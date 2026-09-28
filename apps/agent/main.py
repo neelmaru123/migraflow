@@ -585,13 +585,40 @@ def poll_and_execute_tasks(
                     with urllib.request.urlopen(req_plan, timeout=15.0) as r_plan:
                         plan_ast = json.loads(r_plan.read().decode("utf-8"))
                     
-                    target_engine_type = "postgresql"
-                    if dest_url.startswith("mongodb://") or dest_url.startswith("mongodb+srv://") or "mongo" in dest_url.lower():
-                        target_engine_type = "mongodb"
-                    elif "mysql" in dest_url.lower():
+                    target_engine_type = None
+                    dest_url_lower = dest_url.lower()
+
+                    if dest_url_lower.startswith(("postgresql://", "postgres://", "postgresql+")):
+                        target_engine_type = "postgresql"
+                    elif dest_url_lower.startswith(("mysql://", "mysql+", "mariadb://", "mariadb+")):
                         target_engine_type = "mysql"
-                    elif "sqlite" in dest_url.lower():
+                    elif dest_url_lower.startswith(("mongodb://", "mongodb+srv://")):
+                        target_engine_type = "mongodb"
+                    elif dest_url_lower.startswith("sqlite"):
                         target_engine_type = "sqlite"
+
+                    # Check explicit environment variables (e.g. DEST_DST_DB_745_TYPE, DEST_DB_TYPE)
+                    if not target_engine_type:
+                        for env_k, env_v in os.environ.items():
+                            if ("DEST_" in env_k or "TARGET_" in env_k) and "TYPE" in env_k:
+                                env_val = env_v.strip().lower()
+                                if env_val in ("postgresql", "postgres", "mysql", "mongodb", "sqlite"):
+                                    target_engine_type = "postgresql" if env_val == "postgres" else env_val
+                                    break
+
+                    # Check plan AST specification
+                    if not target_engine_type and isinstance(plan_ast, dict):
+                        ast_type = (
+                            plan_ast.get("target_db_type")
+                            or plan_ast.get("target_database_type")
+                            or plan_data.get("target_database_type")
+                            or plan_data.get("target_db_type")
+                        )
+                        if ast_type:
+                            target_engine_type = "postgresql" if str(ast_type).lower() == "postgres" else str(ast_type).lower()
+
+                    if not target_engine_type:
+                        target_engine_type = "postgresql"
 
                     ExecutionOrchestrator.run_job(
                         backend_url=backend_url,

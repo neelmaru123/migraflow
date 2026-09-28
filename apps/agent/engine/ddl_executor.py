@@ -284,8 +284,9 @@ class DDLExecutor:
         import re
         cleaned = stmt.strip()
         url_lower = db_url.lower()
+        scheme = url_lower.split("://")[0] if "://" in url_lower else url_lower
 
-        if "postgres" in url_lower:
+        if "postgres" in scheme:
             # Replace invalid uuid_v4() / uuidv4() function calls with native gen_random_uuid()
             cleaned = re.sub(
                 r'\bDEFAULT\s+(?:uuid_v4|uuidv4)\(\)',
@@ -300,7 +301,7 @@ class DDLExecutor:
                 flags=re.IGNORECASE,
             )
 
-        elif "mysql" in url_lower:
+        elif "mysql" in scheme or "mariadb" in scheme:
             # Strip PostgreSQL typecast operators e.g. ::jsonb, ::JSON, ::text
             cleaned = re.sub(r'::[a-zA-Z0-9_]+', '', cleaned, flags=re.IGNORECASE)
             # Convert PostgreSQL Array types e.g. TEXT[], VARCHAR(255)[], INT[] -> JSON
@@ -378,11 +379,12 @@ class DDLExecutor:
 
         for stmt in ddl_statements:
             stmt_clean = stmt.strip()
-            if "mysql" in db_url.lower() and "create extension" in stmt_clean.lower():
+            scheme = db_url.lower().split("://")[0] if "://" in db_url else db_url.lower()
+            if ("mysql" in scheme or "mariadb" in scheme) and "create extension" in stmt_clean.lower():
                 logger.warning(f"Skipping PostgreSQL-specific DDL statement on MySQL target: '{stmt_clean}'")
                 continue
 
-            if "sqlite" in db_url.lower() and "add constraint" in stmt_clean.lower():
+            if "sqlite" in scheme and "add constraint" in stmt_clean.lower():
                 logger.warning(f"Skipping ALTER TABLE ADD CONSTRAINT statement on SQLite target: '{stmt_clean}'")
                 continue
 

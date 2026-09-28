@@ -1129,3 +1129,40 @@ sequenceDiagram
 - **[MODIFIED]**: [`apps/agent/engine/ddl_executor.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/agent/engine/ddl_executor.py) — Added `"duplicate key name"`, `"duplicate key"`, and `"1061"` to `benign_keywords`.
 - **[MODIFIED]**: [`apps/api/tests/unit/test_bug_fix11_ddl_and_sql_correctness.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/tests/unit/test_bug_fix11_ddl_and_sql_correctness.py) — Added unit test assertion validating MySQL error 1061 does not raise RuntimeError.
 
+---
+
+# Execution Flow — Single-Container Database Provisioning & Orchestration
+
+## 1. Entry Point
+- **File**: [`docker-compose.yml`](file:///d:/GitHub/Ai_data_migration_platform/docker-compose.yml)
+- **Trigger**: Invocation of `docker compose up -d` or `docker compose --profile sample-dbs up -d` by developer or CI/CD deployment pipeline.
+
+## 2. Step-by-Step Execution Sequence
+1. **PostgreSQL Bootstrapping**:
+   - `docker compose` starts `migration_platform_postgres` container.
+   - Entrypoint runs initial cluster creation for default database `migration_platform` and user `postgres`.
+   - Mounts and executes [`infra/docker/init-postgres-dbs.sql`](file:///d:/GitHub/Ai_data_migration_platform/infra/docker/init-postgres-dbs.sql) in `/docker-entrypoint-initdb.d/`:
+     - Checks and executes `CREATE DATABASE` queries conditionally via `\gexec` for `ecommerce_db`, `crm_db`, `retail_commerce_pg`, `complex_pg_db`, and `ecommerce_production`.
+   - Exposes ports `5434`, `5435`, and `5436` bound to internal port `5432`.
+2. **MySQL Bootstrapping**:
+   - `docker compose` starts `migration_platform_mysql` container.
+   - Entrypoint executes [`infra/docker/init-mysql-dbs.sql`](file:///d:/GitHub/Ai_data_migration_platform/infra/docker/init-mysql-dbs.sql) in `/docker-entrypoint-initdb.d/`:
+     - Creates `inventory_db`, `retail_logistics_mysql`, `complex_mysql_db`, and `inventory_production`.
+     - Flushes grant privileges for `root@%`.
+   - Exposes ports `3307` and `3306` bound to internal port `3306`.
+3. **MongoDB Bootstrapping**:
+   - `docker compose` starts `migration_platform_mongo` container with root credentials.
+   - Entrypoint executes [`infra/docker/init-mongo-dbs.js`](file:///d:/GitHub/Ai_data_migration_platform/infra/docker/init-mongo-dbs.js) in `/docker-entrypoint-initdb.d/`:
+     - Iterates through database names (`analytics_db`, `complex_nosql_enterprise`, `retail_experience_mongo`, `complex_mongo_db`, `analytics_production`), switches to each sibling database, and creates an initialization marker collection.
+   - Exposes port `27017` bound to internal port `27017`.
+4. **App & Agent Connection Resolution**:
+   - Local tools and seed scripts connect using credentials documented in [`DATABASE_CREDENTIALS.md`](file:///d:/GitHub/Ai_data_migration_platform/DATABASE_CREDENTIALS.md).
+
+## 3. Impact & Delta Analysis
+- **[MODIFIED]**: [`docker-compose.yml`](file:///d:/GitHub/Ai_data_migration_platform/docker-compose.yml) — Consolidated to 1 container per engine (removed redundant `postgres_ecommerce` and `postgres_crm` containers).
+- **[NEW]**: [`infra/docker/init-postgres-dbs.sql`](file:///d:/GitHub/Ai_data_migration_platform/infra/docker/init-postgres-dbs.sql) — PostgreSQL multi-database init script.
+- **[NEW]**: [`infra/docker/init-mysql-dbs.sql`](file:///d:/GitHub/Ai_data_migration_platform/infra/docker/init-mysql-dbs.sql) — MySQL multi-database init script.
+- **[NEW]**: [`infra/docker/init-mongo-dbs.js`](file:///d:/GitHub/Ai_data_migration_platform/infra/docker/init-mongo-dbs.js) — MongoDB multi-database init script.
+- **[NEW]**: [`DATABASE_CREDENTIALS.md`](file:///d:/GitHub/Ai_data_migration_platform/DATABASE_CREDENTIALS.md) — Master credentials and catalog reference.
+- **[NEW]**: [`database_credentials.env`](file:///d:/GitHub/Ai_data_migration_platform/database_credentials.env) — Master environment variable credentials file.
+

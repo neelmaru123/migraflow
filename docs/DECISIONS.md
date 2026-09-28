@@ -2040,3 +2040,49 @@ Added `"duplicate key name"`, `"duplicate key"`, and `"1061"` to the `benign_key
 ### 4. Trade-offs & Future Considerations
 - Target database pre-checks can also introspect existing indexes before submitting DDL statements, reducing the need for exception-based flow control.
 
+---
+
+## [2026-09-28] - Single-Container Database Consolidation & Master Credentials Catalog
+
+### 1. Decision Summary
+Consolidated all database instances in the project into a strict **Single-Container per Engine Architecture** (one container for PostgreSQL, one container for MySQL, and one container for MongoDB). Created a master credentials and database catalog document ([`DATABASE_CREDENTIALS.md`](file:///d:/GitHub/Ai_data_migration_platform/DATABASE_CREDENTIALS.md)) and an accompanying environment configuration ([`database_credentials.env`](file:///d:/GitHub/Ai_data_migration_platform/database_credentials.env)).
+
+1. **PostgreSQL Consolidation**:
+   - Eliminated redundant multiple PostgreSQL containers (`postgres_ecommerce` on port 5435 and `postgres_crm` on port 5436) and their dedicated volumes.
+   - Preserved a single authoritative PostgreSQL container (`migration_platform_postgres`) configured to host all PostgreSQL databases: `migration_platform`, `ecommerce_db`, `crm_db`, `retail_commerce_pg`, `complex_pg_db`, and `ecommerce_production`.
+   - Mapped host ports `5434`, `5435`, and `5436` directly to internal port `5432` to guarantee 100% backward compatibility with existing integration tests and seed scripts.
+   - Implemented automated, idempotent database provisioning via [`infra/docker/init-postgres-dbs.sql`](file:///d:/GitHub/Ai_data_migration_platform/infra/docker/init-postgres-dbs.sql) mounted to `/docker-entrypoint-initdb.d/init-postgres-dbs.sql`.
+2. **MySQL Consolidation**:
+   - Maintained single container `migration_platform_mysql` hosting `inventory_db`, `retail_logistics_mysql`, `complex_mysql_db`, and `inventory_production`.
+   - Added automated multi-database provisioning script [`infra/docker/init-mysql-dbs.sql`](file:///d:/GitHub/Ai_data_migration_platform/infra/docker/init-mysql-dbs.sql).
+3. **MongoDB Consolidation**:
+   - Maintained single container `migration_platform_mongo` hosting `analytics_db`, `complex_nosql_enterprise`, `retail_experience_mongo`, `complex_mongo_db`, and `analytics_production`.
+   - Added automated multi-database provisioning script [`infra/docker/init-mongo-dbs.js`](file:///d:/GitHub/Ai_data_migration_platform/infra/docker/init-mongo-dbs.js).
+4. **Master Documentation & Credentials**:
+   - Authored [`DATABASE_CREDENTIALS.md`](file:///d:/GitHub/Ai_data_migration_platform/DATABASE_CREDENTIALS.md) detailing master usernames, passwords, internal/external ports, network hostnames for local/Docker/Agent contexts, and exhaustive table/collection breakdowns for each hosted database.
+
+### 2. Why This Approach? (Rationale)
+- **Problem Being Solved**: Previously, PostgreSQL was fragmented across 3 separate containers (`migration_platform_postgres`, `postgres_ecommerce`, and `postgres_crm`), tripling memory consumption, volume management complexity, and port contention.
+- **Chosen Solution**: Consolidating to one container per engine standardizes resource utilization, simplifies container lifecycle management (`docker compose up`), and keeps all schemas accessible from a single endpoint while maintaining multi-port backward compatibility.
+
+### 3. Alternatives Considered & Rejected
+- **Alternative A: Keeping Separate Containers per Sample Database**:
+  - _Rejected_: Running 3 distinct Postgres containers wastes RAM, complicates CI/CD runner environments, and diverges from production multi-tenant topologies.
+- **Alternative B: Merging All Data into a Single Shared Database Name**:
+  - _Rejected_: Merging tables from `ecommerce_db`, `crm_db`, and `migration_platform` into one schema breaks migration isolation testing and leads to table namespace collisions (`customers`, `users`, `orders`).
+
+---
+
+## [2026-09-28] - Fix Target/Source Engine Type Dialect Detection False Positive on Database Names
+
+### 1. Decision Summary
+Fixed a critical dialect detection false positive in the Docker Migration Agent where destination URLs containing the substring `"mysql"` within the database name (e.g. `postgresql://.../mysql_and_pg_combined`) were incorrectly classified as MySQL instead of PostgreSQL:
+
+1. **URL Scheme Inspection**: In [`apps/agent/main.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/agent/main.py), [`apps/agent/engine/orchestrator.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/agent/engine/orchestrator.py), and [`apps/agent/engine/ddl_executor.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/agent/engine/ddl_executor.py), replaced naive substring matching (`elif "mysql" in dest_url.lower()`) with strict scheme prefix checks (`dest_url_lower.startswith(("postgresql://", "postgres://", "postgresql+"))`).
+2. **Environment Variable Precedence**: Enforced check on explicit environment variables (e.g. `DEST_DST_DB_745_TYPE`, `DEST_DB_TYPE`) and the plan AST before falling back to defaults.
+3. **Target Database Provisioning**: Provisioned clean target database `pg_combined_db` inside the PostgreSQL container.
+
+### 2. Why This Approach? (Rationale)
+- **Problem**: When a customer created a combined migration targeting PostgreSQL with a database name containing the word `mysql` (`mysql_and_pg_combined`), the agent generated MySQL-specific dialect statements (`INSERT IGNORE INTO \`categories\` ...`) against PostgreSQL, causing immediate syntax errors (`psycopg2.errors.SyntaxError: syntax error at or near "IGNORE"`).
+- **Solution**: Checking the URL scheme (protocol before `://`) ensures 100% dialect fidelity regardless of database name or credentials.
+

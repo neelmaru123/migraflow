@@ -218,12 +218,15 @@ class ExecutionOrchestrator:
 
                         src_engine = "postgresql"
                         if db_url:
-                            if "mysql" in db_url:
+                            db_url_lower = db_url.lower()
+                            if db_url_lower.startswith(("mysql://", "mysql+", "mariadb://", "mariadb+")):
                                 src_engine = "mysql"
-                            elif "mongo" in db_url:
+                            elif db_url_lower.startswith(("mongodb://", "mongodb+srv://")):
                                 src_engine = "mongodb"
-                            elif "sqlite" in db_url:
+                            elif db_url_lower.startswith("sqlite"):
                                 src_engine = "sqlite"
+                            elif db_url_lower.startswith(("postgresql://", "postgres://", "postgresql+")):
+                                src_engine = "postgresql"
 
                         # Detect primary key column if available for keyset pagination
                         pk_col = None
