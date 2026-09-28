@@ -604,9 +604,10 @@ def poll_and_execute_tasks(
                 job_id = task.get("job_id")
                 plan_id = task.get("migration_plan_id")
                 is_dry_run = bool(task.get("is_dry_run", False))
+                truncate_target = bool(task.get("truncate_target", False))
 
                 try:
-                    logger.info(f"Fetching AST plan '{plan_id}' for job '{job_id}' (Dry Run: {is_dry_run}) via X-Agent-Token...")
+                    logger.info(f"Fetching AST plan '{plan_id}' for job '{job_id}' (Dry Run: {is_dry_run}, Clean Wipe: {truncate_target}) via X-Agent-Token...")
 
                     # Fetch full plan AST from API using Agent token auth
                     plan_url = f"{backend_url.rstrip('/')}/api/v1/plans/{plan_id}"
@@ -635,17 +636,16 @@ def poll_and_execute_tasks(
                         target_db_url=dest_url,
                         target_engine_type=target_engine_type,
                         is_dry_run=is_dry_run,
+                        truncate_target=truncate_target,
                     )
+
+                    # Trigger metadata snapshot re-sync after migration completes so control plane has fresh row counts
+                    try:
+                        sync_metadata_snapshots(backend_url, clean_token)
+                    except Exception as sync_exc:
+                        logger.warning(f"Notice: Could not re-sync metadata snapshot after migration: {sync_exc}")
                 except Exception as run_err:
                     logger.error(f"Execution error for job '{job_id}': {run_err}")
-                    try:
-                        ProgressReporter.report(
-                            backend_url, clean_token, job_id,
-                            status="failed", progress=0.0,
-                            error_message=f"Agent Execution Failure: {str(run_err)}"
-                        )
-                    except Exception as rep_err:
-                        logger.error(f"Failed to report job failure to backend: {rep_err}")
     except Exception as exc:
         logger.warning(f"Task polling check exception: {exc}")
 
@@ -667,6 +667,7 @@ class HeartbeatConfig:
     def __init__(self) -> None:
         self._interval = self.ACTIVE_INTERVAL
         self._lock = threading.Lock()
+        self._wake_event = threading.Event()
 
     def enter_idle_mode(self) -> None:
         """Switch to 5-minute standby heartbeat (Option C). Container stays alive."""
@@ -683,6 +684,7 @@ class HeartbeatConfig:
         with self._lock:
             if self._interval != self.ACTIVE_INTERVAL:
                 self._interval = self.ACTIVE_INTERVAL
+                self._wake_event.set()
                 logger.info(
                     "[OPTION C] Heartbeat restored to ACTIVE mode (20-sec interval)."
                 )
@@ -699,7 +701,7 @@ def start_heartbeat_thread(
     version: str,
     interval: int,
     stop_event: threading.Event,
-    heartbeat_config: "HeartbeatConfig",
+    heartbeat_config: Optional["HeartbeatConfig"] = None,
 ) -> threading.Thread:
     """
     Launches a dedicated daemon background thread that sends periodic heartbeats
@@ -709,6 +711,11 @@ def start_heartbeat_thread(
       - RESUME_ACTIVE_MODE: restores 20-sec interval when a new job is detected
       - SHUTDOWN          : sets stop_event to trigger graceful container exit (Option A)
     """
+    if heartbeat_config is None:
+        heartbeat_config = HeartbeatConfig()
+        heartbeat_config._interval = interval
+        heartbeat_config.ACTIVE_INTERVAL = interval
+
     def _run() -> None:
         logger.info(f"Background heartbeat loop started (initial interval: {heartbeat_config.current}s).")
         while not stop_event.is_set():
@@ -735,7 +742,15 @@ def start_heartbeat_thread(
                 # Backend confirmed an active job — snap back to fast mode
                 heartbeat_config.enter_active_mode()
 
-            stop_event.wait(timeout=heartbeat_config.current)
+            # Sliced wait loop: wake up immediately if mode switches to active or stop_event is set
+            sleep_elapsed = 0
+            while not stop_event.is_set():
+                if stop_event.wait(timeout=1.0):
+                    break
+                sleep_elapsed += 1
+                if sleep_elapsed >= heartbeat_config.current or heartbeat_config._wake_event.is_set():
+                    heartbeat_config._wake_event.clear()
+                    break
 
         logger.info("Background heartbeat loop terminated cleanly.")
 
@@ -746,7 +761,7 @@ def start_heartbeat_thread(
 
 def main():
     logger.info("Initializing Docker Agent process...")
-    backend_url = os.getenv("BACKEND_URL", os.getenv("API_BASE_URL", os.getenv("API_URL", "http://localhost:8000"))).replace("/api/v1", "")
+    backend_url = os.getenv("BACKEND_URL", os.getenv("API_URL", os.getenv("API_BASE_URL", "http://localhost:8000"))).replace("/api/v1", "")
     agent_token = os.getenv("AGENT_TOKEN", "")
     version = os.getenv("AGENT_VERSION", "1.0.0")
     run_once = os.getenv("AGENT_RUN_ONCE", "false").lower() == "true"
@@ -869,7 +884,7 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as unhandled_exc:
-        _backend_url = os.getenv("BACKEND_URL", os.getenv("API_BASE_URL", "http://localhost:8000")).replace("/api/v1", "")
+        _backend_url = os.getenv("BACKEND_URL", os.getenv("API_URL", os.getenv("API_BASE_URL", "http://localhost:8000"))).replace("/api/v1", "")
         _agent_token = os.getenv("AGENT_TOKEN", "")
         _version = os.getenv("AGENT_VERSION", "1.0.0")
         report_fatal_error_and_exit(

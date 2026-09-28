@@ -1,9 +1,10 @@
 [tool.poetry]
-name = "data-migration-platform-agent"
+name = "migraflow-agent"
 version = "0.1.0"
-description = "Docker Agent Application Runtime for Customer Database Migration"
-authors = ["Lead Architect <architect@migrationplatform.com>"]
+description = "Migraflow Docker Agent Application Runtime for Database Migration"
+authors = ["Migraflow Architect <architect@migraflow.com>"]
 readme = "README.md"
+package-mode = false
 
 [tool.poetry.dependencies]
 python = "^3.11"
@@ -12,8 +13,8 @@ sqlalchemy = "^2.0.35"
 psycopg2-binary = "^2.9.9"
 pymysql = "^1.1.1"
 polars = "^1.0.0"
-duckdb = "^0.10.0"
-pyarrow = "^15.0.0"
+duckdb = "^1.1.0"
+pyarrow = "^18.0.0"
 pymongo = "^4.6.0"
 
 [build-system]
