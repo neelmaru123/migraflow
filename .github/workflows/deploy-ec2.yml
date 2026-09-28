@@ -24,7 +24,7 @@ jobs:
           script_stop: true
           script: |
             echo "=== Navigating to project directory ==="
-            cd /home/ubuntu/Migraflow || cd ~/Migraflow
+            cd /home/ubuntu/migraflow || cd ~/migraflow || cd /home/ubuntu/Migraflow || cd ~/Migraflow
 
             echo "=== Pulling latest changes from branch: ${{ github.ref_name }} ==="
             git fetch origin ${{ github.ref_name }}
