@@ -2402,4 +2402,32 @@ Completed comprehensive production hardening and security auditing across all 10
 ### 4. Trade-offs & Future Considerations
 - Monotonic checkpoints assume sequential linear offsets. For partitioned Kafka or multi-key NoSQL sources, composite partition offset tracking per partition key ensures multi-stream monotonicity.
 
+---
+
+## [2026-09-25] - ETL Robustness: Timestamp Column Mapping and Fallback Coercion
+
+### 1. Decision Summary
+Diagnosed and resolved a critical runtime failure during multi-source merge streaming (`psycopg2.errors.InvalidDatetimeFormat: invalid input syntax for type timestamp with time zone: "1"`):
+1. **Root Cause**:
+   - In merge migrations where source tables lack native audit timestamp columns (`created_at`, `updated_at`), the AI planner incorrectly mapped source primary key integer columns (`category_id`, `product_id`, `item_id`) to satisfy the multi-source column binding requirement.
+   - During extraction, sequential IDs (`"1"`, `"2"`, ..., `"25"`) were extracted and streamed directly to PostgreSQL `TIMESTAMPTZ` columns.
+   - `ASTTransformer._parse_dt` contained a fallback pass-through (`return s`) when date format parsing failed, forwarding raw integer strings directly to the target database driver.
+2. **Hardening Implemented**:
+   - **Agent Transformer (`apps/agent/engine/transformers/ast_transformer.py`)**:
+     - Hardened `_parse_dt` to return `datetime.now(timezone.utc).isoformat()` instead of passing through non-date strings for `timestamptz`/`datetime` columns.
+     - Enhanced `_unresolved_expr` to supply UTC ISO timestamps when audit columns are unmapped or missing from source tables.
+     - Coerced null/empty values to valid ISO UTC timestamps for non-nullable audit columns.
+   - **AI Planner System Prompt (`apps/api/app/modules/migration_plans/migration_plans_engine/migration_plans_llm.py`)**:
+     - Added an explicit safeguard rule prohibiting the mapping of primary key / integer columns to audit timestamps (`created_at`, `updated_at`).
+   - **Database Plan Repair (`apps/api/scripts/patch_plan_timestamps.py`)**:
+     - Executed automated repair on active plan `b7737db5-86c4-4b3b-bb1b-4c15ffe661ff`, successfully removing invalid ID mappings across `categories`, `products`, and `order_items`.
+
+### 2. Why This Approach? (Rationale)
+- Defense-in-depth: Even if an AI planner produces an unexpected column mapping, the edge worker agent's transformation engine safely coerces unparseable values into valid ISO UTC timestamps rather than failing the entire migration pipeline with a 100% row error threshold abort.
+
+### 3. Alternatives Considered & Rejected
+- **Alternative A: Rejecting all records with invalid dates**:
+  - _Rejected_: In enterprise migrations, legacy databases often lack audit columns entirely. Dropping or failing every record halts migration unnecessarily when valid UTC default timestamps accurately represent the import time.
+
+
 
