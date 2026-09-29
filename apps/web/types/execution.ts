@@ -10,6 +10,7 @@ export interface AIDiagnosisPayload {
   is_user_environment_issue: boolean;
   fix_steps: string[];
   copyable_fix_command?: string;
+  copyable_fix_label?: string;
   raw_error_snippet?: string;
 }
 

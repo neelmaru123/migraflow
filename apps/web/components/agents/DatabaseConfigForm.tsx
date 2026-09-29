@@ -8,7 +8,14 @@ import {
   Database,
   HardDrive,
   Server,
+  Eye,
+  EyeOff,
+  Sparkles,
+  Key,
+  AlertCircle,
+  Info,
 } from 'lucide-react';
+import { ConnectionDetails } from '../../lib/dockerCommandUtils';
 
 interface DatabaseConfigFormProps {
   sourceCount: number;
@@ -17,13 +24,16 @@ interface DatabaseConfigFormProps {
     agentIdentifier: string;
     sources: InitialDataSourceCreate[];
     destination: InitialDataSourceCreate;
-    // Client-side-only connection details (host/port/username/database/ssl),
+    // Client-side-only connection details (host/port/username/password/database/ssl),
     // keyed by identifier. NEVER sent to the backend API -- only used
     // locally by DockerCommandOutput to fill in the displayed command.
-    connectionDetailsByIdentifier: Record<string, { host: string; port: string; username: string; database: string; ssl: boolean }>;
+    connectionDetailsByIdentifier: Record<string, ConnectionDetails>;
   }) => void;
   onBack: () => void;
   isSubmitting?: boolean;
+  destinationIdentifierError?: string | null;
+  onClearDestinationIdentifierError?: () => void;
+  existingDestinationIdentifiers?: string[];
 }
 
 export const SUPPORTED_ENGINES: {
@@ -69,7 +79,26 @@ export const DatabaseConfigForm: React.FC<DatabaseConfigFormProps> = ({
   onSubmit,
   onBack,
   isSubmitting = false,
+  destinationIdentifierError = null,
+  onClearDestinationIdentifierError,
+  existingDestinationIdentifiers = [],
 }) => {
+  const [localDestError, setLocalDestError] = useState<string | null>(null);
+  const [hasUserModifiedDestIdentifier, setHasUserModifiedDestIdentifier] = useState(false);
+  const [hasAttemptedSubmit, setHasAttemptedSubmit] = useState(false);
+
+  // Only display validation error if the user has actively modified the field, attempted submit, or a server error arrived
+  const shouldShowDestError = hasUserModifiedDestIdentifier || hasAttemptedSubmit || Boolean(destinationIdentifierError);
+  const activeDestError = shouldShowDestError ? (destinationIdentifierError || localDestError) : null;
+  const destIdentifierInputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    if (activeDestError && destIdentifierInputRef.current && (hasUserModifiedDestIdentifier || hasAttemptedSubmit)) {
+      destIdentifierInputRef.current.focus();
+      destIdentifierInputRef.current.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+  }, [activeDestError, hasUserModifiedDestIdentifier, hasAttemptedSubmit]);
+
   const [agentName, setAgentName] = useState('Production Migration Agent');
   const [agentIdentifier, setAgentIdentifier] = useState(
     `agent_${Math.random().toString(36).substring(2, 7)}`
@@ -93,37 +122,116 @@ export const DatabaseConfigForm: React.FC<DatabaseConfigFormProps> = ({
     identifier: 'dst_db_main',
   });
 
-  interface ConnectionDetails {
-    host: string;
-    port: string;
-    username: string;
-    database: string;
-    ssl: boolean;
-  }
+  // Validate destination identifier uniqueness whenever destination, existingDestinationIdentifiers, or sources change,
+  // but ONLY if the user has actively modified the field or attempted submission.
+  useEffect(() => {
+    if (!hasUserModifiedDestIdentifier && !hasAttemptedSubmit) {
+      setLocalDestError(null);
+      return;
+    }
 
-  // Local-only connection details, keyed by identifier. This state is
-  // NEVER included in the onSubmit payload sent to the backend -- it only
-  // ever gets read by DockerCommandOutput (a sibling component, wired via
-  // the parent page) to fill in the displayed docker command in the
-  // browser. Do not add these fields to InitialDataSourceCreate or to the
-  // onSubmit payload.
-  const [connectionDetails, setConnectionDetails] = useState<Record<string, ConnectionDetails>>(() => {
-    const initial: Record<string, ConnectionDetails> = {};
-    sources.forEach((s) => {
-      initial[s.identifier] = { host: '', port: '', username: '', database: '', ssl: false };
-    });
-    initial[destination.identifier] = { host: '', port: '', username: '', database: '', ssl: false };
-    return initial;
+    const trimmed = destination.identifier.toLowerCase().trim();
+    if (!trimmed) {
+      setLocalDestError(null);
+      return;
+    }
+
+    const isDuplicateExisting = existingDestinationIdentifiers
+      .map((i) => i.toLowerCase().trim())
+      .includes(trimmed);
+
+    const isDuplicateSource = sources
+      .map((s) => s.identifier.toLowerCase().trim())
+      .includes(trimmed);
+
+    if (isDuplicateExisting || isDuplicateSource) {
+      setLocalDestError('DB with this identifier already exists');
+    } else {
+      setLocalDestError(null);
+    }
+  }, [destination.identifier, existingDestinationIdentifiers, sources, hasUserModifiedDestIdentifier, hasAttemptedSubmit]);
+
+  // Source connection details state: array indexed by source card index 0..N-1
+  // Completely immune to identifier renames so values are never lost
+  const [sourceConnectionDetails, setSourceConnectionDetails] = useState<ConnectionDetails[]>(() =>
+    Array.from({ length: sourceCount }).map((_, idx) => ({
+      host: '',
+      port: idx === 0 ? '5434' : idx === 1 ? '3307' : '27017',
+      username: '',
+      password: '',
+      database: '',
+      ssl: false,
+    }))
+  );
+
+  // Target destination connection details state: dedicated object
+  // Completely immune to destination identifier renames
+  const [destinationConnectionDetails, setDestinationConnectionDetails] = useState<ConnectionDetails>({
+    host: '',
+    port: '5434',
+    username: '',
+    password: '',
+    database: '',
+    ssl: false,
   });
 
-  const handleConnectionDetailChange = (
-    identifier: string,
+  // Password visibility state toggles
+  const [showSourcePasswords, setShowSourcePasswords] = useState<Record<number, boolean>>({});
+  const [showDestPassword, setShowDestPassword] = useState<boolean>(false);
+
+  // Synchronize when sourceCount changes
+  useEffect(() => {
+    setSources((prev) => {
+      if (prev.length === sourceCount) return prev;
+      return Array.from({ length: sourceCount }).map((_, idx) => {
+        if (prev[idx]) return prev[idx];
+        return {
+          name: `Source Database ${idx + 1}`,
+          type: idx === 0 ? 'postgresql' : idx === 1 ? 'mysql' : 'mongodb',
+          role: 'source',
+          identifier: `src_db_${idx + 1}`,
+        };
+      });
+    });
+
+    setSourceConnectionDetails((prev) => {
+      if (prev.length === sourceCount) return prev;
+      return Array.from({ length: sourceCount }).map((_, idx) => {
+        if (prev[idx]) return prev[idx];
+        return {
+          host: '',
+          port: idx === 0 ? '5434' : idx === 1 ? '3307' : '27017',
+          username: '',
+          password: '',
+          database: '',
+          ssl: false,
+        };
+      });
+    });
+  }, [sourceCount]);
+
+  const handleSourceConnectionDetailChange = (
+    index: number,
     field: keyof ConnectionDetails,
     value: string | boolean
   ) => {
-    setConnectionDetails((prev) => ({
+    setSourceConnectionDetails((prev) => {
+      const updated = [...prev];
+      updated[index] = {
+        ...(updated[index] || { host: '', port: '', username: '', password: '', database: '', ssl: false }),
+        [field]: value,
+      };
+      return updated;
+    });
+  };
+
+  const handleDestinationConnectionDetailChange = (
+    field: keyof ConnectionDetails,
+    value: string | boolean
+  ) => {
+    setDestinationConnectionDetails((prev) => ({
       ...prev,
-      [identifier]: { ...(prev[identifier] || { host: '', port: '', username: '', database: '', ssl: false }), [field]: value },
+      [field]: value,
     }));
   };
 
@@ -137,14 +245,101 @@ export const DatabaseConfigForm: React.FC<DatabaseConfigFormProps> = ({
     setSources(updated);
   };
 
+  const handleSourceTypeChange = (index: number, newType: ValidSourceType) => {
+    handleSourceChange(index, 'type', newType);
+    const defaultPorts: Record<string, string> = { postgresql: '5434', mysql: '3307', mongodb: '27017' };
+    const currentPort = sourceConnectionDetails[index]?.port;
+    if (!currentPort || ['5432', '5434', '3306', '3307', '27017'].includes(currentPort)) {
+      handleSourceConnectionDetailChange(index, 'port', defaultPorts[newType] || '5432');
+    }
+  };
+
+  const handleDestinationTypeChange = (newType: ValidSourceType) => {
+    setDestination((prev) => ({ ...prev, type: newType }));
+    const defaultPorts: Record<string, string> = { postgresql: '5434', mysql: '3307', mongodb: '27017' };
+    const currentPort = destinationConnectionDetails.port;
+    if (!currentPort || ['5432', '5434', '3306', '3307', '27017'].includes(currentPort)) {
+      handleDestinationConnectionDetailChange('port', defaultPorts[newType] || '5432');
+    }
+  };
+
+  const handleDestinationIdentifierChange = (val: string) => {
+    const cleanVal = val.toLowerCase().replace(/\s+/g, '_');
+    setDestination((prev) => ({ ...prev, identifier: cleanVal }));
+    setHasUserModifiedDestIdentifier(true);
+
+    if (onClearDestinationIdentifierError) {
+      onClearDestinationIdentifierError();
+    }
+
+    const trimmed = cleanVal.trim();
+    if (!trimmed) {
+      setLocalDestError(null);
+      return;
+    }
+
+    const isDuplicateExisting = existingDestinationIdentifiers
+      .map((i) => i.toLowerCase().trim())
+      .includes(trimmed);
+
+    const isDuplicateSource = sources
+      .map((s) => s.identifier.toLowerCase().trim())
+      .includes(trimmed);
+
+    if (isDuplicateExisting || isDuplicateSource) {
+      setLocalDestError('DB with this identifier already exists');
+    } else {
+      setLocalDestError(null);
+    }
+  };
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    setHasAttemptedSubmit(true);
+
+    const destCleanId = destination.identifier.trim().toLowerCase();
+
+    if (
+      existingDestinationIdentifiers &&
+      existingDestinationIdentifiers.map((i) => i.toLowerCase().trim()).includes(destCleanId)
+    ) {
+      setLocalDestError('DB with this identifier already exists');
+      destIdentifierInputRef.current?.focus();
+      destIdentifierInputRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      return;
+    }
+
+    const sourceIds = sources.map((s) => s.identifier.trim().toLowerCase());
+    if (sourceIds.includes(destCleanId)) {
+      setLocalDestError('DB with this identifier already exists');
+      destIdentifierInputRef.current?.focus();
+      destIdentifierInputRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      return;
+    }
+
+    const connectionDetailsByIdentifier: Record<string, ConnectionDetails> = {};
+    sources.forEach((src, idx) => {
+      const details = sourceConnectionDetails[idx] || {
+        host: '',
+        port: '',
+        username: '',
+        password: '',
+        database: '',
+        ssl: false,
+      };
+      connectionDetailsByIdentifier[src.identifier] = details;
+      connectionDetailsByIdentifier[src.identifier.toLowerCase().trim()] = details;
+    });
+
+    connectionDetailsByIdentifier[destination.identifier] = destinationConnectionDetails;
+    connectionDetailsByIdentifier[destination.identifier.toLowerCase().trim()] = destinationConnectionDetails;
+
     onSubmit({
       agentName: agentName.trim(),
       agentIdentifier: agentIdentifier.trim(),
       sources,
       destination,
-      connectionDetailsByIdentifier: connectionDetails,
+      connectionDetailsByIdentifier,
     });
   };
 
@@ -160,9 +355,9 @@ export const DatabaseConfigForm: React.FC<DatabaseConfigFormProps> = ({
   const middleColRef = useRef<HTMLDivElement | null>(null);
 
   // Default fallback estimate based on current card height with connection fields
-  const cardEstimateH = 485;
+  const cardEstimateH = 580;
   const gap = 20;
-  const fallbackTotalH = Math.max(340, sources.length * cardEstimateH + Math.max(0, sources.length - 1) * gap);
+  const fallbackTotalH = Math.max(380, sources.length * cardEstimateH + Math.max(0, sources.length - 1) * gap);
   const fallbackDestY = Math.round(fallbackTotalH / 2);
 
   const [measuredLayout, setMeasuredLayout] = useState<{
@@ -337,6 +532,23 @@ export const DatabaseConfigForm: React.FC<DatabaseConfigFormProps> = ({
         </div>
       </div>
 
+      {/* Prominent Informational Banner */}
+      <div className="p-4 bg-sky-950/20 border border-sky-400/30 text-xs font-mono space-y-2 shadow-lg">
+        <div className="flex items-center gap-2 text-sky-400 font-bold uppercase tracking-wider">
+          <Sparkles className="w-4 h-4 text-sky-400 shrink-0" />
+          <span>Database Credentials Auto-Fill (Optional)</span>
+        </div>
+        <p className="text-zinc-300 leading-relaxed text-[11px] font-sans">
+          You can provide your database connection credentials (<strong className="text-white font-mono">Host, Port, Username, Password, and Database Name</strong>) directly below to automatically inject them into your generated Docker command.
+        </p>
+        <div className="flex items-center gap-2 text-[10px] text-amber-300/90 font-mono bg-amber-400/10 px-2.5 py-1.5 border border-amber-400/20">
+          <Info className="w-3.5 h-3.5 shrink-0 text-amber-400" />
+          <span>
+            <strong>Two Options:</strong> Either enter your credentials here for an instant ready-to-run command, OR leave them blank to generate template placeholders and substitute your credentials later in your terminal.
+          </span>
+        </div>
+      </div>
+
       {/* 3-Column Split Form Layout with Dynamic Engine-Colored Pipeline Wires */}
       <div className="p-6 rounded-none bg-black border border-sky-400/30 space-y-4 shadow-2xl relative overflow-hidden">
         {/* Subtle grid background */}
@@ -354,6 +566,15 @@ export const DatabaseConfigForm: React.FC<DatabaseConfigFormProps> = ({
             <div ref={sourcesContainerRef} className="space-y-5">
               {sources.map((source, index) => {
                 const currentEngineHex = getEngineHex(source.type);
+                const details = sourceConnectionDetails[index] || {
+                  host: '',
+                  port: '',
+                  username: '',
+                  password: '',
+                  database: '',
+                  ssl: false,
+                };
+                const hasEnteredDetails = Boolean(details.host || details.username || details.password || details.database);
 
                 return (
                   <div
@@ -415,58 +636,113 @@ export const DatabaseConfigForm: React.FC<DatabaseConfigFormProps> = ({
                       </div>
                     </div>
 
-                    {/* Connection Details (host/port/username/database only -- password is
-                        NEVER collected here; it stays a manual placeholder the user fills
-                        into the copied command themselves, so it never touches the browser
-                        state or this form at all). */}
-                    <div className="space-y-2 pt-2 border-t border-zinc-900">
-                      <label className="block text-[10px] font-mono font-semibold uppercase tracking-wider text-zinc-400">
-                        Connection Details
-                      </label>
+                    {/* Connection Details Section with Password and Explicit Labels */}
+                    <div className="space-y-3 pt-3 border-t border-zinc-900">
+                      <div className="flex items-center justify-between">
+                        <label className="flex items-center gap-1.5 text-[10px] font-mono font-bold uppercase tracking-wider text-zinc-300">
+                          <Key className="w-3 h-3 text-sky-400" />
+                          <span>Credentials</span>
+                          <span className="text-[9px] font-normal text-zinc-500 font-sans">(Optional Auto-Fill)</span>
+                        </label>
+                        {hasEnteredDetails ? (
+                          <span className="text-[9px] font-mono text-emerald-400 bg-emerald-400/10 px-2 py-0.5 border border-emerald-400/30">
+                            Auto-Fill Active
+                          </span>
+                        ) : (
+                          <span className="text-[9px] font-mono text-zinc-500">
+                            Leave blank for terminal edit
+                          </span>
+                        )}
+                      </div>
+
+                      {/* Host & Port */}
                       <div className="grid grid-cols-3 gap-2">
-                        <input
-                          type="text"
-                          value={connectionDetails[source.identifier]?.host || ''}
-                          onChange={(e) => handleConnectionDetailChange(source.identifier, 'host', e.target.value)}
-                          placeholder="Host (e.g. db.example.com)"
-                          className="col-span-2 w-full px-3 py-2 rounded-none bg-black border border-zinc-800 text-white text-xs placeholder-zinc-600 focus:outline-none focus:border-sky-400 transition-colors font-mono"
-                        />
-                        <input
-                          type="text"
-                          value={connectionDetails[source.identifier]?.port || ''}
-                          onChange={(e) => handleConnectionDetailChange(source.identifier, 'port', e.target.value)}
-                          placeholder="Port"
-                          className="w-full px-3 py-2 rounded-none bg-black border border-zinc-800 text-white text-xs placeholder-zinc-600 focus:outline-none focus:border-sky-400 transition-colors font-mono"
-                        />
+                        <div className="col-span-2 space-y-1">
+                          <label className="block text-[9px] font-mono uppercase text-zinc-400">
+                            Host / IP
+                          </label>
+                          <input
+                            type="text"
+                            value={details.host || ''}
+                            onChange={(e) => handleSourceConnectionDetailChange(index, 'host', e.target.value)}
+                            placeholder="Host or IP (e.g. localhost)"
+                            className="w-full px-3 py-2 rounded-none bg-black border border-zinc-800 text-white text-xs placeholder-zinc-600 focus:outline-none focus:border-sky-400 transition-colors font-mono"
+                          />
+                        </div>
+                        <div className="space-y-1">
+                          <label className="block text-[9px] font-mono uppercase text-zinc-400">Port</label>
+                          <input
+                            type="text"
+                            value={details.port || ''}
+                            onChange={(e) => handleSourceConnectionDetailChange(index, 'port', e.target.value)}
+                            placeholder={source.type === 'mysql' ? '3307' : source.type === 'mongodb' ? '27017' : '5434'}
+                            className="w-full px-3 py-2 rounded-none bg-black border border-zinc-800 text-white text-xs placeholder-zinc-600 focus:outline-none focus:border-sky-400 transition-colors font-mono"
+                          />
+                        </div>
                       </div>
+
+                      {/* Username & Password */}
                       <div className="grid grid-cols-2 gap-2">
+                        <div className="space-y-1">
+                          <label className="block text-[9px] font-mono uppercase text-zinc-400">Username</label>
+                          <input
+                            type="text"
+                            value={details.username || ''}
+                            onChange={(e) => handleSourceConnectionDetailChange(index, 'username', e.target.value)}
+                            placeholder={source.type === 'mysql' || source.type === 'mongodb' ? 'root' : 'postgres'}
+                            className="w-full px-3 py-2 rounded-none bg-black border border-zinc-800 text-white text-xs placeholder-zinc-600 focus:outline-none focus:border-sky-400 transition-colors font-mono"
+                          />
+                        </div>
+                        <div className="space-y-1">
+                          <label className="block text-[9px] font-mono uppercase text-zinc-400">Password</label>
+                          <div className="relative">
+                            <input
+                              type={showSourcePasswords[index] ? 'text' : 'password'}
+                              value={details.password || ''}
+                              onChange={(e) => handleSourceConnectionDetailChange(index, 'password', e.target.value)}
+                              placeholder="Password"
+                              className="w-full px-3 py-2 pr-8 rounded-none bg-black border border-zinc-800 text-white text-xs placeholder-zinc-600 focus:outline-none focus:border-sky-400 transition-colors font-mono"
+                            />
+                            <button
+                              type="button"
+                              onClick={() => setShowSourcePasswords((p) => ({ ...p, [index]: !p[index] }))}
+                              className="absolute right-2 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-white"
+                              title={showSourcePasswords[index] ? 'Hide password' : 'Show password'}
+                            >
+                              {showSourcePasswords[index] ? (
+                                <EyeOff className="w-3.5 h-3.5 text-zinc-400 hover:text-white" />
+                              ) : (
+                                <Eye className="w-3.5 h-3.5 text-zinc-400 hover:text-white" />
+                              )}
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Database Name */}
+                      <div className="space-y-1">
+                        <label className="block text-[9px] font-mono uppercase text-zinc-400">
+                          Database Name <span className="text-zinc-500 font-sans">(appended to connection URL)</span>
+                        </label>
                         <input
                           type="text"
-                          value={connectionDetails[source.identifier]?.username || ''}
-                          onChange={(e) => handleConnectionDetailChange(source.identifier, 'username', e.target.value)}
-                          placeholder="Username"
-                          className="w-full px-3 py-2 rounded-none bg-black border border-zinc-800 text-white text-xs placeholder-zinc-600 focus:outline-none focus:border-sky-400 transition-colors font-mono"
-                        />
-                        <input
-                          type="text"
-                          value={connectionDetails[source.identifier]?.database || ''}
-                          onChange={(e) => handleConnectionDetailChange(source.identifier, 'database', e.target.value)}
-                          placeholder="Database name"
+                          value={details.database || ''}
+                          onChange={(e) => handleSourceConnectionDetailChange(index, 'database', e.target.value)}
+                          placeholder={source.type === 'mysql' ? 'e.g. inventory_db' : source.type === 'mongodb' ? 'e.g. analytics_db' : 'e.g. ecommerce_db'}
                           className="w-full px-3 py-2 rounded-none bg-black border border-zinc-800 text-white text-xs placeholder-zinc-600 focus:outline-none focus:border-sky-400 transition-colors font-mono"
                         />
                       </div>
-                      <label className="flex items-center gap-2 text-[10px] font-mono text-zinc-400 pt-1">
+
+                      {/* Require SSL */}
+                      <label className="flex items-center gap-2 text-[10px] font-mono text-zinc-400 pt-0.5 cursor-pointer">
                         <input
                           type="checkbox"
-                          checked={connectionDetails[source.identifier]?.ssl || false}
-                          onChange={(e) => handleConnectionDetailChange(source.identifier, 'ssl', e.target.checked)}
+                          checked={details.ssl || false}
+                          onChange={(e) => handleSourceConnectionDetailChange(index, 'ssl', e.target.checked)}
                           className="accent-sky-400"
                         />
-                        Require SSL
+                        Require SSL Connection
                       </label>
-                      <p className="text-[9px] text-zinc-600 font-mono">
-                        Password is entered later, directly in your terminal -- never here.
-                      </p>
                     </div>
 
                     {/* Engine Selector Tiles */}
@@ -483,7 +759,7 @@ export const DatabaseConfigForm: React.FC<DatabaseConfigFormProps> = ({
                             <button
                               key={engine.type}
                               type="button"
-                              onClick={() => handleSourceChange(index, 'type', engine.type)}
+                              onClick={() => handleSourceTypeChange(index, engine.type)}
                               className={`p-2 rounded-none border flex flex-col items-center gap-1 transition-all ${
                                 isSelected
                                   ? `${engine.color} ${engine.border} bg-black shadow-md scale-[1.02]`
@@ -636,8 +912,8 @@ export const DatabaseConfigForm: React.FC<DatabaseConfigFormProps> = ({
             </div>
 
             <div
-              style={{ height: `${totalH}px` }}
-              className="p-5 rounded-none bg-zinc-950 border border-blue-500/50 flex flex-col justify-between shadow-[0_0_20px_rgba(59,130,246,0.15)] relative"
+              style={{ minHeight: `${totalH}px` }}
+              className="p-5 rounded-none bg-zinc-950 border border-blue-500/50 flex flex-col justify-between shadow-[0_0_20px_rgba(59,130,246,0.15)] relative space-y-4"
             >
               <div className="flex items-center justify-between">
                 <span
@@ -653,7 +929,7 @@ export const DatabaseConfigForm: React.FC<DatabaseConfigFormProps> = ({
                 <span className="text-[10px] text-zinc-400 font-mono">{destination.identifier}</span>
               </div>
 
-              <div className="space-y-3 my-2">
+              <div className="space-y-3 my-1">
                 <div>
                   <label className="block text-[10px] font-mono font-semibold uppercase tracking-wider text-zinc-400 mb-1">
                     Destination Name
@@ -668,76 +944,147 @@ export const DatabaseConfigForm: React.FC<DatabaseConfigFormProps> = ({
                   />
                 </div>
                 <div>
-                  <label className="block text-[10px] font-mono font-semibold uppercase tracking-wider text-zinc-400 mb-1">
-                    Destination Identifier Tag
-                  </label>
+                  <div className="flex items-center justify-between mb-1">
+                    <label className={`block text-[10px] font-mono font-semibold uppercase tracking-wider ${
+                      activeDestError ? 'text-rose-400' : 'text-zinc-400'
+                    }`}>
+                      Destination Identifier Tag
+                    </label>
+                    {activeDestError && (
+                      <span className="text-[9px] font-mono text-rose-400 font-semibold uppercase tracking-wider">
+                        Conflict Detected
+                      </span>
+                    )}
+                  </div>
                   <input
+                    ref={destIdentifierInputRef}
+                    id="destination-identifier-input"
                     type="text"
                     required
                     value={destination.identifier}
-                    onChange={(e) =>
-                      setDestination({
-                        ...destination,
-                        identifier: e.target.value.toLowerCase().replace(/\s+/g, '_'),
-                      })
-                    }
-                    className="w-full px-3 py-2 rounded-none bg-black border border-zinc-800 text-blue-400 font-mono text-xs focus:outline-none focus:border-blue-400 transition-colors"
+                    onChange={(e) => handleDestinationIdentifierChange(e.target.value)}
+                    className={`w-full px-3 py-2 rounded-none bg-black font-mono text-xs focus:outline-none transition-all ${
+                      activeDestError
+                        ? 'border-2 border-rose-500 text-rose-300 focus:border-rose-400 bg-rose-950/20 shadow-[0_0_12px_rgba(244,63,94,0.3)]'
+                        : 'border border-zinc-800 text-blue-400 focus:border-blue-400'
+                    }`}
                   />
+                  {activeDestError && (
+                    <p className="text-[11px] font-mono text-rose-400 mt-1.5 flex items-center gap-1.5 font-medium animate-in fade-in slide-in-from-top-1 duration-150">
+                      <AlertCircle className="w-3.5 h-3.5 flex-shrink-0 text-rose-400" />
+                      <span>{activeDestError}</span>
+                    </p>
+                  )}
                 </div>
               </div>
 
-              {/* Connection Details (host/port/username/database only -- password is
-                  NEVER collected here; it stays a manual placeholder the user fills
-                  into the copied command themselves, so it never touches the browser
-                  state or this form at all). */}
-              <div className="space-y-2 pt-2 border-t border-zinc-900">
-                <label className="block text-[10px] font-mono font-semibold uppercase tracking-wider text-zinc-400">
-                  Connection Details
-                </label>
+              {/* Target Connection Details Section with Password and Explicit Labels */}
+              <div className="space-y-3 pt-3 border-t border-zinc-900">
+                <div className="flex items-center justify-between">
+                  <label className="flex items-center gap-1.5 text-[10px] font-mono font-bold uppercase tracking-wider text-zinc-300">
+                    <Key className="w-3 h-3 text-blue-400" />
+                    <span>Target Credentials</span>
+                    <span className="text-[9px] font-normal text-zinc-500 font-sans">(Optional Auto-Fill)</span>
+                  </label>
+                  {Boolean(destinationConnectionDetails.host || destinationConnectionDetails.username || destinationConnectionDetails.password || destinationConnectionDetails.database) ? (
+                    <span className="text-[9px] font-mono text-emerald-400 bg-emerald-400/10 px-2 py-0.5 border border-emerald-400/30">
+                      Auto-Fill Active
+                    </span>
+                  ) : (
+                    <span className="text-[9px] font-mono text-zinc-500">
+                      Leave blank for terminal edit
+                    </span>
+                  )}
+                </div>
+
+                {/* Host & Port */}
                 <div className="grid grid-cols-3 gap-2">
-                  <input
-                    type="text"
-                    value={connectionDetails[destination.identifier]?.host || ''}
-                    onChange={(e) => handleConnectionDetailChange(destination.identifier, 'host', e.target.value)}
-                    placeholder="Host (e.g. db.example.com)"
-                    className="col-span-2 w-full px-3 py-2 rounded-none bg-black border border-zinc-800 text-white text-xs placeholder-zinc-600 focus:outline-none focus:border-sky-400 transition-colors font-mono"
-                  />
-                  <input
-                    type="text"
-                    value={connectionDetails[destination.identifier]?.port || ''}
-                    onChange={(e) => handleConnectionDetailChange(destination.identifier, 'port', e.target.value)}
-                    placeholder="Port"
-                    className="w-full px-3 py-2 rounded-none bg-black border border-zinc-800 text-white text-xs placeholder-zinc-600 focus:outline-none focus:border-sky-400 transition-colors font-mono"
-                  />
+                  <div className="col-span-2 space-y-1">
+                    <label className="block text-[9px] font-mono uppercase text-zinc-400">
+                      Host / IP
+                    </label>
+                    <input
+                      type="text"
+                      value={destinationConnectionDetails.host || ''}
+                      onChange={(e) => handleDestinationConnectionDetailChange('host', e.target.value)}
+                      placeholder="Host or IP (e.g. localhost)"
+                      className="w-full px-3 py-1.5 rounded-none bg-black border border-zinc-800 text-white text-xs placeholder-zinc-600 focus:outline-none focus:border-blue-400 transition-colors font-mono"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="block text-[9px] font-mono uppercase text-zinc-400">Port</label>
+                    <input
+                      type="text"
+                      value={destinationConnectionDetails.port || ''}
+                      onChange={(e) => handleDestinationConnectionDetailChange('port', e.target.value)}
+                      placeholder={destination.type === 'mysql' ? '3307' : destination.type === 'mongodb' ? '27017' : '5434'}
+                      className="w-full px-3 py-1.5 rounded-none bg-black border border-zinc-800 text-white text-xs placeholder-zinc-600 focus:outline-none focus:border-blue-400 transition-colors font-mono"
+                    />
+                  </div>
                 </div>
+
+                {/* Username & Password */}
                 <div className="grid grid-cols-2 gap-2">
+                  <div className="space-y-1">
+                    <label className="block text-[9px] font-mono uppercase text-zinc-400">Username</label>
+                    <input
+                      type="text"
+                      value={destinationConnectionDetails.username || ''}
+                      onChange={(e) => handleDestinationConnectionDetailChange('username', e.target.value)}
+                      placeholder={destination.type === 'mysql' || destination.type === 'mongodb' ? 'root' : 'postgres'}
+                      className="w-full px-3 py-1.5 rounded-none bg-black border border-zinc-800 text-white text-xs placeholder-zinc-600 focus:outline-none focus:border-blue-400 transition-colors font-mono"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="block text-[9px] font-mono uppercase text-zinc-400">Password</label>
+                    <div className="relative">
+                      <input
+                        type={showDestPassword ? 'text' : 'password'}
+                        value={destinationConnectionDetails.password || ''}
+                        onChange={(e) => handleDestinationConnectionDetailChange('password', e.target.value)}
+                        placeholder="Password"
+                        className="w-full px-3 py-1.5 pr-8 rounded-none bg-black border border-zinc-800 text-white text-xs placeholder-zinc-600 focus:outline-none focus:border-blue-400 transition-colors font-mono"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowDestPassword((p) => !p)}
+                        className="absolute right-2 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-white"
+                        title={showDestPassword ? 'Hide password' : 'Show password'}
+                      >
+                        {showDestPassword ? (
+                          <EyeOff className="w-3.5 h-3.5 text-zinc-400 hover:text-white" />
+                        ) : (
+                          <Eye className="w-3.5 h-3.5 text-zinc-400 hover:text-white" />
+                        )}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Database Name */}
+                <div className="space-y-1">
+                  <label className="block text-[9px] font-mono uppercase text-zinc-400">
+                    Database Name <span className="text-zinc-500 font-sans">(appended to connection URL)</span>
+                  </label>
                   <input
                     type="text"
-                    value={connectionDetails[destination.identifier]?.username || ''}
-                    onChange={(e) => handleConnectionDetailChange(destination.identifier, 'username', e.target.value)}
-                    placeholder="Username"
-                    className="w-full px-3 py-2 rounded-none bg-black border border-zinc-800 text-white text-xs placeholder-zinc-600 focus:outline-none focus:border-sky-400 transition-colors font-mono"
-                  />
-                  <input
-                    type="text"
-                    value={connectionDetails[destination.identifier]?.database || ''}
-                    onChange={(e) => handleConnectionDetailChange(destination.identifier, 'database', e.target.value)}
-                    placeholder="Database name"
-                    className="w-full px-3 py-2 rounded-none bg-black border border-zinc-800 text-white text-xs placeholder-zinc-600 focus:outline-none focus:border-sky-400 transition-colors font-mono"
+                    value={destinationConnectionDetails.database || ''}
+                    onChange={(e) => handleDestinationConnectionDetailChange('database', e.target.value)}
+                    placeholder={destination.type === 'mysql' ? 'e.g. inventory_db' : destination.type === 'mongodb' ? 'e.g. analytics_db' : 'e.g. migration_platform'}
+                    className="w-full px-3 py-1.5 rounded-none bg-black border border-zinc-800 text-white text-xs placeholder-zinc-600 focus:outline-none focus:border-blue-400 transition-colors font-mono"
                   />
                 </div>
-                <label className="flex items-center gap-2 text-[10px] font-mono text-zinc-400 pt-1">
+
+                {/* Require SSL */}
+                <label className="flex items-center gap-2 text-[10px] font-mono text-zinc-400 pt-0.5 cursor-pointer">
                   <input
                     type="checkbox"
-                    checked={connectionDetails[destination.identifier]?.ssl || false}
-                    onChange={(e) => handleConnectionDetailChange(destination.identifier, 'ssl', e.target.checked)}
-                    className="accent-sky-400"
+                    checked={destinationConnectionDetails.ssl || false}
+                    onChange={(e) => handleDestinationConnectionDetailChange('ssl', e.target.checked)}
+                    className="accent-blue-400"
                   />
-                  Require SSL
+                  Require SSL Connection
                 </label>
-                <p className="text-[9px] text-zinc-600 font-mono">
-                  Password is entered later, directly in your terminal -- never here.
-                </p>
               </div>
 
               {/* Engine Selector Tiles for Destination */}
@@ -754,7 +1101,7 @@ export const DatabaseConfigForm: React.FC<DatabaseConfigFormProps> = ({
                       <button
                         key={engine.type}
                         type="button"
-                        onClick={() => setDestination({ ...destination, type: engine.type })}
+                        onClick={() => handleDestinationTypeChange(engine.type)}
                         className={`p-2 rounded-none border flex flex-col items-center gap-1 transition-all ${
                           isSelected
                             ? `${engine.color} ${engine.border} bg-black shadow-md scale-[1.02]`

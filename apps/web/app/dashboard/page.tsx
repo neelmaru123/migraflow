@@ -4,7 +4,7 @@ import React, { useState, useEffect } from 'react';
 import Link from 'next/link';
 import { AgentDetailResponse, AgentDockerCommandResponse } from '../../types/agent';
 import agentService from '../../services/agentService';
-import { Activity, Plus, Terminal, Trash2, ArrowRight, Copy, Check, RefreshCw, ShieldAlert, ShieldCheck, Monitor, Code, FileCode, AlertTriangle, Sliders, Database, ChevronDown, ChevronUp, LogOut } from 'lucide-react';
+import { Activity, Plus, Terminal, Trash2, ArrowRight, Copy, Check, RefreshCw, ShieldAlert, ShieldCheck, Monitor, Code, FileCode, AlertTriangle, Sliders, Database, ChevronDown, ChevronUp, LogOut, Eye, EyeOff } from 'lucide-react';
 import { ConnectionDetails, substituteConnectionPlaceholders } from '../../lib/dockerCommandUtils';
 import toast from 'react-hot-toast';
 import { useAuthUser } from '../../hooks/queries/useAuthUser';
@@ -42,6 +42,7 @@ export default function DashboardPage() {
   // Connection details re-entered by the user for THIS viewing session only
   // (never persisted, never sent anywhere -- mirrors the create-agent flow).
   const [modalConnectionDetails, setModalConnectionDetails] = useState<Record<string, ConnectionDetails>>({});
+  const [showModalPasswords, setShowModalPasswords] = useState<Record<string, boolean>>({});
   const [showRegenerateConfirm, setShowRegenerateConfirm] = useState<boolean>(false);
   const [regenerating, setRegenerating] = useState<boolean>(false);
   const [showConnectionConfig, setShowConnectionConfig] = useState<boolean>(false);
@@ -78,6 +79,7 @@ export default function DashboardPage() {
     setSelectedAgentForCmd(ag);
     setDockerCmdData(null);
     setModalConnectionDetails({});
+    setShowModalPasswords({});
     setShowRegenerateConfirm(false);
     setShowConnectionConfig(false);
     setLoadingCmd(true);
@@ -98,7 +100,7 @@ export default function DashboardPage() {
   ) => {
     setModalConnectionDetails((prev) => ({
       ...prev,
-      [identifier]: { ...(prev[identifier] || { host: '', port: '', username: '', database: '', ssl: false }), [field]: value },
+      [identifier]: { ...(prev[identifier] || { host: '', port: '', username: '', database: '', password: '', ssl: false }), [field]: value },
     }));
   };
 
@@ -695,7 +697,7 @@ export default function DashboardPage() {
                                   onChange={(e) =>
                                     handleModalConnectionChange(ds.identifier, 'host', e.target.value)
                                   }
-                                  placeholder="Host (e.g. localhost)"
+                                  placeholder="Host (e.g. host.docker.internal)"
                                   className="col-span-2 px-2.5 py-1.5 bg-zinc-950 border border-zinc-800 text-white text-[11px] font-mono focus:border-sky-400 focus:outline-none transition-colors"
                                 />
                                 <input
@@ -710,24 +712,64 @@ export default function DashboardPage() {
                               </div>
 
                               <div className="grid grid-cols-2 gap-1.5">
-                                <input
-                                  type="text"
-                                  value={modalConnectionDetails[ds.identifier]?.username || ''}
-                                  onChange={(e) =>
-                                    handleModalConnectionChange(ds.identifier, 'username', e.target.value)
-                                  }
-                                  placeholder="Username"
-                                  className="px-2.5 py-1.5 bg-zinc-950 border border-zinc-800 text-white text-[11px] font-mono focus:border-sky-400 focus:outline-none transition-colors"
-                                />
-                                <input
-                                  type="text"
-                                  value={modalConnectionDetails[ds.identifier]?.database || ''}
-                                  onChange={(e) =>
-                                    handleModalConnectionChange(ds.identifier, 'database', e.target.value)
-                                  }
-                                  placeholder="Database Name"
-                                  className="px-2.5 py-1.5 bg-zinc-950 border border-zinc-800 text-white text-[11px] font-mono focus:border-sky-400 focus:outline-none transition-colors"
-                                />
+                                <div>
+                                  <label className="text-[10px] text-zinc-400 font-mono mb-1 block">Username</label>
+                                  <input
+                                    type="text"
+                                    value={modalConnectionDetails[ds.identifier]?.username || ''}
+                                    onChange={(e) =>
+                                      handleModalConnectionChange(ds.identifier, 'username', e.target.value)
+                                    }
+                                    placeholder="Username"
+                                    className="w-full px-2.5 py-1.5 bg-zinc-950 border border-zinc-800 text-white text-[11px] font-mono focus:border-sky-400 focus:outline-none transition-colors"
+                                  />
+                                </div>
+                                <div>
+                                  <label className="text-[10px] text-zinc-400 font-mono mb-1 block">Database Name</label>
+                                  <input
+                                    type="text"
+                                    value={modalConnectionDetails[ds.identifier]?.database || ''}
+                                    onChange={(e) =>
+                                      handleModalConnectionChange(ds.identifier, 'database', e.target.value)
+                                    }
+                                    placeholder="Database Name"
+                                    className="w-full px-2.5 py-1.5 bg-zinc-950 border border-zinc-800 text-white text-[11px] font-mono focus:border-sky-400 focus:outline-none transition-colors"
+                                  />
+                                </div>
+                              </div>
+
+                              <div>
+                                <label className="text-[10px] text-zinc-400 font-mono mb-1 block">
+                                  Password <span className="text-zinc-600 font-normal">(optional, browser-only)</span>
+                                </label>
+                                <div className="relative">
+                                  <input
+                                    type={showModalPasswords[ds.identifier] ? 'text' : 'password'}
+                                    value={modalConnectionDetails[ds.identifier]?.password || ''}
+                                    onChange={(e) =>
+                                      handleModalConnectionChange(ds.identifier, 'password', e.target.value)
+                                    }
+                                    placeholder="Password (substitutes <..._PASSWORD> in command)"
+                                    className="w-full px-2.5 py-1.5 pr-8 bg-zinc-950 border border-zinc-800 text-white text-[11px] font-mono focus:border-sky-400 focus:outline-none transition-colors"
+                                  />
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      setShowModalPasswords((prev) => ({
+                                        ...prev,
+                                        [ds.identifier]: !prev[ds.identifier],
+                                      }))
+                                    }
+                                    className="absolute right-2 top-1/2 -translate-y-1/2 text-zinc-500 hover:text-zinc-300 transition-colors"
+                                    tabIndex={-1}
+                                  >
+                                    {showModalPasswords[ds.identifier] ? (
+                                      <EyeOff className="w-3.5 h-3.5" />
+                                    ) : (
+                                      <Eye className="w-3.5 h-3.5" />
+                                    )}
+                                  </button>
+                                </div>
                               </div>
                             </div>
                           );
@@ -738,12 +780,18 @@ export default function DashboardPage() {
                 </div>
               )}
 
-              {/* Password Notice */}
-              <div className="p-3 bg-sky-400/5 border border-sky-400/25 text-sky-300 text-[11px] leading-relaxed flex items-center gap-2">
-                <span className="text-base shrink-0">💡</span>
-                <span>
-                  Replace password placeholders (e.g. <code className="text-white font-bold">&lt;..._PASSWORD&gt;</code>) with actual database passwords before executing. Passwords are never stored on the server.
-                </span>
+              {/* Password & Credentials Notice */}
+              <div className="p-3 bg-sky-400/5 border border-sky-400/25 text-sky-300 text-[11px] leading-relaxed flex items-start gap-2.5">
+                <span className="text-base shrink-0 mt-0.5">💡</span>
+                <div className="space-y-1">
+                  <p className="font-semibold text-white">Fill Credentials Now or Replace in Terminal Later</p>
+                  <p>
+                    You can enter host, port, credentials, and passwords above to auto-substitute them into the command preview. Alternatively, leave any field blank and replace the placeholders (such as <code className="text-sky-200 font-mono bg-sky-950/60 px-1 py-0.5 border border-sky-800/40">&lt;..._PASSWORD&gt;</code>) directly in your terminal before running.
+                  </p>
+                  <p className="text-[10px] text-zinc-400">
+                    🔒 Zero Storage Guarantee: Credentials and passwords entered here exist only in your local browser memory and are never sent or stored on the server.
+                  </p>
+                </div>
               </div>
 
               {/* Regenerate Token Section */}

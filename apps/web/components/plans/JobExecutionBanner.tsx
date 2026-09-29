@@ -704,7 +704,7 @@ export const JobExecutionBanner: React.FC<JobExecutionBannerProps> = ({
           {diagnosis?.copyable_fix_command && (
             <div className="space-y-1.5">
               <div className="flex items-center justify-between text-[10px] font-bold text-amber-400 uppercase">
-                <span>📋 Copyable Container Fix Command (Password Placeholders Retained):</span>
+                <span>📋 {diagnosis.copyable_fix_label || (diagnosis.is_user_environment_issue ? 'Copyable Container Fix Command (Password Placeholders Retained):' : 'Copyable Database / Schema Fix Command:')}</span>
                 <button
                   type="button"
                   onClick={() => {
