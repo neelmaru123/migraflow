@@ -61,6 +61,9 @@ RULES & INDUSTRY DATABASE ARCHITECTURE STANDARDS:
    - post_migration_ddl: include CREATE INDEX and ALTER TABLE ... ADD CONSTRAINT FOREIGN KEY DDL statements.
    - Index naming convention: idx_{tablename}_{columnname}
    - Foreign key constraint naming convention: fk_{srctable}_{tgttable}_{columnname}
+   - FOREIGN KEY TARGET COLUMN UNIQUENESS (CRITICAL FOR POSTGRESQL & SQL STANDARDS):
+     * A FOREIGN KEY constraint can ONLY reference a column that is either the table's PRIMARY KEY or explicitly defined with a UNIQUE constraint / unique index.
+     * If a foreign key in post_migration_ddl references a non-PK column (for example, 'ALTER TABLE tickets ADD CONSTRAINT ... FOREIGN KEY (customer_email) REFERENCES leads(email)'), you MUST ensure that the referenced target column ('email' in 'leads') is declared with 'UNIQUE' in 'pre_migration_ddl' (e.g. 'email VARCHAR(255) UNIQUE') OR include 'CREATE UNIQUE INDEX IF NOT EXISTS uq_{ref_table}_{ref_col} ON {ref_table} ({ref_col});' in post_migration_ddl BEFORE the foreign key statement! Failure to declare the referenced column as UNIQUE will cause fatal database constraint violations (psycopg2.errors.InvalidForeignKey).
 8. For EVERY column in EVERY source table, you MUST output a column_mapping with:
    - transformation_type from the ALLOWED TAXONOMY.
    - ui_badge_type that EXACTLY matches transformation_type.
@@ -373,7 +376,7 @@ class LLMPlanGeneratorService:
                 result = parser.parse(content)
 
                 logger.info(f"LLM plan generation succeeded on attempt {attempt}.")
-                return result
+                return self._sanitize_post_migration_ddl(result)
 
             except Exception as exc:
                 last_error = exc
@@ -383,6 +386,48 @@ class LLMPlanGeneratorService:
             f"LLM plan generation failed after {max_retries} attempts. "
             f"Last error: {last_error}"
         )
+
+    @staticmethod
+    def _sanitize_post_migration_ddl(ast: TransformationPlanAST) -> TransformationPlanAST:
+        """
+        Guarantees that any column referenced by a foreign key constraint in post_migration_ddl
+        is preceded by a CREATE UNIQUE INDEX statement if it is not the standard primary key.
+        Prevents PostgreSQL InvalidForeignKey: there is no unique constraint matching given keys.
+        """
+        import re
+
+        fk_pattern = re.compile(
+            r'REFERENCES\s+["`]?([a-zA-Z0-9_]+)["`]?\s*\(\s*["`]?([a-zA-Z0-9_]+)["`]?\s*\)',
+            re.IGNORECASE,
+        )
+
+        unique_indices_to_add = []
+        seen = set()
+
+        for ddl in (ast.post_migration_ddl or []):
+            for match in fk_pattern.finditer(ddl):
+                ref_table = match.group(1).lower()
+                ref_col = match.group(2).lower()
+                if ref_col != "id" and (ref_table, ref_col) not in seen:
+                    seen.add((ref_table, ref_col))
+                    already_indexed = any(
+                        re.search(
+                            rf'CREATE\s+UNIQUE\s+INDEX.*ON\s+["`]?{ref_table}["`]?\s*\(\s*["`]?{ref_col}["`]?\s*\)',
+                            s,
+                            re.IGNORECASE,
+                        )
+                        for s in (ast.post_migration_ddl or [])
+                    )
+                    if not already_indexed:
+                        unique_indices_to_add.append(
+                            f'CREATE UNIQUE INDEX IF NOT EXISTS "uq_{ref_table}_{ref_col}" ON "{ref_table}" ("{ref_col}");'
+                        )
+
+        if unique_indices_to_add:
+            logger.info(f"Auto-prepended {len(unique_indices_to_add)} unique index prerequisite(s) to post_migration_ddl: {unique_indices_to_add}")
+            ast.post_migration_ddl = unique_indices_to_add + (ast.post_migration_ddl or [])
+
+        return ast
 
     def refine(
         self,
@@ -498,7 +543,7 @@ class LLMPlanGeneratorService:
                         result.refinement_feedback.user_prompt = user_feedback
 
                 logger.info(f"LLM plan refinement succeeded on attempt {attempt}.")
-                return result
+                return self._sanitize_post_migration_ddl(result)
             except Exception as exc:
                 last_error = exc
                 logger.warning(f"LLM refinement attempt {attempt} failed: {exc}")
