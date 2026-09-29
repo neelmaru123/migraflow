@@ -143,5 +143,23 @@ export function substituteConnectionPlaceholders(
     }
   }
 
+  // Dynamic host adaptation: If user is accessing the web console from a public IP / domain (e.g. EC2 or staging domain),
+  // and the generated command contains the local fallback "http://host.docker.internal:8000" or "localhost",
+  // dynamically replace it with the accessible public endpoint so remote agents connect cleanly.
+  if (typeof window !== 'undefined') {
+    const host = window.location.hostname;
+    const isLocal = host === 'localhost' || host === '127.0.0.1';
+    if (!isLocal) {
+      const publicBackend =
+        window.location.protocol === 'https:'
+          ? `${window.location.origin}`
+          : `${window.location.protocol}//${host}:8000`;
+      result = result.split('BACKEND_URL="http://host.docker.internal:8000"').join(`BACKEND_URL="${publicBackend}"`);
+      result = result.split('BACKEND_URL="http://localhost:8000"').join(`BACKEND_URL="${publicBackend}"`);
+      result = result.split('BACKEND_URL=http://host.docker.internal:8000').join(`BACKEND_URL=${publicBackend}`);
+      result = result.split('BACKEND_URL=http://localhost:8000').join(`BACKEND_URL=${publicBackend}`);
+    }
+  }
+
   return result;
 }
