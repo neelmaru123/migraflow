@@ -43,7 +43,7 @@ export const DockerCommandOutput: React.FC<DockerCommandOutputProps> = ({
     agent.docker_command ||
     `docker run -d --name agent_${agent.agent_identifier} -e AGENT_TOKEN="${
       agent.api_token || '<YOUR_AGENT_TOKEN>'
-    }" -e BACKEND_URL="${typeof window !== 'undefined' ? `${window.location.protocol}//${window.location.hostname}:8000` : 'http://localhost:8000'}" data-migration-agent:latest`;
+    }" -e BACKEND_URL="${typeof window !== 'undefined' ? (window.location.protocol === 'https:' ? `${window.location.protocol}//${window.location.hostname}` : `${window.location.protocol}//${window.location.hostname}:8000`) : 'http://localhost:8000'}" data-migration-agent:latest`;
 
   const rawPowershellCmd =
     dockerCmdData?.docker_command_powershell ||
@@ -60,10 +60,20 @@ export const DockerCommandOutput: React.FC<DockerCommandOutputProps> = ({
     agent.env_template ||
     `AGENT_TOKEN=${agent.api_token || '<YOUR_AGENT_TOKEN>'}\nBACKEND_URL=http://localhost:8000`;
 
-  const bashCmd = substituteConnectionPlaceholders(rawBashCmd, sources, destination, connectionDetailsByIdentifier);
-  const powershellCmd = substituteConnectionPlaceholders(rawPowershellCmd, sources, destination, connectionDetailsByIdentifier);
-  const onelineCmd = substituteConnectionPlaceholders(rawOnelineCmd, sources, destination, connectionDetailsByIdentifier);
-  const envTemplate = substituteConnectionPlaceholders(rawEnvTemplate, sources, destination, connectionDetailsByIdentifier);
+  const resolvedSources =
+    sources && sources.length > 0
+      ? sources
+      : (agent.data_sources || []).filter((d: any) => d.role === 'source');
+
+  const resolvedDestination =
+    destination ||
+    (agent.data_sources || []).find((d: any) => d.role === 'target' || d.role === 'destination' || d.role === 'dest') ||
+    null;
+
+  const bashCmd = substituteConnectionPlaceholders(rawBashCmd, resolvedSources, resolvedDestination, connectionDetailsByIdentifier);
+  const powershellCmd = substituteConnectionPlaceholders(rawPowershellCmd, resolvedSources, resolvedDestination, connectionDetailsByIdentifier);
+  const onelineCmd = substituteConnectionPlaceholders(rawOnelineCmd, resolvedSources, resolvedDestination, connectionDetailsByIdentifier);
+  const envTemplate = substituteConnectionPlaceholders(rawEnvTemplate, resolvedSources, resolvedDestination, connectionDetailsByIdentifier);
 
   // Subscribe to real-time WebSocket for live heartbeat ping
   useEffect(() => {
@@ -262,10 +272,10 @@ export const DockerCommandOutput: React.FC<DockerCommandOutputProps> = ({
 
         <ol className="list-decimal list-inside text-xs text-zinc-400 space-y-2 leading-relaxed font-sans">
           <li>
-            Paste the command into your local shell terminal. Replace the placeholder parameters (such as <code className="text-sky-400 font-mono">&lt;SRC_..._HOST&gt;</code>, <code className="text-sky-400 font-mono">&lt;SRC_..._PORT&gt;</code>, <code className="text-sky-400 font-mono">&lt;SRC_..._USER&gt;</code>, <code className="text-sky-400 font-mono">&lt;SRC_..._PASSWORD&gt;</code>, <code className="text-sky-400 font-mono">&lt;SRC_..._NAME&gt;</code>) with your actual database connection credentials.
+            If you entered your database connection credentials during setup, they have been <strong className="text-emerald-400">automatically filled</strong> in the command above. Any unfilled parameters (e.g. <code className="text-sky-400 font-mono">&lt;SRC_..._PASSWORD&gt;</code> or <code className="text-sky-400 font-mono">&lt;..._HOST&gt;</code>) should be replaced with your actual database credentials before running.
           </li>
           <li>
-            The control plane <strong className="text-white">never</strong> receives or stores your database credentials or passwords.
+            The control plane <strong className="text-white">never</strong> receives or stores your database credentials or passwords over the network.
           </li>
           <li>
             The container will automatically execute the startup handshake using the generated <code className="text-sky-400 font-mono">AGENT_TOKEN</code>.

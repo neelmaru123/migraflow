@@ -76,6 +76,7 @@ RULES & INDUSTRY DATABASE ARCHITECTURE STANDARDS:
     - High-coverage fields (coverage >= 20%): Use 'nosql_field_promote' or 'json_flatten' to extract into dedicated SQL columns.
     - Nested document paths (e.g. address.city): Use 'json_flatten' to convert to snake_case target columns (e.g. address_city).
     - Unmapped or low-coverage fields (< 20%): Preserve zero data loss by storing in a catch-all column named 'extra_attributes' (JSONB for PostgreSQL, JSON for MySQL, TEXT for SQLite) using 'json_stringify'.
+    - CRITICAL NULLABILITY RULE: In 'pre_migration_ddl', ALL columns converted or flattened from MongoDB/NoSQL fields (except the primary key 'id' and audit timestamps with defaults) MUST BE NULLABLE (e.g. no NOT NULL constraint). NEVER add 'NOT NULL' constraints to promoted NoSQL columns, because NoSQL collections are polymorphic and fields do not exist on every document. Adding NOT NULL will cause fatal constraint violations during ETL execution.
 15. POSTGRESQL ARRAYS & JSON CROSS-DIALECT CONVERSION:
     - When target is MySQL/SQLite and source column is a Postgres Array (TEXT[], INT[]):
       - Use 'array_to_csv' for simple text arrays (e.g. tags -> "tag1,tag2").

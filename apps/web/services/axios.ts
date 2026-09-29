@@ -3,11 +3,18 @@ import toast from 'react-hot-toast';
 import Cookies from 'js-cookie';
 
 const getInitialBaseUrl = (): string => {
+  if (typeof window !== 'undefined') {
+    const host = window.location.hostname;
+    const isLocal = host === 'localhost' || host === '127.0.0.1';
+    if (!isLocal) {
+      if (window.location.protocol === 'https:') {
+        return `${window.location.origin}/api/v1`;
+      }
+      return `${window.location.protocol}//${host}:8000/api/v1`;
+    }
+  }
   if (process.env.NEXT_PUBLIC_API_URL) {
     return process.env.NEXT_PUBLIC_API_URL;
-  }
-  if (typeof window !== 'undefined' && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
-    return `${window.location.protocol}//${window.location.hostname}:8000/api/v1`;
   }
   return 'http://localhost:8000/api/v1';
 };
@@ -20,12 +27,16 @@ export const apiClient = axios.create({
 });
 
 apiClient.interceptors.request.use((config) => {
-  if (typeof window !== 'undefined' && (!config.baseURL || config.baseURL.includes('localhost'))) {
+  if (typeof window !== 'undefined') {
     const host = window.location.hostname;
-    if (host !== 'localhost' && host !== '127.0.0.1') {
-      config.baseURL = (process.env.NEXT_PUBLIC_API_URL && !process.env.NEXT_PUBLIC_API_URL.includes('localhost'))
-        ? process.env.NEXT_PUBLIC_API_URL
-        : `${window.location.protocol}//${host}:8000/api/v1`;
+    const isLocal = host === 'localhost' || host === '127.0.0.1';
+
+    if (!isLocal) {
+      if (window.location.protocol === 'https:') {
+        config.baseURL = `${window.location.origin}/api/v1`;
+      } else {
+        config.baseURL = `${window.location.protocol}//${host}:8000/api/v1`;
+      }
     }
   }
 
@@ -93,6 +104,10 @@ apiClient.interceptors.response.use(
       } catch (refreshError) {
         isRefreshing = false;
         processQueue(refreshError);
+
+        // Clear client auth cookies to prevent infinite redirect loops
+        Cookies.remove('logged_in', { path: '/' });
+        Cookies.remove('active_org_id', { path: '/' });
 
         // Refresh failed, usually means user needs to log in again
         toast.error('Session expired. Please log in again.', { id: 'session-expired' });
