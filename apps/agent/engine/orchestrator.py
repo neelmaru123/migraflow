@@ -129,6 +129,18 @@ class ExecutionOrchestrator:
                 DDLExecutor.execute_ddl_list(target_db_url, pre_ddl, "Pre-Migration DDL")
             else:
                 logger.info(f"[DRY RUN] Pre-Migration DDL skipped ({len(pre_ddl)} statements).")
+                logger.info("[DRY RUN] Performing non-destructive target database preflight schema validation...")
+                schema_warnings = DDLExecutor.validate_target_schema_compatibility(
+                    target_db_url, target_engine_type, table_mappings
+                )
+                if schema_warnings:
+                    logger.warning(
+                        f"=== [DRY RUN SCHEMA COMPATIBILITY WARNINGS] ===\n"
+                        f"Found {len(schema_warnings)} potential database constraint conflict(s) in destination tables:\n"
+                        + "\n".join(f"  • {w}" for w in schema_warnings)
+                    )
+                else:
+                    logger.info("[DRY RUN] Preflight schema validation passed! Target tables match migration plan specifications.")
 
             # Step 2: Data Extraction, AST Transformation, Merge, and Target Loading
             for idx, table_spec in enumerate(table_mappings, start=1):

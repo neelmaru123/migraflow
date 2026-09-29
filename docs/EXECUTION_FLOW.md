@@ -71,16 +71,23 @@
 
 ### Phase D: AI Execution Error Diagnosis & Self-Healing Loop
 
-1. **Agent Error Dispatch**:
+1. **Agent Error Trapping & Driver Detail Preservation**:
+   - In [`apps/agent/engine/writers/target_writer.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/agent/engine/writers/target_writer.py), when batch bulk inserts fail, row-level retries record `last_sample_error` (e.g. `psycopg2.errors.NotNullViolation: null value in column "stock_id" of relation "inventory_stock"`).
+   - If the error threshold is exceeded, the agent appends `Cause: {last_sample_error}` to the abort `RuntimeError`.
    - Docker Agent catches runtime exception in universal 7-phase guard in [`main.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/agent/main.py#L503-L512).
-   - Dispatches `POST /api/v1/execution/jobs/{job_id}/progress` with `status: "failed"` and `error_message`.
-2. **Background AI Diagnosis Synthesis**:
+   - Dispatches `POST /api/v1/execution/jobs/{job_id}/progress` with `status: "failed"` and detailed `error_message`.
+2. **Background AI Diagnosis Synthesis (Gemini LLM & Heuristics)**:
    - Backend `update_job_progress()` sets `job.status = "failed"` and spawns `asyncio.create_task(_run_diagnosis_background(job_id))` using a fresh `AsyncSessionLocal()`.
-   - `ExecutionService.diagnose_job_failure()` acquires atomic row lock (`with_for_update(skip_locked=True)`), checks pattern/regex rules, synthesizes plain-English explanation, formats copyable `docker run` command with password placeholders, and persists `job.ai_diagnosis`.
-3. **UI Real-Time Rendering & Remediation**:
+   - `ExecutionService.diagnose_job_failure()` acquires atomic row lock (`with_for_update(skip_locked=True)`).
+   - **Gemini AI Synthesis**: If `GEMINI_API_KEY` is configured, prompts Gemini with structured Pydantic schema (`LLMDiagnosisResponse`) to generate a conversational, Antigravity-like plain-English explanation, identify the offending table/column, and draft actionable remediation steps with copyable SQL.
+   - **Deterministic Fallback**: If LLM is unreachable, regex parsers extract constraint names, tables, and columns (`NOT_NULL_CONSTRAINT_VIOLATION`, `UNIQUE_CONSTRAINT_VIOLATION`, `FOREIGN_KEY_CONSTRAINT_VIOLATION`, `HIGH_ROW_ERROR_RATE`).
+   - **Remediation Command Categorization**: Database constraint errors generate copyable SQL statements (e.g. `ALTER TABLE "inventory_stock" ALTER COLUMN "stock_id" DROP NOT NULL;` or inspection queries) and dynamic label `"SQL Schema Fix (Run in Destination DB)"`, strictly suppressing misleading `docker run` container commands. Container commands are only attached if the error is a host/network/auth environment issue.
+3. **Dry Run Pre-Flight Destination Schema Validation**:
+   - In [`apps/agent/engine/ddl_executor.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/agent/engine/ddl_executor.py) `validate_target_schema_compatibility()`, Dry Run queries `information_schema.columns` to detect existing destination tables with unmapped `NOT NULL` columns lacking default values, logging immediate warnings before real execution.
+4. **UI Real-Time Rendering & Remediation**:
    - `JobExecutionBanner.tsx` 2-second polling tick fetches updated job details via `executionService.getExecutionDetails()`.
-   - UI renders **AI Failure Diagnosis Card**, root cause badge, step-by-step remediation list, and 1-click **Copy Command** button.
-   - User can click **`⚡ RETRY MIGRATION JOB`** to queue a fresh job attempt or switch between historical runs (`Run #1`, `Run #2`) using the run selector dropdown.
+   - UI renders **AI Failure Diagnosis Card**, root cause badge, plain-English summary, step-by-step remediation list, and 1-click **Copy Command** button with dynamic header (`📋 SQL SCHEMA FIX (RUN IN DESTINATION DB)`).
+   - User can click **`⚡ RETRY MIGRATION JOB`** or **`⚡ RESUME MIGRATION`** to resume from last checkpoint.
 
 ### Phase E: Docker Agent Fatal Stopping Error Reporting & UI Callout
 
@@ -1165,4 +1172,86 @@ sequenceDiagram
 - **[NEW]**: [`infra/docker/init-mongo-dbs.js`](file:///d:/GitHub/Ai_data_migration_platform/infra/docker/init-mongo-dbs.js) — MongoDB multi-database init script.
 - **[NEW]**: [`DATABASE_CREDENTIALS.md`](file:///d:/GitHub/Ai_data_migration_platform/DATABASE_CREDENTIALS.md) — Master credentials and catalog reference.
 - **[NEW]**: [`database_credentials.env`](file:///d:/GitHub/Ai_data_migration_platform/database_credentials.env) — Master environment variable credentials file.
+
+---
+
+# Execution Flow — Client-Side Database Credential Auto-Fill & Command Substitution
+
+## 1. Entry Point
+- **Files**:
+  - [`apps/web/app/agents/create/page.tsx`](file:///d:/GitHub/Ai_data_migration_platform/apps/web/app/agents/create/page.tsx) (Agent Creation Wizard, Step 2: Database Topology)
+  - [`apps/web/app/dashboard/page.tsx`](file:///d:/GitHub/Ai_data_migration_platform/apps/web/app/dashboard/page.tsx) (Agent Command Modal -> Auto-Fill Accordion)
+- **Triggers**:
+  - User enters connection parameters (Host, Port, Username, Database Name, Password) during agent creation.
+  - User modifies identifier tags (e.g. changing `dst_db_main` to `dst_db_854`).
+  - User opens the Docker command viewer on the dashboard and toggles the connection parameter auto-fill section.
+
+## 2. Step-by-Step Execution Sequence
+
+1. **Form State Collection**:
+   - In [`apps/web/components/agents/DatabaseConfigForm.tsx`](file:///d:/GitHub/Ai_data_migration_platform/apps/web/components/agents/DatabaseConfigForm.tsx), source credentials are stored in an array indexed by card position (`sourceConnectionDetails`), and target credentials in `destinationConnectionDetails`.
+   - Modifying identifier tags updates `formData.sources[i].identifier` or `formData.destination.identifier` without resetting or detaching the credential state.
+   - When any field changes, `handleEmitDetails` synchronizes with parent state via `onConnectionDetailsChange(dict)` mapping active identifiers to their respective `ConnectionDetails`.
+2. **Agent Creation Submission**:
+   - In [`apps/web/app/agents/create/page.tsx`](file:///d:/GitHub/Ai_data_migration_platform/apps/web/app/agents/create/page.tsx), clicking **"Create Agent & Generate Command"** sends only metadata (agent name, source engine types, identifiers, tags) via `agentService.createAgent(payload)`.
+   - **Crucial Security Boundary**: Passwords, usernames, hosts, and database names are strictly excluded from the HTTP payload, keeping the API and database zero-knowledge.
+3. **Template Command Generation**:
+   - The backend API generates template Docker commands containing uppercase placeholders:
+     - `-e SRC_<IDENTIFIER>_URL="...://<SRC_<IDENTIFIER>_USER>:<SRC_<IDENTIFIER>_PASSWORD>@<SRC_<IDENTIFIER>_HOST>:<SRC_<IDENTIFIER>_PORT>/<SRC_<IDENTIFIER>_NAME>"`
+     - `-e DEST_<IDENTIFIER>_URL="...://<DEST_<IDENTIFIER>_USER>:<DEST_<IDENTIFIER>_PASSWORD>@<DEST_<IDENTIFIER>_HOST>:<DEST_<IDENTIFIER>_PORT>/<DEST_<IDENTIFIER>_NAME>"`
+     - `-e DEST_DB_URL="...://<DEST_<IDENTIFIER>_USER>:<DEST_<IDENTIFIER>_PASSWORD>@<DEST_<IDENTIFIER>_HOST>:<DEST_<IDENTIFIER>_PORT>/<DEST_<IDENTIFIER>_NAME>"`
+4. **Browser-Side Substitution (`substituteConnectionPlaceholders`)**:
+   - [`apps/web/lib/dockerCommandUtils.ts`](file:///d:/GitHub/Ai_data_migration_platform/apps/web/lib/dockerCommandUtils.ts) normalizes and matches identifiers across sources and destination.
+   - Replaces `<..._HOST>`, `<..._PORT>`, `<..._USER>`, `<..._PASSWORD>`, and `<..._NAME>` with values entered by the user.
+   - Replaces fallback aliases `<DEST_DB_HOST>`, `<DEST_DB_PORT>`, `<DEST_DB_USER>`, `<DEST_DB_PASSWORD>`, and `<DEST_DB_NAME>`.
+   - Leaves unentered fields as readable `<...>` placeholders so users can replace them directly in their terminal shell.
+5. **Rendered Command & Copy**:
+   - [`apps/web/components/agents/DockerCommandOutput.tsx`](file:///d:/GitHub/Ai_data_migration_platform/apps/web/components/agents/DockerCommandOutput.tsx) or dashboard modal displays the fully hydrated command.
+   - The developer copies and runs the command in PowerShell or Bash with zero missing database names or placeholder remnants.
+
+## 3. Impact & Delta Analysis
+- **[MODIFIED]**: [`apps/web/lib/dockerCommandUtils.ts`](file:///d:/GitHub/Ai_data_migration_platform/apps/web/lib/dockerCommandUtils.ts) — Added `password` support, robust identifier matching, and `<DEST_DB_...>` alias fallback substitution.
+- **[MODIFIED]**: [`apps/web/components/agents/DatabaseConfigForm.tsx`](file:///d:/GitHub/Ai_data_migration_platform/apps/web/components/agents/DatabaseConfigForm.tsx) — Decoupled credential state from mutable identifier tags, added password inputs with visibility toggles, explicit database name labels, and dual-mode instruction callout.
+- **[MODIFIED]**: [`apps/web/app/agents/create/page.tsx`](file:///d:/GitHub/Ai_data_migration_platform/apps/web/app/agents/create/page.tsx) — Added typed `ConnectionDetails` integration and auto-population instructions.
+- **[MODIFIED]**: [`apps/web/components/agents/DockerCommandOutput.tsx`](file:///d:/GitHub/Ai_data_migration_platform/apps/web/components/agents/DockerCommandOutput.tsx) — Updated instructions and fallback source/destination resolution.
+- **[MODIFIED]**: [`apps/web/app/dashboard/page.tsx`](file:///d:/GitHub/Ai_data_migration_platform/apps/web/app/dashboard/page.tsx) — Added password field with show/hide toggle and instructions in the Docker command view modal.
+- **[MODIFIED]**: [`docs/DECISIONS.md`](file:///d:/GitHub/Ai_data_migration_platform/docs/DECISIONS.md) — Recorded architectural rationale and security boundaries.
+- **[MODIFIED]**: [`docs/EXECUTION_FLOW.md`](file:///d:/GitHub/Ai_data_migration_platform/docs/EXECUTION_FLOW.md) — Recorded entry point, flow sequence, and impact analysis.
+
+---
+
+# Execution Flow - Local Docker Build & Database Multi-Host Connectivity
+
+## 1. Entry Point
+- **Trigger**: Developer runs `docker compose build` / `docker compose up -d` or configures database connections via the web UI at `http://localhost:3000/agents/create`.
+- **Files**:
+  - [`docker-compose.yml`](file:///d:/GitHub/Ai_data_migration_platform/docker-compose.yml)
+  - [`apps/api/Dockerfile`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/Dockerfile)
+  - [`apps/web/Dockerfile`](file:///d:/GitHub/Ai_data_migration_platform/apps/web/Dockerfile)
+  - [`apps/agent/Dockerfile`](file:///d:/GitHub/Ai_data_migration_platform/apps/agent/Dockerfile)
+  - [`DATABASE_CREDENTIALS.md`](file:///d:/GitHub/Ai_data_migration_platform/DATABASE_CREDENTIALS.md)
+
+## 2. Step-by-Step Execution Sequence
+
+1. **Local Build & Container Image Assembly**:
+   - `apps/web`: Docker multi-stage build creates standalone Next.js server bundle and static chunks (`ai_data_migration_platform-web`).
+   - `apps/api`: Docker multi-stage build installs Python dependencies via Poetry and prepares entrypoint with Alembic migration invocation (`ai_data_migration_platform-api`).
+   - `apps/agent`: Builds data migration worker container (`data-migration-agent:latest`).
+2. **Container Startup & Database Connection Wait**:
+   - [`apps/api/entrypoint.sh`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/entrypoint.sh) waits for PostgreSQL on `postgres:5432` until connection is established.
+   - Executes `alembic upgrade head`. Revision `c9f0a2b3456e` is verified and confirmed.
+   - Uvicorn spawns FastAPI server on `0.0.0.0:8000`.
+   - Node.js starts Next.js standalone server on `0.0.0.0:3000`.
+3. **Database Host Routing by Network Boundary**:
+   - **Local OS Developer Access**: Requests to `localhost:5434` (PG), `localhost:3307` (MySQL), and `localhost:27017` (Mongo) hit host-mapped ports and route directly into their respective engine containers.
+   - **Docker Migration Agent Access**: The agent running in a bridge Docker container connects back to host ports via `host.docker.internal:5434`, `host.docker.internal:3307`, and `host.docker.internal:27017`.
+   - **Inter-Container Access**: Inside the Docker Compose bridge network, services use internal DNS names: `postgres:5432`, `mysql_source:3306`, and `mongo_source:27017`.
+
+## 3. Impact & Delta Analysis
+- **[MODIFIED]**: [`DATABASE_CREDENTIALS.md`](file:///d:/GitHub/Ai_data_migration_platform/DATABASE_CREDENTIALS.md) & [`docs/DATABASE_CREDENTIALS.md`](file:///d:/GitHub/Ai_data_migration_platform/docs/DATABASE_CREDENTIALS.md) — Added explicit Host columns, Web UI configuration tables, and 3-way connection URLs.
+- **[MODIFIED]**: [`database_credentials.env`](file:///d:/GitHub/Ai_data_migration_platform/database_credentials.env) — Added notes on host selection for local vs Docker agent containers.
+- **[FIXED]**: Database `alembic_version` state synchronized to head revision `c9f0a2b3456e`, resolving API container crash loop.
+- **[VERIFIED]**: `web`, `api`, and `agent` Docker images built cleanly and tested with HTTP 200 OK.
+
+
 

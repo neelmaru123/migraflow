@@ -8,6 +8,7 @@ export interface ConnectionDetails {
   host: string;
   port: string;
   username: string;
+  password?: string;
   database: string;
   ssl: boolean;
 }
@@ -40,10 +41,9 @@ export function resolvePrefix(baseClean: string, rolePrefix: 'SRC' | 'DEST', use
   return prefix;
 }
 
-// Substitutes <PREFIX_HOST>, <PREFIX_PORT>, <PREFIX_USER>, <PREFIX_NAME>
-// placeholders in the raw command text with real values from
-// connectionDetailsByIdentifier. Password placeholders are deliberately
-// left untouched -- the user fills those in manually.
+// Substitutes <PREFIX_HOST>, <PREFIX_PORT>, <PREFIX_USER>, <PREFIX_PASSWORD>, <PREFIX_NAME>
+// placeholders in the raw command text with real values from connectionDetailsByIdentifier.
+// If any parameter is left blank, its placeholder remains intact for manual replacement in the shell.
 export function substituteConnectionPlaceholders(
   rawText: string,
   sources: { identifier: string }[],
@@ -54,11 +54,22 @@ export function substituteConnectionPlaceholders(
   let result = rawText;
   const usedPrefixes = new Set<string>();
 
+  const getDetails = (identifier: string): ConnectionDetails | undefined => {
+    if (!identifier) return undefined;
+    return (
+      connectionDetailsByIdentifier[identifier] ||
+      connectionDetailsByIdentifier[identifier.toLowerCase().trim()] ||
+      connectionDetailsByIdentifier[identifier.toUpperCase().trim()] ||
+      connectionDetailsByIdentifier[sanitizeIdentifier(identifier)]
+    );
+  };
+
   const applyForIdentifier = (identifier: string, rolePrefix: 'SRC' | 'DEST') => {
-    const details = connectionDetailsByIdentifier[identifier];
+    const details = getDetails(identifier);
     const cleanId = sanitizeIdentifier(identifier);
     const prefix = resolvePrefix(cleanId, rolePrefix, usedPrefixes);
     if (!details) return;
+
     if (details.host) {
       result = result.split(`<${prefix}_HOST>`).join(details.host);
     }
@@ -68,13 +79,69 @@ export function substituteConnectionPlaceholders(
     if (details.username) {
       result = result.split(`<${prefix}_USER>`).join(details.username);
     }
+    if (details.password) {
+      result = result.split(`<${prefix}_PASSWORD>`).join(details.password);
+    }
     if (details.database) {
-      result = result.split(`<${prefix}_NAME>`).join(details.database);
+      let dbVal = details.database;
+      if (details.ssl) {
+        const lineWithPlaceholder = result.split('\n').find((l) => l.includes(`<${prefix}_NAME>`)) || '';
+        if (lineWithPlaceholder.includes('postgresql://') || lineWithPlaceholder.includes('postgres://')) {
+          dbVal = `${details.database}?sslmode=require`;
+        } else if (lineWithPlaceholder.includes('mysql')) {
+          dbVal = `${details.database}?ssl=true`;
+        } else if (lineWithPlaceholder.includes('mongodb://') || lineWithPlaceholder.includes('mongodb+srv://')) {
+          if (result.includes(`<${prefix}_NAME>?authSource=admin`)) {
+            result = result.split(`<${prefix}_NAME>?authSource=admin`).join(`${details.database}?authSource=admin&tls=true`);
+          } else {
+            dbVal = `${details.database}?tls=true`;
+          }
+        }
+      }
+      result = result.split(`<${prefix}_NAME>`).join(dbVal);
+    }
+
+    // Convenience alias replacements for single destination
+    if (rolePrefix === 'DEST') {
+      if (details.host) result = result.split(`<DEST_DB_HOST>`).join(details.host);
+      if (details.port) result = result.split(`<DEST_DB_PORT>`).join(details.port);
+      if (details.username) result = result.split(`<DEST_DB_USER>`).join(details.username);
+      if (details.password) result = result.split(`<DEST_DB_PASSWORD>`).join(details.password);
+      if (details.database) {
+        let destDbVal = details.database;
+        if (details.ssl) {
+          const destLineWithPlaceholder = result.split('\n').find((l) => l.includes(`<DEST_DB_NAME>`)) || '';
+          if (destLineWithPlaceholder.includes('postgresql://') || destLineWithPlaceholder.includes('postgres://')) {
+            destDbVal = `${details.database}?sslmode=require`;
+          } else if (destLineWithPlaceholder.includes('mysql')) {
+            destDbVal = `${details.database}?ssl=true`;
+          } else if (destLineWithPlaceholder.includes('mongodb://') || destLineWithPlaceholder.includes('mongodb+srv://')) {
+            if (result.includes(`<DEST_DB_NAME>?authSource=admin`)) {
+              result = result.split(`<DEST_DB_NAME>?authSource=admin`).join(`${details.database}?authSource=admin&tls=true`);
+            } else {
+              destDbVal = `${details.database}?tls=true`;
+            }
+          }
+        }
+        result = result.split(`<DEST_DB_NAME>`).join(destDbVal);
+      }
     }
   };
 
   sources.forEach((s) => applyForIdentifier(s.identifier, 'SRC'));
   if (destination) applyForIdentifier(destination.identifier, 'DEST');
+
+  // Single-source convenience alias replacements
+  if (sources.length === 1) {
+    const firstDetails = getDetails(sources[0].identifier);
+    if (firstDetails) {
+      if (firstDetails.host) result = result.split(`<SOURCE_DB_HOST>`).join(firstDetails.host);
+      if (firstDetails.port) result = result.split(`<SOURCE_DB_PORT>`).join(firstDetails.port);
+      if (firstDetails.username) result = result.split(`<SOURCE_DB_USER>`).join(firstDetails.username);
+      if (firstDetails.password) result = result.split(`<SOURCE_DB_PASSWORD>`).join(firstDetails.password);
+      if (firstDetails.database) result = result.split(`<SOURCE_DB_NAME>`).join(firstDetails.database);
+    }
+  }
 
   return result;
 }

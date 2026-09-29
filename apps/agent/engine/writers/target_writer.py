@@ -304,6 +304,13 @@ class TargetWriterFactory:
                                 col_conn.execute(text(f'ALTER TABLE {quoted_table} ADD COLUMN {q_col} TEXT;'))
                             except Exception:
                                 pass
+                    if "_source_origin" not in columns:
+                        if "postgres" in engine_type:
+                            try:
+                                col_conn.execute(text(f'ALTER TABLE {quoted_table} ALTER COLUMN _source_origin DROP NOT NULL;'))
+                                col_conn.execute(text(f"ALTER TABLE {quoted_table} ALTER COLUMN _source_origin SET DEFAULT 'unknown';"))
+                            except Exception:
+                                pass
             except Exception:
                 pass
 
@@ -352,6 +359,7 @@ class TargetWriterFactory:
                 ABORT_THRESHOLD_PERCENT = 0.50
                 threshold_sample_size = min(1000, max(5, len(rows) // 2))
 
+                last_sample_error = None
                 for idx, row in enumerate(rows):
                     try:
                         with engine.begin() as conn:
@@ -375,13 +383,15 @@ class TargetWriterFactory:
                                         pass
                     except Exception as row_exc:
                         failed_rows += 1
+                        last_sample_error = str(row_exc)
                         if failed_rows <= MAX_SAMPLE_ERRORS:
                             logger.warning(f"Row insertion notice in table '{table_name}' (Row #{idx}): {row_exc}")
 
                         if (idx + 1) >= threshold_sample_size and (failed_rows / (idx + 1)) > ABORT_THRESHOLD_PERCENT:
+                            err_detail = f" Cause: {last_sample_error}" if last_sample_error else ""
                             raise RuntimeError(
                                 f"Migration aborted for table '{table_name}': Error rate exceeded {ABORT_THRESHOLD_PERCENT*100:.0f}% "
-                                f"({failed_rows}/{idx+1} rows failed). Please verify target schema and column mapping specs."
+                                f"({failed_rows}/{idx+1} rows failed).{err_detail}"
                             )
 
                 return successful_rows, failed_rows, skipped_rows

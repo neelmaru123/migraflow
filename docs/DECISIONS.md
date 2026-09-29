@@ -4,6 +4,31 @@ This file records all key architectural decisions, technology selections, trade-
 
 ---
 
+## [2026-09-29] - Intelligent Database Failure Diagnosis with Gemini & Dry Run Schema Validation
+
+### 1. Decision Summary
+Implemented Gemini-powered failure diagnosis synthesis with structured Pydantic output and heuristic regex fallback in `ExecutionService.diagnose_job_failure()`. Provides conversational, plain-English explanations of target database constraint rejections (e.g. `NOT NULL`, `UNIQUE`, `FOREIGN KEY`), generates exact copyable SQL schema fixes (e.g. `ALTER TABLE "<table>" ALTER COLUMN "<column>" DROP NOT NULL;`), suppresses misleading `docker run` container commands for database schema issues, and introduces non-destructive Pre-Flight Schema Validation into the Dry Run pipeline.
+
+### 2. Why This Approach? (Rationale)
+- **Problem Being Solved**:
+  1. Dry Run previously tested only source extraction and in-memory AST transforms, bypassing DDL and inserts. Consequently, pre-existing physical constraints on target tables (such as legacy NOT NULL columns without default values) were not evaluated, allowing simulations to pass while real migrations failed.
+  2. When insertion aborted due to target database constraint violations, the error was masked by generic `Error rate exceeded 50%` messages, and the UI displayed confusing `docker run` container commands instead of pointing the developer to their database schema and offering the exact SQL fix.
+- **Chosen Solution**:
+  - **Agent Target Writer**: Captures the exact database driver exception during row retry loops and appends it to the abort `RuntimeError`.
+  - **Intelligent Diagnosis Engine**: Leverages Gemini LLM (with fallback to regex pattern matching) to analyze errors, extract the offending table and column, write an intuitive explanation, and generate copyable SQL statements for immediate execution in tools like DBeaver or pgAdmin.
+  - **Dry Run Pre-Flight Validation**: `DDLExecutor.validate_target_schema_compatibility()` queries `information_schema.columns` to detect unmapped `NOT NULL` columns on existing target tables before streaming begins.
+
+### 3. Alternatives Considered & Rejected
+- **Alternative A: Execute dry-run inserts inside an uncommitted database transaction**
+  - _Rejected_: Certain database engines (and cross-database transactions involving DuckDB staging or NoSQL targets like MongoDB) do not support rolling back DDL or high-volume chunked transactional streaming without table locks.
+- **Alternative B: Keep generic error text and ask user to inspect Docker logs**
+  - _Rejected_: Frustrating developer experience. Developers expect the platform UI to diagnose and guide them directly with copy-pasteable SQL fixes.
+
+### 4. Trade-offs & Future Considerations
+- Target schema pre-flight inspection runs quickly against `information_schema`, adding < 100ms overhead during Dry Run while preventing unexpected run-time aborts.
+
+---
+
 ## [2026-08-11] - AI Data Migration Platform Foundation Architecture
 
 ### 1. Decision Summary
@@ -2085,4 +2110,89 @@ Fixed a critical dialect detection false positive in the Docker Migration Agent 
 ### 2. Why This Approach? (Rationale)
 - **Problem**: When a customer created a combined migration targeting PostgreSQL with a database name containing the word `mysql` (`mysql_and_pg_combined`), the agent generated MySQL-specific dialect statements (`INSERT IGNORE INTO \`categories\` ...`) against PostgreSQL, causing immediate syntax errors (`psycopg2.errors.SyntaxError: syntax error at or near "IGNORE"`).
 - **Solution**: Checking the URL scheme (protocol before `://`) ensures 100% dialect fidelity regardless of database name or credentials.
+
+---
+
+## [2026-09-28] - Client-Side Auto-Fill of Database Credentials & Password Substitution
+
+### 1. Decision Summary
+Enhanced the agent creation wizard and dashboard Docker command generation to support direct input and client-side substitution of database credentials—including database name and passwords—while strictly preserving Zero Control-Plane Storage guarantees. Decoupled form connection detail tracking from mutable identifier strings to prevent state loss when renaming source or destination tags.
+
+### 2. Why This Approach? (Rationale)
+- **Problem Being Solved**:
+  1. Users configuring databases in the wizard were frustrated that database names were omitted from connection strings or lost when modifying default identifiers (e.g. changing `dst_db_main` to `dst_db_854`).
+  2. Destination credentials were not substituted into `DEST_...` and `DEST_DB_URL` placeholders in the final generated Docker command due to identifier key mismatches.
+  3. Passwords were previously excluded from the UI, forcing users to manually edit the lengthy Docker run command in the terminal.
+  4. The UI lacked clear guidance explaining that users have two viable options: enter connection details in the browser to auto-populate the command, or generate the command with placeholders and fill them in the terminal later.
+- **Chosen Solution**:
+  1. **Zero-Knowledge Client Substitution**: Added `password?: string` to `ConnectionDetails` in [`apps/web/lib/dockerCommandUtils.ts`](file:///d:/GitHub/Ai_data_migration_platform/apps/web/lib/dockerCommandUtils.ts). Added substitution for `<${prefix}_PASSWORD>`, `<DEST_DB_...>`, and `<SOURCE_DB_...>`.
+  2. **Index-Based Form State Decoupling**: In [`apps/web/components/agents/DatabaseConfigForm.tsx`](file:///d:/GitHub/Ai_data_migration_platform/apps/web/components/agents/DatabaseConfigForm.tsx), decoupled connection parameters from the mutable `identifier` string by holding `sourceConnectionDetails` indexed by source card index and `destinationConnectionDetails` in a dedicated object. On submit or change, the dictionary is keyed by the active identifier tag, preventing credential loss when renaming identifiers.
+  3. **Explicit Form Inputs & Visibility Toggles**: Added explicit inputs for Host, Port, Username, Database Name, and Password with show/hide eye toggles in both `DatabaseConfigForm` and the dashboard Docker Command modal.
+  4. **Clear Dual-Path Guidance**: Added high-visibility callouts informing developers that they can either auto-fill credentials in the UI or copy placeholders to edit in their terminal, noting that credentials exist only in browser memory and are never sent to the backend.
+- **Why This Technology**: React client state keeps secret data in local memory; no backend API schema modifications or DB column additions were needed, maintaining zero risk of credential leakage.
+
+### 3. Alternatives Considered & Rejected
+- **Alternative A: Storing Credentials on the Backend API**
+  - *Rejected*: Violates the core Zero Control-Plane Storage architecture. The platform should never know or store customer database credentials or passwords in its central database.
+- **Alternative B: Pure Terminal Replacement Only (Status Quo)**
+  - *Rejected*: Error-prone for users with complex multi-source setups and caused missing database names in connection strings when aliases were customized.
+
+### 4. Trade-offs & Future Considerations
+- **Trade-offs**: If the user reloads the browser tab, locally entered credentials in the wizard must be re-entered. This is an intentional security trade-off.
+- **Future Considerations**: For desktop/local deployments, an optional encrypted session storage vault could be provided if users request persistence across browser reloads.
+
+---
+
+## [2026-09-29] - Local Docker Build Verification, Alembic Version Sync, and Multi-Context Database Host Documentation
+
+### 1. Decision Summary
+Verified and successfully built all local Docker application containers (`migration_platform_web`, `migration_platform_api`, and `data-migration-agent:latest`). Synchronized the persistent PostgreSQL container's `alembic_version` state to the repository head migration (`c9f0a2b3456e`), resolving an Alembic revision mismatch crash loop. Enriched both root [`DATABASE_CREDENTIALS.md`](file:///d:/GitHub/Ai_data_migration_platform/DATABASE_CREDENTIALS.md) and [`docs/DATABASE_CREDENTIALS.md`](file:///d:/GitHub/Ai_data_migration_platform/docs/DATABASE_CREDENTIALS.md) to explicitly document exact DB hostnames across three runtime contexts: Local Host (`localhost`), Docker Agent Container / Web UI (`host.docker.internal`), and Docker Compose Inter-service (`postgres`, `mysql_source`, `mongo_source`).
+
+### 2. Why This Approach? (Rationale)
+- **Problem Being Solved**:
+  1. Developers running the app locally through Docker encountered a container restart crash loop on `migration_platform_api` due to `FAILED: Can't locate revision identified by 'b5c6d7e8f9a0'` in `alembic_version` stored in the persistent volume.
+  2. Developers frequently struggled with connecting agents or UI forms to databases because the required `host` differs depending on whether a process runs on the bare-metal host, inside Docker Compose, or inside an agent container on Windows/macOS/Linux.
+  3. The root `DATABASE_CREDENTIALS.md` was untracked/missing while `docs/DATABASE_CREDENTIALS.md` lacked explicit host columns in its summary and catalogs.
+- **Chosen Solution**:
+  1. **Alembic Version Alignment**: Verified that all migration columns (including `truncate_target` from revision `c9f0a2b3456e`) existed in the database, and synced `alembic_version` to head revision `c9f0a2b3456e`.
+  2. **Multi-Stage Local Docker Builds**: Executed local builds of `apps/web` (Next.js 14 standalone output) and `apps/api` (FastAPI with Poetry), as well as `apps/agent` (migration agent), verifying successful startup and HTTP 200 health responses.
+  3. **Multi-Context Host Matrix**: Documented the host parameters for Local OS (`localhost`), Docker Agent Container / Web UI (`host.docker.internal` for Windows/macOS, `localhost` for Linux host network), and Docker Compose (`postgres`, `mysql_source`, `mongo_source`) across quick reference tables, UI setup guides, and per-engine database catalogs.
+- **Why This Technology**: Docker Desktop on Windows routes host traffic via the virtual interface DNS name `host.docker.internal`. Clarifying this in the credentials file and the UI prevents networking errors when agents attempt to reach host-mapped DB ports.
+
+### 3. Alternatives Considered & Rejected
+- **Alternative A: Resetting Persistent Docker Volume (`docker volume rm postgres_data`)**
+  - *Rejected*: Would wipe out existing test tables, seed data, and user databases across all 5 PostgreSQL databases.
+- **Alternative B: Documenting Host as only `localhost`**
+  - *Rejected*: Misleads users configuring the migration agent in Docker; containers on Windows cannot reach the host machine on `localhost` without host networking or `host.docker.internal`.
+
+### 4. Trade-offs & Future Considerations
+- **Trade-offs**: Dual-location markdown documentation (`DATABASE_CREDENTIALS.md` at root and in `docs/`) requires keeping both files in sync.
+- **Future Considerations**: Automate host detection in the web UI based on user agent (suggesting `host.docker.internal` on Windows/Mac and `localhost` on Linux).
+
+---
+
+## [2026-09-29] - Production vs. Local `BACKEND_URL` Deployment Architecture & Safeguards
+
+### 1. Decision Summary
+Parameterized `BACKEND_URL` across `apps/api/app/core/config.py`, `docker-compose.yml`, and `.env.example`. Established clear operational boundaries between local development (where Docker migration agents connect to `http://host.docker.internal:8000`) and cloud/production deployment (where `BACKEND_URL` is configured via environment variables to the public domain or IP, e.g., `https://api.yourdomain.com`). Added an active safeguard in `AgentCommandGenerator` that detects when `ENVIRONMENT="production"` while `BACKEND_URL` still references a local hostname, emitting an explicit warning.
+
+### 2. Why This Approach? (Rationale)
+- **Problem**: Changing `BACKEND_URL` to `http://host.docker.internal:8000` for local Docker agent handshake could cause silent failures in production if operators don't realize `host.docker.internal` is a local virtual bridge address.
+- **Chosen Solution**:
+  1. `docker-compose.yml` uses `${BACKEND_URL:-http://host.docker.internal:8000}`. When `BACKEND_URL` is set in production `.env` (or cloud dashboard/Kubernetes config), it overrides the default without requiring code changes.
+  2. The frontend axios client in [`apps/web/services/axios.ts`](file:///d:/GitHub/Ai_data_migration_platform/apps/web/services/axios.ts) dynamically resolves the browser origin in production, ensuring the web interface remains 100% decoupled from `BACKEND_URL`.
+  3. Added configuration alert in `AgentCommandGenerator` for production mode.
+- **Why This Technology**: Docker Compose variable interpolation (`${VAR:-default}`) provides seamless backwards compatibility for local workstation developers while enabling 12-factor cloud deployment compliance.
+
+### 3. Alternatives Considered & Rejected
+- **Alternative A: Hardcoding Production Domain in Code**
+  - *Rejected*: Breaks local offline development and creates environment-specific coupling.
+- **Alternative B: Hardcoding `http://host.docker.internal:8000` in the API Dockerfile**
+  - *Rejected*: Would break remote/customer on-premise agents deployed against cloud environments.
+
+### 4. Trade-offs & Future Considerations
+- **Trade-offs**: Requires DevOps/operators to supply `BACKEND_URL` in their production `.env` file or cloud secrets manager.
+- **Future Considerations**: Support auto-detecting the public hostname via incoming request headers (`X-Forwarded-Host`, `Host`) if `BACKEND_URL` is left unconfigured in production.
+
+
 

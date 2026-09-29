@@ -4,10 +4,13 @@ Constructs copy-paste ready Docker run commands (Bash, PowerShell, Single-line)
 and .env file templates with credential placeholders for multi-source to destination migration agents.
 """
 
+import logging
 import re
 from typing import Any, Dict, List, Optional
 from app.core.config import settings
 from app.modules.agents.agents_models import Agent
+
+logger = logging.getLogger("migration_platform.agents")
 
 
 class AgentCommandGenerator:
@@ -81,6 +84,17 @@ class AgentCommandGenerator:
         """
         token_str = raw_token if raw_token else "<YOUR_AGENT_API_TOKEN>"
         resolved_backend_url = backend_url or settings.BACKEND_URL
+
+        # Safeguard: in production, warn if BACKEND_URL still points to a local address
+        if settings.ENVIRONMENT == "production" and any(
+            local_host in resolved_backend_url for local_host in ("host.docker.internal", "localhost", "127.0.0.1")
+        ):
+            logger.warning(
+                f"[PRODUCTION CONFIG WARNING] Agent command generated with local BACKEND_URL '{resolved_backend_url}'. "
+                "Remote/customer agents will not be able to reach this address. "
+                "Set BACKEND_URL in your production environment variables to your public domain or IP (e.g., https://api.yourdomain.com)."
+            )
+
         resolved_image = docker_image or settings.AGENT_DOCKER_IMAGE
         container_name = f"agent_{re.sub(r'[^a-zA-Z0-9_-]', '_', agent.agent_identifier).lower()}"
 

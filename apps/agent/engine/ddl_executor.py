@@ -444,4 +444,71 @@ class DDLExecutor:
                     logger.error(f"{stage_label} error for statement '{stmt_clean}': {exc}")
                     raise RuntimeError(f"{stage_label} failed for statement '{stmt_clean}': {exc}")
 
+    @staticmethod
+    def validate_target_schema_compatibility(
+        db_url: str, engine_type: str, table_mappings: List[dict]
+    ) -> List[str]:
+        """
+        Non-destructive preflight check for Dry Run and migration startup.
+        Inspects existing target database tables to identify unmapped NOT NULL columns
+        without default values that would cause real insertions to fail in Append mode.
+        Returns a list of warning messages.
+        """
+        warnings: List[str] = []
+        if not db_url:
+            return warnings
+
+        clean_type = (engine_type or "postgresql").lower().strip()
+        if "mongo" in clean_type or "sqlite" in clean_type:
+            return warnings
+
+        try:
+            engine = _get_engine(db_url)
+            with engine.connect() as conn:
+                for table_spec in table_mappings:
+                    target_table = table_spec.get("target_table_name")
+                    column_mappings = table_spec.get("column_mappings", [])
+                    mapped_cols = {
+                        cm.get("target_column_name")
+                        for cm in column_mappings
+                        if cm.get("target_column_name")
+                    }
+
+                    if "postgres" in clean_type:
+                        stmt = text(
+                            "SELECT column_name, data_type, is_nullable, column_default "
+                            "FROM information_schema.columns "
+                            "WHERE table_name = :tbl AND table_schema = 'public'"
+                        )
+                    elif "mysql" in clean_type:
+                        stmt = text(
+                            "SELECT column_name, data_type, is_nullable, column_default "
+                            "FROM information_schema.columns "
+                            "WHERE table_name = :tbl AND table_schema = DATABASE()"
+                        )
+                    else:
+                        continue
+
+                    res = conn.execute(stmt, {"tbl": target_table})
+                    db_cols = res.fetchall()
+                    if db_cols:
+                        for row in db_cols:
+                            col_name = row[0]
+                            is_null = str(row[2]).upper()
+                            col_def = row[3]
+                            if is_null == "NO" and col_def is None and col_name not in mapped_cols:
+                                warn = (
+                                    f"Target table '{target_table}' already exists with required column '{col_name}' "
+                                    f"(NOT NULL, no default) which is NOT in your migration plan! "
+                                    f"Append mode will fail unless you Clean Wipe, map this column, or run: "
+                                    f"ALTER TABLE \"{target_table}\" ALTER COLUMN \"{col_name}\" DROP NOT NULL;"
+                                )
+                                warnings.append(warn)
+                                logger.warning(f"[PREFLIGHT SCHEMA ALERT] {warn}")
+        except Exception as exc:
+            logger.warning(f"Notice during target schema preflight validation: {exc}")
+
+        return warnings
+
+
 

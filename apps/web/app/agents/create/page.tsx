@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import Link from 'next/link';
 import TopologySelector, { TOPOLOGY_OPTIONS } from '../../../components/agents/TopologySelector';
 import DatabaseConfigForm from '../../../components/agents/DatabaseConfigForm';
@@ -14,6 +14,7 @@ import {
 import agentService from '../../../services/agentService';
 import toast from 'react-hot-toast';
 import { ArrowLeft, ChevronRight } from 'lucide-react';
+import { ConnectionDetails } from '../../../lib/dockerCommandUtils';
 
 export default function AgentCreatePage() {
   const [step, setStep] = useState<1 | 2 | 3>(1);
@@ -21,14 +22,48 @@ export default function AgentCreatePage() {
   const [customSourceCount, setCustomSourceCount] = useState<number>(4);
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
 
+  // Validation state for destination identifier uniqueness
+  const [destinationIdentifierError, setDestinationIdentifierError] = useState<string | null>(null);
+  const [existingDestinationIdentifiers, setExistingDestinationIdentifiers] = useState<string[]>([]);
+
   // Results from Step 2 API submission
   const [createdAgent, setCreatedAgent] = useState<AgentDetailResponse | null>(null);
   const [dockerCmdData, setDockerCmdData] = useState<AgentDockerCommandResponse | null>(null);
   const [submittedSources, setSubmittedSources] = useState<InitialDataSourceCreate[]>([]);
   const [submittedDestination, setSubmittedDestination] = useState<InitialDataSourceCreate | null>(null);
   const [connectionDetailsByIdentifier, setConnectionDetailsByIdentifier] = useState<
-    Record<string, { host: string; port: string; username: string; database: string; ssl: boolean }>
+    Record<string, ConnectionDetails>
   >({});
+
+  // Fetch registered agents on mount to extract existing destination database identifiers
+  useEffect(() => {
+    let isMounted = true;
+    agentService
+      .listAgents()
+      .then((agents) => {
+        if (!isMounted) return;
+        const destIds: string[] = [];
+        agents.forEach((ag) => {
+          if (Array.isArray(ag.data_sources)) {
+            ag.data_sources.forEach((ds) => {
+              const role = ds.role?.toLowerCase()?.trim();
+              if (role === 'target' || role === 'destination' || role === 'dest' || role === 'both') {
+                if (ds.identifier) {
+                  destIds.push(ds.identifier.toLowerCase().trim());
+                }
+              }
+            });
+          }
+        });
+        setExistingDestinationIdentifiers(destIds);
+      })
+      .catch((err) => {
+        console.warn('Failed to pre-fetch existing agents for destination identifier uniqueness:', err);
+      });
+    return () => {
+      isMounted = false;
+    };
+  }, []);
 
   // Compute number of source databases needed
   const getSourceCount = (): number => {
@@ -43,9 +78,10 @@ export default function AgentCreatePage() {
     agentIdentifier: string;
     sources: InitialDataSourceCreate[];
     destination: InitialDataSourceCreate;
-    connectionDetailsByIdentifier: Record<string, { host: string; port: string; username: string; database: string; ssl: boolean }>;
+    connectionDetailsByIdentifier: Record<string, ConnectionDetails>;
   }) => {
     setIsSubmitting(true);
+    setDestinationIdentifierError(null);
     try {
       // 1. Prepare payload with data sources array
       // NOTE: connectionDetailsByIdentifier is deliberately NOT included in this
@@ -81,8 +117,30 @@ export default function AgentCreatePage() {
       toast.success('Agent registered successfully!');
       setStep(3);
     } catch (err: any) {
-      const msg = err.response?.data?.detail || err.message || 'Failed to create agent.';
-      toast.error(`Error: ${msg}`);
+      const status = err.response?.status;
+      const detail = err.response?.data?.detail;
+      const msg = typeof detail === 'string' ? detail : err.message || 'Failed to create agent.';
+
+      // Check if error is due to destination identifier already existing / in use
+      const isDestinationConflict =
+        status === 409 &&
+        (msg.toLowerCase().includes('target database') ||
+          msg.toLowerCase().includes('identifier') ||
+          msg.toLowerCase().includes('already registered') ||
+          msg.toLowerCase().includes('in use by agent'));
+
+      if (isDestinationConflict) {
+        // Suppress toast popup and show inline error below textbox with red border
+        setDestinationIdentifierError('DB with this identifier already exists');
+        if (formData.destination?.identifier) {
+          const cleanId = formData.destination.identifier.toLowerCase().trim();
+          setExistingDestinationIdentifiers((prev) =>
+            prev.includes(cleanId) ? prev : [...prev, cleanId]
+          );
+        }
+      } else {
+        toast.error(`Error: ${msg}`);
+      }
     } finally {
       setIsSubmitting(false);
     }
@@ -91,6 +149,7 @@ export default function AgentCreatePage() {
   const handleReset = () => {
     setCreatedAgent(null);
     setDockerCmdData(null);
+    setDestinationIdentifierError(null);
     setStep(1);
   };
 
@@ -180,6 +239,9 @@ export default function AgentCreatePage() {
             onSubmit={handleFormSubmit}
             onBack={() => setStep(1)}
             isSubmitting={isSubmitting}
+            destinationIdentifierError={destinationIdentifierError}
+            onClearDestinationIdentifierError={() => setDestinationIdentifierError(null)}
+            existingDestinationIdentifiers={existingDestinationIdentifiers}
           />
         )}
 

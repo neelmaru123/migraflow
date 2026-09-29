@@ -35,7 +35,7 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - JWT_SECRET_KEY=${JWT_SECRET_KEY:-default_jwt_secret_key_change_me_in_production}
       - FRONTEND_URL=${FRONTEND_URL:-http://localhost:3000}
-      - BACKEND_URL=${BACKEND_URL:-http://localhost:8000}
+      - BACKEND_URL=${BACKEND_URL:-http://host.docker.internal:8000}
       - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000,*}
       - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
       - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
