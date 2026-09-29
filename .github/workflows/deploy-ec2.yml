@@ -10,6 +10,8 @@ jobs:
   deploy:
     name: Deploy Application to EC2
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -27,9 +29,9 @@ jobs:
             cd /home/ubuntu/migraflow || cd ~/migraflow || cd /home/ubuntu/Migraflow || cd ~/Migraflow
 
             echo "=== Pulling latest changes from branch: ${{ github.ref_name }} ==="
-            git fetch origin ${{ github.ref_name }}
+            git fetch https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git ${{ github.ref_name }}
             git checkout ${{ github.ref_name }}
-            git pull origin ${{ github.ref_name }}
+            git reset --hard FETCH_HEAD
 
             echo "=== Building and launching updated Docker containers ==="
             docker compose up -d --build
