@@ -1,5 +1,60 @@
 # Execution Flow — Migraflow Platform
 
+## Execution Flow — Password Recovery & Reset Flow (Redis TTL & Google SMTP)
+
+### 1. Entry Points
+- **Web Routes**:
+  - [`apps/web/app/forgot-password/page.tsx`](file:///c:/Users/91873/Desktop/Data_migration_tool/Ai_data_migration_platform/apps/web/app/forgot-password/page.tsx)
+  - [`apps/web/app/reset-password/page.tsx`](file:///c:/Users/91873/Desktop/Data_migration_tool/Ai_data_migration_platform/apps/web/app/reset-password/page.tsx)
+- **API Endpoints**:
+  - `POST /api/v1/auth/forgot-password` in [`apps/api/app/modules/users/users_routes.py`](file:///c:/Users/91873/Desktop/Data_migration_tool/Ai_data_migration_platform/apps/api/app/modules/users/users_routes.py)
+  - `POST /api/v1/auth/reset-password` in [`apps/api/app/modules/users/users_routes.py`](file:///c:/Users/91873/Desktop/Data_migration_tool/Ai_data_migration_platform/apps/api/app/modules/users/users_routes.py)
+
+### 2. Step-by-Step Execution Sequence
+
+#### Phase 1: Forgot Password Request & Cooldown
+1. **User Submission**: User submits email address on `/forgot-password`.
+2. **Account Existence & Type Guard**:
+   - `forgot_password()` immediately queries `User` by email in PostgreSQL.
+   - If user does not exist: aborts with `HTTP 404 Not Found` (`"No account found with this email address. Please check your email or register."`).
+   - If user registered via Google OAuth without password: aborts with `HTTP 400 Bad Request` (`"This account was registered using Google Sign-In. Please sign in with Google."`).
+   - If user is deactivated: aborts with `HTTP 400 Bad Request` (`"This user account is deactivated."`).
+3. **Frontend Rate Limit Protection**: `ForgotPasswordForm` initializes a 60-second cooldown timer. If a previous request was made, the button shows a countdown (e.g., `Resend available in 45s`).
+4. **API Rate Limit Guard**: `forgot_password()` calls `PasswordResetCache.check_rate_limit(email)`. If TTL > 0 in Redis (or in-memory fallback), immediately aborts with `HTTP 429 Too Many Requests` indicating remaining cooldown seconds.
+5. **Token Generation & Cache**: Generates a 32-byte URL-safe cryptographic token (`secrets.token_urlsafe(32)`).
+6. **Token TTL Storage**: Calls `PasswordResetCache.set_reset_token()` storing token with 5-minute expiration (in Redis with in-memory fallback).
+7. **Cooldown Lock**: Calls `PasswordResetCache.set_rate_limit()` setting 60-second cooldown lock.
+8. **Email Dispatch**: `send_password_reset_email()` connects to Google Gmail SMTP (`smtp.gmail.com:587`) via `asyncio.to_thread` and sends a responsive HTML email with the reset button pointing to `${FRONTEND_URL}/reset-password?token=<token>`.
+9. **Success Response**: Returns `HTTP 200 OK` confirming `"Password reset link has been dispatched to <email>."`. Frontend displays the green confirmation banner.
+
+#### Phase 2: Password Reset Execution
+1. **User Navigation**: User opens email and clicks link, navigating to `/reset-password?token=<token>`.
+2. **Token Extraction**: `ResetPasswordForm` extracts token from search params. If absent, renders warning state prompting for a fresh request.
+3. **Password Validation**: User enters new password and confirmation (minimum 8 characters).
+4. **API Token Lookup**: `reset_password()` checks `PasswordResetCache.get_reset_token(token)`.
+   - If token expired (> 5 min) or invalid -> Redis returns `None` -> Aborts with `HTTP 400 Bad Request` ("Password reset link is invalid or has expired").
+5. **Password Encryption**: Hashes new password with `bcrypt.hashpw` using a random salt.
+6. **Database Persistence**: `UserService.reset_user_password()` updates `users.password_hash` and commits transaction to PostgreSQL.
+7. **Single-Use Invalidation**: Calls `PasswordResetCache.delete_reset_token(token)` immediately removing the token from Redis so it cannot be reused.
+8. **Success Transition**: Returns `MessageResponse`; frontend displays success banner and redirects user to `/login`.
+
+### 3. Impact & Delta Analysis (AI Modifications)
+- **[NEW]**: [`apps/api/app/core/redis_client.py`](file:///c:/Users/91873/Desktop/Data_migration_tool/Ai_data_migration_platform/apps/api/app/core/redis_client.py) — Async Redis helper managing token TTL (5 min) and rate limit cooldown (1 min).
+- **[NEW]**: [`apps/api/app/core/email.py`](file:///c:/Users/91873/Desktop/Data_migration_tool/Ai_data_migration_platform/apps/api/app/core/email.py) — Google Gmail SMTP transactional email dispatcher with branded HTML template.
+- **[NEW]**: [`apps/web/app/forgot-password/page.tsx`](file:///c:/Users/91873/Desktop/Data_migration_tool/Ai_data_migration_platform/apps/web/app/forgot-password/page.tsx) — Forgot password request route.
+- **[NEW]**: [`apps/web/app/reset-password/page.tsx`](file:///c:/Users/91873/Desktop/Data_migration_tool/Ai_data_migration_platform/apps/web/app/reset-password/page.tsx) — Password reset route.
+- **[NEW]**: [`apps/web/components/auth/ForgotPasswordForm.tsx`](file:///c:/Users/91873/Desktop/Data_migration_tool/Ai_data_migration_platform/apps/web/components/auth/ForgotPasswordForm.tsx) — Request form with countdown timer.
+- **[NEW]**: [`apps/web/components/auth/ResetPasswordForm.tsx`](file:///c:/Users/91873/Desktop/Data_migration_tool/Ai_data_migration_platform/apps/web/components/auth/ResetPasswordForm.tsx) — Reset form with password toggle & validation.
+- **[MODIFIED]**: [`apps/api/app/core/config.py`](file:///c:/Users/91873/Desktop/Data_migration_tool/Ai_data_migration_platform/apps/api/app/core/config.py) — Added SMTP and password reset settings.
+- **[MODIFIED]**: [`apps/api/app/modules/users/users_schemas.py`](file:///c:/Users/91873/Desktop/Data_migration_tool/Ai_data_migration_platform/apps/api/app/modules/users/users_schemas.py) — Added `ForgotPasswordRequest` and `ResetPasswordRequest`.
+- **[MODIFIED]**: [`apps/api/app/modules/users/users_services.py`](file:///c:/Users/91873/Desktop/Data_migration_tool/Ai_data_migration_platform/apps/api/app/modules/users/users_services.py) — Added `reset_user_password`.
+- **[MODIFIED]**: [`apps/api/app/modules/users/users_routes.py`](file:///c:/Users/91873/Desktop/Data_migration_tool/Ai_data_migration_platform/apps/api/app/modules/users/users_routes.py) — Added `/auth/forgot-password` and `/auth/reset-password` endpoints.
+- **[MODIFIED]**: [`apps/web/components/auth/LoginForm.tsx`](file:///c:/Users/91873/Desktop/Data_migration_tool/Ai_data_migration_platform/apps/web/components/auth/LoginForm.tsx) — Added "Forgot Password?" navigation link.
+- **[MODIFIED]**: [`apps/web/middleware.ts`](file:///c:/Users/91873/Desktop/Data_migration_tool/Ai_data_migration_platform/apps/web/middleware.ts) — Whitelisted recovery routes from auth redirection.
+- **[MODIFIED]**: [`.env.example`](file:///c:/Users/91873/Desktop/Data_migration_tool/Ai_data_migration_platform/.env.example) — Documented Google SMTP and Redis variables.
+
+---
+
 ## 1. Entry Point
 
 - **Files**:

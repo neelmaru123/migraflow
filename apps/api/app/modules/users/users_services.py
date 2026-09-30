@@ -209,3 +209,31 @@ class UserService:
         stmt = select(User).order_by(User.created_at.desc()).offset(skip).limit(limit)
         res = await db.execute(stmt)
         return list(res.scalars().all())
+
+    @staticmethod
+    async def reset_user_password(
+        db: AsyncSession,
+        user_id: uuid.UUID,
+        new_password: str,
+    ) -> User:
+        """
+        Encrypt and update user password following token verification.
+        """
+        user = await UserService.get_user_by_id(db, user_id)
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User account not found.",
+            )
+
+        if not user.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="User account is deactivated.",
+            )
+
+        user.password_hash = hash_password(new_password)
+        await db.commit()
+        await db.refresh(user)
+        return user
+

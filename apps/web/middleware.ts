@@ -13,7 +13,8 @@ export function middleware(request: NextRequest) {
   const isAuthenticated = Boolean(hasToken || loggedInCookie === 'true');
 
   // Route classifications
-  const isPublicAuthRoute = pathname === '/' || pathname === '/login' || pathname === '/register';
+  const isPublicLandingOrAuth = pathname === '/' || pathname === '/login' || pathname === '/register';
+  const isPasswordRecoveryRoute = pathname === '/forgot-password' || pathname.startsWith('/reset-password');
 
   const isProtectedRoute =
     pathname.startsWith('/dashboard') ||
@@ -24,7 +25,7 @@ export function middleware(request: NextRequest) {
     pathname.startsWith('/profiling');
 
   // 1. Signed-in users: Redirect away from landing/login/register to /dashboard ONLY if they actually have a token
-  if (hasToken && isPublicAuthRoute) {
+  if (hasToken && isPublicLandingOrAuth) {
     return NextResponse.redirect(new URL('/dashboard', request.url));
   }
 
