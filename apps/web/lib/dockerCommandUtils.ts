@@ -71,30 +71,30 @@ export function substituteConnectionPlaceholders(
     if (!details) return;
 
     if (details.host) {
-      result = result.split(`<${prefix}_HOST>`).join(details.host);
+      result = result.split(`<${prefix}_HOST>`).join(details.host.trim());
     }
     if (details.port) {
-      result = result.split(`<${prefix}_PORT>`).join(details.port);
+      result = result.split(`<${prefix}_PORT>`).join(details.port.trim());
     }
     if (details.username) {
-      result = result.split(`<${prefix}_USER>`).join(details.username);
+      result = result.split(`<${prefix}_USER>`).join(details.username.trim());
     }
     if (details.password) {
-      result = result.split(`<${prefix}_PASSWORD>`).join(details.password);
+      result = result.split(`<${prefix}_PASSWORD>`).join(details.password.trim());
     }
     if (details.database) {
-      let dbVal = details.database;
+      let dbVal = details.database.trim();
       if (details.ssl) {
         const lineWithPlaceholder = result.split('\n').find((l) => l.includes(`<${prefix}_NAME>`)) || '';
         if (lineWithPlaceholder.includes('postgresql://') || lineWithPlaceholder.includes('postgres://')) {
-          dbVal = `${details.database}?sslmode=require`;
+          dbVal = `${details.database.trim()}?sslmode=require`;
         } else if (lineWithPlaceholder.includes('mysql')) {
-          dbVal = `${details.database}?ssl=true`;
+          dbVal = `${details.database.trim()}?ssl=true`;
         } else if (lineWithPlaceholder.includes('mongodb://') || lineWithPlaceholder.includes('mongodb+srv://')) {
           if (result.includes(`<${prefix}_NAME>?authSource=admin`)) {
-            result = result.split(`<${prefix}_NAME>?authSource=admin`).join(`${details.database}?authSource=admin&tls=true`);
+            result = result.split(`<${prefix}_NAME>?authSource=admin`).join(`${details.database.trim()}?authSource=admin&tls=true`);
           } else {
-            dbVal = `${details.database}?tls=true`;
+            dbVal = `${details.database.trim()}?tls=true`;
           }
         }
       }
@@ -103,23 +103,23 @@ export function substituteConnectionPlaceholders(
 
     // Convenience alias replacements for single destination
     if (rolePrefix === 'DEST') {
-      if (details.host) result = result.split(`<DEST_DB_HOST>`).join(details.host);
-      if (details.port) result = result.split(`<DEST_DB_PORT>`).join(details.port);
-      if (details.username) result = result.split(`<DEST_DB_USER>`).join(details.username);
-      if (details.password) result = result.split(`<DEST_DB_PASSWORD>`).join(details.password);
+      if (details.host) result = result.split(`<DEST_DB_HOST>`).join(details.host.trim());
+      if (details.port) result = result.split(`<DEST_DB_PORT>`).join(details.port.trim());
+      if (details.username) result = result.split(`<DEST_DB_USER>`).join(details.username.trim());
+      if (details.password) result = result.split(`<DEST_DB_PASSWORD>`).join(details.password.trim());
       if (details.database) {
-        let destDbVal = details.database;
+        let destDbVal = details.database.trim();
         if (details.ssl) {
           const destLineWithPlaceholder = result.split('\n').find((l) => l.includes(`<DEST_DB_NAME>`)) || '';
           if (destLineWithPlaceholder.includes('postgresql://') || destLineWithPlaceholder.includes('postgres://')) {
-            destDbVal = `${details.database}?sslmode=require`;
+            destDbVal = `${details.database.trim()}?sslmode=require`;
           } else if (destLineWithPlaceholder.includes('mysql')) {
-            destDbVal = `${details.database}?ssl=true`;
+            destDbVal = `${details.database.trim()}?ssl=true`;
           } else if (destLineWithPlaceholder.includes('mongodb://') || destLineWithPlaceholder.includes('mongodb+srv://')) {
             if (result.includes(`<DEST_DB_NAME>?authSource=admin`)) {
-              result = result.split(`<DEST_DB_NAME>?authSource=admin`).join(`${details.database}?authSource=admin&tls=true`);
+              result = result.split(`<DEST_DB_NAME>?authSource=admin`).join(`${details.database.trim()}?authSource=admin&tls=true`);
             } else {
-              destDbVal = `${details.database}?tls=true`;
+              destDbVal = `${details.database.trim()}?tls=true`;
             }
           }
         }
@@ -135,11 +135,11 @@ export function substituteConnectionPlaceholders(
   if (sources.length === 1) {
     const firstDetails = getDetails(sources[0].identifier);
     if (firstDetails) {
-      if (firstDetails.host) result = result.split(`<SOURCE_DB_HOST>`).join(firstDetails.host);
-      if (firstDetails.port) result = result.split(`<SOURCE_DB_PORT>`).join(firstDetails.port);
-      if (firstDetails.username) result = result.split(`<SOURCE_DB_USER>`).join(firstDetails.username);
-      if (firstDetails.password) result = result.split(`<SOURCE_DB_PASSWORD>`).join(firstDetails.password);
-      if (firstDetails.database) result = result.split(`<SOURCE_DB_NAME>`).join(firstDetails.database);
+      if (firstDetails.host) result = result.split(`<SOURCE_DB_HOST>`).join(firstDetails.host.trim());
+      if (firstDetails.port) result = result.split(`<SOURCE_DB_PORT>`).join(firstDetails.port.trim());
+      if (firstDetails.username) result = result.split(`<SOURCE_DB_USER>`).join(firstDetails.username.trim());
+      if (firstDetails.password) result = result.split(`<SOURCE_DB_PASSWORD>`).join(firstDetails.password.trim());
+      if (firstDetails.database) result = result.split(`<SOURCE_DB_NAME>`).join(firstDetails.database.trim());
     }
   }
 

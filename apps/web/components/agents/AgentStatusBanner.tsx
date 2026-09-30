@@ -3,6 +3,7 @@
 import React, { useState, useEffect } from 'react';
 import { AgentDetailResponse, DataSourceResponse } from '../../types/agent';
 import agentService from '../../services/agentService';
+import { sortDataSources } from '../../lib/dataSourceUtils';
 
 interface AgentStatusBannerProps {
   agent: AgentDetailResponse;
@@ -17,7 +18,7 @@ export const AgentStatusBanner: React.FC<AgentStatusBannerProps> = ({
 }) => {
   const [status, setStatus] = useState<string>(agent.status || 'offline');
   const [lastSeen, setLastSeen] = useState<string | null>(agent.last_seen_at || null);
-  const [dataSources, setDataSources] = useState<DataSourceResponse[]>(agent.data_sources || []);
+  const [dataSources, setDataSources] = useState<DataSourceResponse[]>(sortDataSources(agent.data_sources || []));
   const [lastError, setLastError] = useState<string | null>(agent.last_error || null);
   const [errorCategory, setErrorCategory] = useState<string | null>(agent.error_category || null);
   const [lastErrorAt, setLastErrorAt] = useState<string | null>(agent.last_error_at || null);
@@ -32,7 +33,7 @@ export const AgentStatusBanner: React.FC<AgentStatusBannerProps> = ({
   useEffect(() => {
     setStatus(agent.status || 'offline');
     setLastSeen(agent.last_seen_at || null);
-    setDataSources(agent.data_sources || []);
+    setDataSources(sortDataSources(agent.data_sources || []));
     setLastError(agent.last_error || null);
     setErrorCategory(agent.error_category || null);
     setLastErrorAt(agent.last_error_at || null);
@@ -58,7 +59,7 @@ export const AgentStatusBanner: React.FC<AgentStatusBannerProps> = ({
               setLastSeen(eventData.last_seen_at);
             }
             if (eventData.data_sources && Array.isArray(eventData.data_sources)) {
-              setDataSources(eventData.data_sources);
+              setDataSources(sortDataSources(eventData.data_sources));
             }
             if (eventData.last_error !== undefined) {
               setLastError(eventData.last_error);
@@ -95,7 +96,7 @@ export const AgentStatusBanner: React.FC<AgentStatusBannerProps> = ({
             setLastSeen(updated.last_seen_at);
           }
           if (updated.data_sources) {
-            setDataSources(updated.data_sources);
+            setDataSources(sortDataSources(updated.data_sources));
           }
           if (updated.last_error !== undefined) {
             setLastError(updated.last_error);

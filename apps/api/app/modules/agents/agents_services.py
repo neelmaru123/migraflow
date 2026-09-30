@@ -3,6 +3,7 @@ Agents Domain Services (Business logic & Atomic operations boundary)
 """
 
 from datetime import datetime, timedelta, timezone
+import re
 import secrets
 from typing import List, Optional
 import uuid
@@ -372,6 +373,20 @@ class AgentService:
                     logger.debug(
                         f"Unmatched health report identifier '{report.identifier}' for agent '{agent.id}'"
                     )
+
+            def _summary_sort_key(item):
+                role = str(item.get("role", "source")).lower()
+                ident = str(item.get("identifier", "")).lower()
+                name = str(item.get("name", "")).lower()
+                is_dest = 1 if any(tag in role or tag in ident for tag in ("dest", "dst", "target")) else 0
+                digits_id = re.findall(r'\d+', ident)
+                num_id = int(digits_id[-1]) if digits_id else 0
+                digits_name = re.findall(r'\d+', name)
+                num_name = int(digits_name[-1]) if digits_name else 0
+                num = num_id or num_name
+                return (is_dest, num, name, ident)
+
+            data_sources_summary.sort(key=_summary_sort_key)
 
         await session.commit()
         await session.refresh(agent)

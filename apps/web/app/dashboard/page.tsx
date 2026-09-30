@@ -6,6 +6,7 @@ import { AgentDetailResponse, AgentDockerCommandResponse } from '../../types/age
 import agentService from '../../services/agentService';
 import { Activity, Plus, Terminal, Trash2, ArrowRight, Copy, Check, RefreshCw, ShieldAlert, ShieldCheck, Monitor, Code, FileCode, AlertTriangle, Sliders, Database, ChevronDown, ChevronUp, LogOut, Eye, EyeOff } from 'lucide-react';
 import { ConnectionDetails, substituteConnectionPlaceholders } from '../../lib/dockerCommandUtils';
+import { sortDataSources } from '../../lib/dataSourceUtils';
 import toast from 'react-hot-toast';
 import { useAuthUser } from '../../hooks/queries/useAuthUser';
 import { useLogout } from '../../hooks/mutations/useAuthMutations';
@@ -426,7 +427,7 @@ export default function DashboardPage() {
 
                         <div className="space-y-1.5 max-h-32 overflow-y-auto pr-1">
                           {ag.data_sources && ag.data_sources.length > 0 ? (
-                            ag.data_sources.map((ds) => (
+                            sortDataSources(ag.data_sources).map((ds) => (
                               <div
                                 key={ds.id}
                                 className="p-2 bg-zinc-950 border border-zinc-900 flex items-center justify-between text-xs"
@@ -659,7 +660,7 @@ export default function DashboardPage() {
                         These parameters were never stored on the server. Type them here to dynamically replace &lt;..._HOST&gt;, &lt;..._PORT&gt;, etc. in the command preview above:
                       </p>
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                        {selectedAgentForCmd.data_sources.map((ds: any) => {
+                        {sortDataSources(selectedAgentForCmd.data_sources).map((ds: any) => {
                           const isSource = ds.role === 'source';
                           return (
                             <div

@@ -352,7 +352,24 @@ class ASTTransformer:
                         exprs.append(bool_expr.alias(target_col))
 
                     elif "int" in target_dtype:
-                        exprs.append(pl.col(src_name).cast(pl.Int64, strict=False).alias(target_col))
+                        # Safe int cast: probe whether actual data is numeric.
+                        # If ANY non-null value cannot be parsed as int (e.g. "TCK-5001-517"),
+                        # keep the column as Utf8 to prevent DuckDB ConversionException.
+                        _sample_vals = df[src_name].drop_nulls().cast(pl.Utf8).to_list()
+                        _can_cast_int = all(
+                            (str(v).strip().lstrip("-").isdigit()) if v is not None else True
+                            for v in _sample_vals[:200]  # probe first 200 non-null rows
+                        )
+                        if _can_cast_int:
+                            exprs.append(pl.col(src_name).cast(pl.Int64, strict=False).alias(target_col))
+                        else:
+                            # Column contains non-numeric strings — store as VARCHAR
+                            logger.warning(
+                                f"Column '{target_col}' has target_dtype '{target_dtype}' but "
+                                f"source data contains non-numeric values (e.g. '{_sample_vals[0] if _sample_vals else '?'}'). "
+                                f"Storing as VARCHAR to avoid ConversionException."
+                            )
+                            exprs.append(pl.col(src_name).cast(pl.Utf8).alias(target_col))
 
                     elif "decimal" in target_dtype or "numeric" in target_dtype:
                         exprs.append(pl.col(src_name).cast(pl.Utf8).alias(target_col))

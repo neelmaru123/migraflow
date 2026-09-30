@@ -56,6 +56,7 @@ def _make_test_plan_ast() -> TransformationPlanAST:
                 source_tables=[
                     SourceTableRef(identifier="source_db_1", schema_name="public", table_name="users", join_type="primary"),
                     SourceTableRef(identifier="source_db_2", schema_name="shop", table_name="customers", join_type="union_merge"),
+                    SourceTableRef(identifier="source_db_1", schema_name="public", table_name="orders", join_type="left_join"),
                 ],
                 column_mappings=[
                     # 1. direct_copy
