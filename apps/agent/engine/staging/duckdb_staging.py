@@ -68,10 +68,52 @@ class TableMerger:
         if not table_exists:
             conn.execute(f"CREATE TABLE {staging_table_name} AS SELECT * FROM df_chunk_temp")
         else:
-            existing_cols = [r[0] for r in conn.execute(f"DESCRIBE {staging_table_name}").fetchall()]
-            new_cols = [c for c in df_with_seq.columns if c not in existing_cols]
-            for c in new_cols:
-                conn.execute(f'ALTER TABLE {staging_table_name} ADD COLUMN "{c}" VARCHAR')
+            # Get existing column schema: {col_name: duckdb_type}
+            existing_schema = {
+                r[0]: r[1].upper()
+                for r in conn.execute(f"DESCRIBE {staging_table_name}").fetchall()
+            }
+            # Get incoming Polars column types
+            incoming_schema = {
+                name: str(dtype).upper()
+                for name, dtype in zip(df_with_seq.columns, df_with_seq.dtypes)
+            }
+
+            _NUMERIC_TYPES = ("INT", "BIGINT", "HUGEINT", "INTEGER", "FLOAT", "DOUBLE", "DECIMAL", "INT64", "INT32")
+            _STRING_TYPES = ("VARCHAR", "UTF8", "STRING", "CHAR", "TEXT", "UTF-8")
+
+            for col_name in df_with_seq.columns:
+                if col_name not in existing_schema:
+                    # New column — add as VARCHAR
+                    conn.execute(f'ALTER TABLE {staging_table_name} ADD COLUMN "{col_name}" VARCHAR')
+                else:
+                    existing_type = existing_schema[col_name]
+                    incoming_type = incoming_schema.get(col_name, "")
+                    is_existing_numeric = any(t in existing_type for t in _NUMERIC_TYPES)
+                    is_incoming_string = any(t in incoming_type for t in _STRING_TYPES)
+                    if is_existing_numeric and is_incoming_string:
+                        # Widen: numeric → VARCHAR to accommodate mixed-type legacy ID columns
+                        try:
+                            conn.execute(
+                                f'ALTER TABLE {staging_table_name} '
+                                f'ALTER COLUMN "{col_name}" SET DATA TYPE VARCHAR'
+                            )
+                            logger.warning(
+                                f"Staging type widened: column '{col_name}' changed from "
+                                f"{existing_type} → VARCHAR to accommodate non-numeric values "
+                                f"(e.g. from a second source table)."
+                            )
+                        except Exception as _widen_err:
+                            logger.warning(
+                                f"Could not widen column '{col_name}' from {existing_type} to VARCHAR: {_widen_err}. "
+                                f"Casting incoming data to match existing type instead."
+                            )
+                            # Fallback: cast incoming column to numeric (nullify bad values)
+                            df_with_seq = df_with_seq.with_columns(
+                                pl.col(col_name).cast(pl.Int64, strict=False)
+                            )
+                            conn.unregister("df_chunk_temp")
+                            conn.register("df_chunk_temp", df_with_seq)
 
             conn.execute(f"INSERT INTO {staging_table_name} BY NAME SELECT * FROM df_chunk_temp")
 

@@ -343,11 +343,11 @@ export const PlanTableMappingsTab: React.FC<PlanTableMappingsTabProps> = ({
                   className={`rounded-none bg-black border ${borderClass} overflow-hidden shadow-xl transition-all`}
                 >
                   {/* Table Accordion Header */}
-                  <div className="p-4 bg-zinc-950 border-b border-zinc-800 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 cursor-pointer hover:bg-zinc-900/60 transition-colors font-mono">
-                    <div
-                      className="flex flex-wrap items-center gap-3 w-full sm:w-auto"
-                      onClick={() => setExpandedTable(isExpanded ? null : tm.target_table_name)}
-                    >
+                  <div
+                    onClick={() => setExpandedTable(isExpanded ? null : tm.target_table_name)}
+                    className="p-4 bg-zinc-950 border-b border-zinc-800 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 cursor-pointer hover:bg-zinc-900/60 transition-colors font-mono select-none"
+                  >
+                    <div className="flex flex-wrap items-center gap-3 w-full sm:w-auto">
                       {isEditing ? (
                         <div className="flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
                           <span className="text-xs font-bold text-sky-400 uppercase">Table:</span>
@@ -382,10 +382,7 @@ export const PlanTableMappingsTab: React.FC<PlanTableMappingsTabProps> = ({
                       </span>
                     </div>
 
-                    <div
-                      className="flex items-center gap-4 text-xs text-zinc-400 w-full sm:w-auto justify-between sm:justify-end"
-                      onClick={() => setExpandedTable(isExpanded ? null : tm.target_table_name)}
-                    >
+                    <div className="flex items-center gap-4 text-xs text-zinc-400 w-full sm:w-auto justify-between sm:justify-end">
                       <TableReadinessBadge tm={tm} />
                       <span className="text-sm font-bold text-white">{isExpanded ? '▲' : '▼'}</span>
                     </div>

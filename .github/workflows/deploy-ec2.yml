@@ -10,6 +10,8 @@ jobs:
   deploy:
     name: Deploy Application to EC2
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -24,15 +26,21 @@ jobs:
           script_stop: true
           script: |
             echo "=== Navigating to project directory ==="
-            cd /home/ubuntu/Migraflow || cd ~/Migraflow
+            cd /home/ubuntu/migraflow || cd ~/migraflow || cd /home/ubuntu/Migraflow || cd ~/Migraflow
 
             echo "=== Pulling latest changes from branch: ${{ github.ref_name }} ==="
-            git fetch origin ${{ github.ref_name }}
+            git fetch https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git ${{ github.ref_name }}
             git checkout ${{ github.ref_name }}
-            git pull origin ${{ github.ref_name }}
+            git reset --hard FETCH_HEAD
+
+            echo "=== Cleaning up stale or conflicting containers ==="
+            docker compose down --remove-orphans || true
+            docker stop migration_platform_postgres migration_platform_api migration_platform_web 2>/dev/null || true
+            docker rm -f migration_platform_postgres migration_platform_api migration_platform_web 2>/dev/null || true
+            docker rm -f $(docker ps -aq --filter "name=migration_platform") 2>/dev/null || true
 
             echo "=== Building and launching updated Docker containers ==="
-            docker compose up -d --build
+            docker compose up -d --build --remove-orphans
 
             echo "=== Pruning dangling Docker build cache and images ==="
             docker image prune -f

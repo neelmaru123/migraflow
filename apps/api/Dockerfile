@@ -1,4 +1,4 @@
-FROM python:3.11-slim as builder
+FROM python:3.11-slim AS builder
 
 WORKDIR /app
 
@@ -21,7 +21,7 @@ COPY pyproject.toml poetry.lock* /app/
 
 RUN poetry install --no-root --only main
 
-FROM python:3.11-slim as runner
+FROM python:3.11-slim AS runner
 
 WORKDIR /app
 

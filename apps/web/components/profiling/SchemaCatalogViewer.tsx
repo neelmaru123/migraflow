@@ -9,6 +9,7 @@ import {
 } from '../../types/metadata';
 import metadataService from '../../services/metadataService';
 import { ArrowRight } from 'lucide-react';
+import { sortDataSources } from '../../lib/dataSourceUtils';
 
 interface SchemaCatalogViewerProps {
   dataSources: DataSourceResponse[];
@@ -23,10 +24,12 @@ export const SchemaCatalogViewer: React.FC<SchemaCatalogViewerProps> = ({
   onSourceSelect,
 }) => {
   // Display ONLY Source Databases (target databases are excluded from catalog inspection)
-  const sourceDataSources = dataSources.filter((ds) => ds.role === 'source' || ds.role === 'both');
-  const displayDataSources = sourceDataSources.length > 0 ? sourceDataSources : dataSources.filter((ds) => ds.role !== 'target');
+  const sourceDataSources = (dataSources || []).filter((ds) => ds.role === 'source' || ds.role === 'both');
+  const displayDataSources = sourceDataSources.length > 0 ? sourceDataSources : (dataSources || []).filter((ds) => ds.role !== 'target');
 
-  const defaultSource = displayDataSources[0];
+  // Sort source databases deterministically (e.g. Source Database 1, 2, 3...)
+  const sortedDataSources = sortDataSources(displayDataSources);
+  const defaultSource = sortedDataSources[0];
 
   const [activeSourceId, setActiveSourceId] = useState<string>(
     selectedSourceId || defaultSource?.id || ''
@@ -37,16 +40,16 @@ export const SchemaCatalogViewer: React.FC<SchemaCatalogViewerProps> = ({
   const [activeTab, setActiveTab] = useState<'columns' | 'constraints' | 'relationships'>('columns');
   const [searchQuery, setSearchQuery] = useState<string>('');
 
-  const sortedDataSources = [...displayDataSources];
+  const activeSource = sortedDataSources.find((ds) => ds.id === activeSourceId) || defaultSource;
 
-  const activeSource = dataSources.find((ds) => ds.id === activeSourceId) || defaultSource;
-
-  // Handle prop changes for activeSourceId
+  // Handle prop changes for activeSourceId or when sortedDataSources populates
   useEffect(() => {
     if (selectedSourceId && selectedSourceId !== activeSourceId) {
       setActiveSourceId(selectedSourceId);
+    } else if (!activeSourceId && sortedDataSources.length > 0) {
+      setActiveSourceId(sortedDataSources[0].id);
     }
-  }, [selectedSourceId]);
+  }, [selectedSourceId, sortedDataSources, activeSourceId]);
 
   // Fetch metadata snapshot when activeSourceId changes
   useEffect(() => {

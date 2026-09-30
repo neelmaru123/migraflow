@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 # Prompt Version — bump when system prompt changes so stored plans are traceable
 # ============================================================================
-PROMPT_VERSION = "v1.1.0"
+PROMPT_VERSION = "v1.3.0"
 
 # ============================================================================
 # System Prompt Template
@@ -50,9 +50,14 @@ RULES & INDUSTRY DATABASE ARCHITECTURE STANDARDS:
    - Every target table MUST include enterprise audit timestamp columns 'created_at' and 'updated_at' (DATETIME for MySQL, TIMESTAMPTZ for PostgreSQL) using transformation_type 'new_column_added'.
    - Merged tables MUST include a '_source_origin' column (VARCHAR) to track data lineage per row.
    - FOREIGN KEY & PRIMARY KEY TYPE SYNCHRONIZATION:
-     Whenever a target table's primary key is mapped to 'uuid' (or converted to UUID from an integer source PK), ALL foreign key columns in other tables that reference this entity (e.g. 'category_id', 'customer_id', 'order_id', 'product_id') MUST ALSO use target_data_type 'uuid' with transformation_type 'type_cast'. A foreign key column MUST NEVER be left as 'bigint' or 'integer' if its referenced parent primary key is 'uuid'!
+     Whenever a target table's primary key is mapped to 'uuid' (or converted to UUID from an integer source PK), ALL foreign key columns in OTHER tables that reference this entity (e.g. 'category_id', 'customer_id', 'order_id', 'product_id', 'warehouse_id' in dependent tables) MUST ALSO use target_data_type 'uuid' with transformation_type 'type_cast'. A foreign key column MUST NEVER be left as 'bigint' or 'integer' if its referenced parent primary key is 'uuid'!
+     HOWEVER, a table's OWN preserved legacy ID (e.g. 'warehouse_id' in table 'warehouses' alongside the new 'id UUID' primary key) is NOT a foreign key — it MUST remain its original source integer type ('int') using transformation_type 'direct_copy'. NEVER turn a table's own preserved ID column into UUID.
 7. TWO-PHASE DDL HYGIENE & DIALECT COMPLIANCE:
    - pre_migration_ddl: include CREATE TABLE DDL for target tables (and CREATE EXTENSION only if target is PostgreSQL). MUST NOT contain ANY inline or table-level FOREIGN KEY constraints.
+   - DDL & COLUMN MAPPING TYPE SYNCHRONIZATION (CRITICAL):
+     Every column declared in 'pre_migration_ddl' MUST have the EXACT SAME data type as declared in 'table_mappings.column_mappings[].target_data_type'!
+     * If a foreign key column (e.g., 'warehouse_id' in 'inventory_items', 'category_id' in 'products') has target_data_type 'uuid', you MUST declare it as 'UUID' in 'pre_migration_ddl' (e.g. 'warehouse_id UUID'), NEVER 'INT' or 'BIGINT'! Declaring 'INT' in DDL when the transformer outputs UUID strings causes fatal PostgreSQL errors (psycopg2.errors.InvalidTextRepresentation: invalid input syntax for type integer: "<UUID>").
+     * If a column has target_data_type 'int', declare it as 'INT' in 'pre_migration_ddl'.
    - For PostgreSQL targets:
      * ALWAYS use 'gen_random_uuid()' for UUID primary key defaults, e.g. 'id UUID PRIMARY KEY DEFAULT gen_random_uuid()'.
      * NEVER generate 'uuid_v4()' or 'uuidv4()' as these functions do not exist in PostgreSQL.
@@ -61,6 +66,9 @@ RULES & INDUSTRY DATABASE ARCHITECTURE STANDARDS:
    - post_migration_ddl: include CREATE INDEX and ALTER TABLE ... ADD CONSTRAINT FOREIGN KEY DDL statements.
    - Index naming convention: idx_{tablename}_{columnname}
    - Foreign key constraint naming convention: fk_{srctable}_{tgttable}_{columnname}
+   - FOREIGN KEY TARGET COLUMN UNIQUENESS (CRITICAL FOR POSTGRESQL & SQL STANDARDS):
+     * A FOREIGN KEY constraint can ONLY reference a column that is either the table's PRIMARY KEY or explicitly defined with a UNIQUE constraint / unique index.
+     * If a foreign key in post_migration_ddl references a non-PK column (for example, 'ALTER TABLE tickets ADD CONSTRAINT ... FOREIGN KEY (customer_email) REFERENCES leads(email)'), you MUST ensure that the referenced target column ('email' in 'leads') is declared with 'UNIQUE' in 'pre_migration_ddl' (e.g. 'email VARCHAR(255) UNIQUE') OR include 'CREATE UNIQUE INDEX IF NOT EXISTS uq_{ref_table}_{ref_col} ON {ref_table} ({ref_col});' in post_migration_ddl BEFORE the foreign key statement! Failure to declare the referenced column as UNIQUE will cause fatal database constraint violations (psycopg2.errors.InvalidForeignKey).
 8. For EVERY column in EVERY source table, you MUST output a column_mapping with:
    - transformation_type from the ALLOWED TAXONOMY.
    - ui_badge_type that EXACTLY matches transformation_type.
@@ -103,16 +111,43 @@ RULES & INDUSTRY DATABASE ARCHITECTURE STANDARDS:
     }
     NOT just one source. If the concept is the same (email vs email_address, full_name vs first_name+last_name),
     LIST ALL VARIANTS from ALL participating sources. Use merge_concat if one source stores it as a
-    single field and another stores it split. NEVER leave a source table unrepresented in source_columns
-    for a merge table column — doing so will cause NULL insertion failures at execution time.
+    single field and another stores it split.
 
-    Column name equivalence examples you MUST recognize and map correctly:
-    - email / email_address / contact_email / user_email → same semantic concept
-    - first_name / fname / given_name / full_name (when split) → same concept
-    - last_name / lname / family_name / surname → same concept
-    - phone / mobile / telephone / phone_number / contact_number → same concept
-    - created_at / created_time / creation_date / registration_date → same concept
-    - customer_id / account_id / user_id / client_id (when referencing same entity) → same concept
+    *** NO FORCED MATCH — SCOPE-CONSTRAINED EQUIVALENCE ***
+    Column semantic equivalence ONLY applies when two columns serve the SAME logical role in the
+    SAME entity being merged. You MUST NOT force-match a column from one source just because no
+    perfect equivalent exists in another source — this causes CATASTROPHIC data corruption.
+
+    RULE: If a source database does NOT have a true equivalent for a target column:
+      → DO NOT add a source_columns entry for that source for this column.
+      → Instead, emit a SEPARATE column_mapping with transformation_type="drop_column" referencing
+        that column from that source (if the source has an unrelated column that would otherwise
+        be unmapped), so the source column is explicitly dropped rather than incorrectly merged.
+      → The target column should list source_columns ONLY for the sources that genuinely have
+        that semantic field. Use nullable=true and note the partial coverage in the explanation.
+
+    ILLEGAL EXAMPLE (NEVER DO THIS):
+      Target column 'phone' in table 'customers' that merges src_db_1.customers and src_db_5.customer_profiles:
+      ❌ WRONG — mapping src_db_5.customer_profiles.full_name into 'phone' just to fill the slot:
+        { "identifier": "src_db_5", "table_name": "customer_profiles", "column_name": "full_name" }
+      ✓ CORRECT — only include src_db_1 which has a phone field; drop full_name separately:
+        source_columns: [{ "identifier": "src_db_1", "table_name": "customers", "column_name": "phone" }]
+        + a separate drop_column mapping for src_db_5.customer_profiles.full_name → target 'full_name'
+
+    Column name equivalence examples (ONLY apply within the same entity context):
+    - email / email_address / contact_email / user_email → same concept IF both are user email fields
+    - first_name / fname / given_name → same concept IF both are person given name fields
+    - last_name / lname / family_name / surname → same concept IF both are person surname fields
+    - full_name → only equivalent to first_name+last_name WHEN the table represents the same person entity
+    - phone / mobile / telephone / phone_number / contact_number → same concept IF both are phone fields
+    - created_at / created_time / creation_date / registration_date → same concept IF same entity timestamp
+    - customer_id / account_id / user_id / client_id → same concept ONLY IF referencing the same entity
+
+    CROSS-TABLE MERGE WARNING: When 5+ databases are merged, different tables (e.g. 'customer_profiles',
+    'user_accounts', 'orders', 'leads') often contain columns with similar names but DIFFERENT semantic
+    meanings. You MUST verify that the source table in each source_columns entry actually contributes
+    to that SAME target table merge — never borrow a column from a table that is being mapped to a
+    DIFFERENT target table.
 
 18. TARGET DATABASE MONGODB RULES:
     When target_database_type is "mongodb":
@@ -363,6 +398,9 @@ class LLMPlanGeneratorService:
                             content=(
                                 f"Your previous response failed Pydantic schema validation. "
                                 f"Error: {last_error}. "
+                                f"CRITICAL REMINDER: Ensure every source_column entry references ONLY "
+                                f"a table that is declared in source_tables for that merge. "
+                                f"Do NOT borrow columns from tables that belong to a different target table mapping. "
                                 f"Please correct and re-generate the complete TransformationPlan JSON."
                             )
                         )
@@ -373,7 +411,7 @@ class LLMPlanGeneratorService:
                 result = parser.parse(content)
 
                 logger.info(f"LLM plan generation succeeded on attempt {attempt}.")
-                return result
+                return self._sanitize_post_migration_ddl(result)
 
             except Exception as exc:
                 last_error = exc
@@ -383,6 +421,48 @@ class LLMPlanGeneratorService:
             f"LLM plan generation failed after {max_retries} attempts. "
             f"Last error: {last_error}"
         )
+
+    @staticmethod
+    def _sanitize_post_migration_ddl(ast: TransformationPlanAST) -> TransformationPlanAST:
+        """
+        Guarantees that any column referenced by a foreign key constraint in post_migration_ddl
+        is preceded by a CREATE UNIQUE INDEX statement if it is not the standard primary key.
+        Prevents PostgreSQL InvalidForeignKey: there is no unique constraint matching given keys.
+        """
+        import re
+
+        fk_pattern = re.compile(
+            r'REFERENCES\s+["`]?([a-zA-Z0-9_]+)["`]?\s*\(\s*["`]?([a-zA-Z0-9_]+)["`]?\s*\)',
+            re.IGNORECASE,
+        )
+
+        unique_indices_to_add = []
+        seen = set()
+
+        for ddl in (ast.post_migration_ddl or []):
+            for match in fk_pattern.finditer(ddl):
+                ref_table = match.group(1).lower()
+                ref_col = match.group(2).lower()
+                if ref_col != "id" and (ref_table, ref_col) not in seen:
+                    seen.add((ref_table, ref_col))
+                    already_indexed = any(
+                        re.search(
+                            rf'CREATE\s+UNIQUE\s+INDEX.*ON\s+["`]?{ref_table}["`]?\s*\(\s*["`]?{ref_col}["`]?\s*\)',
+                            s,
+                            re.IGNORECASE,
+                        )
+                        for s in (ast.post_migration_ddl or [])
+                    )
+                    if not already_indexed:
+                        unique_indices_to_add.append(
+                            f'CREATE UNIQUE INDEX IF NOT EXISTS "uq_{ref_table}_{ref_col}" ON "{ref_table}" ("{ref_col}");'
+                        )
+
+        if unique_indices_to_add:
+            logger.info(f"Auto-prepended {len(unique_indices_to_add)} unique index prerequisite(s) to post_migration_ddl: {unique_indices_to_add}")
+            ast.post_migration_ddl = unique_indices_to_add + (ast.post_migration_ddl or [])
+
+        return ast
 
     def refine(
         self,
@@ -498,7 +578,7 @@ class LLMPlanGeneratorService:
                         result.refinement_feedback.user_prompt = user_feedback
 
                 logger.info(f"LLM plan refinement succeeded on attempt {attempt}.")
-                return result
+                return self._sanitize_post_migration_ddl(result)
             except Exception as exc:
                 last_error = exc
                 logger.warning(f"LLM refinement attempt {attempt} failed: {exc}")

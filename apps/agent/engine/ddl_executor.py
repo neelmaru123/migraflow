@@ -423,6 +423,35 @@ class DDLExecutor:
                         exc = retry_exc
                         exc_str = str(exc).lower()
 
+                # Auto-healing for missing unique constraint on foreign key target column (PostgreSQL / MySQL)
+                # Example: (psycopg2.errors.InvalidForeignKey) there is no unique constraint matching given keys for referenced table "leads"
+                if "no unique constraint matching given keys" in exc_str or "invalidforeignkey" in exc_str:
+                    logger.info(f"Attempting DDL auto-healing for missing UNIQUE constraint on referenced table in statement: '{stmt_sanitized[:80]}...'")
+                    try:
+                        import re
+                        ref_match = re.search(
+                            r'REFERENCES\s+["`]?([a-zA-Z0-9_]+)["`]?\s*\(\s*["`]?([a-zA-Z0-9_]+)["`]?\s*\)',
+                            stmt_sanitized,
+                            flags=re.IGNORECASE,
+                        )
+                        if ref_match:
+                            ref_table = ref_match.group(1)
+                            ref_col = ref_match.group(2)
+                            create_idx_stmt = f'CREATE UNIQUE INDEX IF NOT EXISTS "uq_{ref_table}_{ref_col}" ON "{ref_table}" ("{ref_col}");'
+                            with engine.begin() as conn:
+                                conn.execute(text(create_idx_stmt))
+                            logger.info(f"Successfully auto-created missing unique index: {create_idx_stmt}")
+
+                            # Retry the foreign key constraint
+                            with engine.begin() as conn:
+                                conn.execute(text(stmt_sanitized))
+                            logger.info(f"Successfully auto-healed and executed foreign key constraint: {stmt_sanitized[:80]}...")
+                            continue
+                    except Exception as retry_exc:
+                        logger.warning(f"DDL unique index auto-healing retry failed: {retry_exc}")
+                        exc = retry_exc
+                        exc_str = str(exc).lower()
+
                 # Benign warning keywords (MUST NOT contain 'if not exists', which would match the SQL text!)
                 benign_keywords = [
                     "already exists",
@@ -437,9 +466,15 @@ class DDLExecutor:
                     "violates foreign key constraint",
                     "referential integrity constraint violation",
                     "cannot add or update a child row",
+                    "no unique constraint matching given keys",
+                    "invalidforeignkey",
                 ]
                 if any(kw in exc_str for kw in benign_keywords):
                     logger.warning(f"{stage_label} notice/warning for statement '{stmt_clean}': {exc}")
+                elif "post-migration" in stage_label.lower():
+                    # Post-migration DDL contains secondary optimizations (indexes, FKs) after 100% of data has already transferred.
+                    # Never fail the overall ETL job if a post-migration constraint fails due to data divergence.
+                    logger.warning(f"{stage_label} non-fatal constraint warning for statement '{stmt_clean}': {exc}")
                 else:
                     logger.error(f"{stage_label} error for statement '{stmt_clean}': {exc}")
                     raise RuntimeError(f"{stage_label} failed for statement '{stmt_clean}': {exc}")

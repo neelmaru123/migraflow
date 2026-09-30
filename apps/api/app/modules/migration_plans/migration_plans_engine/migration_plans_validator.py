@@ -109,7 +109,13 @@ class MigrationPlanValidator:
                         f"{base_name}es",
                         f"{base_name[:-1]}ies" if base_name.endswith("y") else "",
                     ]
-                    ref_table = next((cand for cand in candidates if cand and cand in pk_type_by_table), None)
+                    # CRITICAL: Exclude self-table reference!
+                    # A column like 'warehouse_id' in table 'warehouses' is the table's own legacy ID,
+                    # NOT a foreign key referencing an external table.
+                    ref_table = next(
+                        (cand for cand in candidates if cand and cand in pk_type_by_table and cand != tm.target_table_name.lower()),
+                        None,
+                    )
                     if ref_table and "uuid" in pk_type_by_table[ref_table]:
                         cur_dtype = (cm.target_data_type or "").lower()
                         if "uuid" not in cur_dtype:
@@ -122,6 +128,36 @@ class MigrationPlanValidator:
                                 f"'{tm.target_table_name}' was synchronized to target type 'uuid' to match parent table "
                                 f"'{ref_table}' primary key."
                             )
+
+        # Synchronize pre_migration_ddl column types with column_mappings target_data_type
+        # to prevent fatal PostgreSQL type mismatches (e.g. inserting UUID into INT DDL column)
+        if ast.pre_migration_ddl:
+            col_types_by_table: Dict[str, Dict[str, str]] = {}
+            for tm in ast.table_mappings:
+                tbl_key = tm.target_table_name.lower()
+                col_types_by_table[tbl_key] = {}
+                for cm in tm.column_mappings:
+                    col_name = (cm.target_column_name or "").lower()
+                    col_dtype = (cm.target_data_type or "").lower()
+                    if col_name and col_dtype:
+                        col_types_by_table[tbl_key][col_name] = col_dtype
+
+            synced_ddl = []
+            for ddl_stmt in ast.pre_migration_ddl:
+                match = re.search(r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-zA-Z0-9_\"\.]+)", ddl_stmt, re.IGNORECASE)
+                if match:
+                    raw_tbl = match.group(1).strip('"').split(".")[-1].lower()
+                    if raw_tbl in col_types_by_table:
+                        tbl_cols = col_types_by_table[raw_tbl]
+                        for c_name, c_dtype in tbl_cols.items():
+                            if "uuid" in c_dtype:
+                                pattern = re.compile(rf"\b({re.escape(c_name)})\s+(?:INT|INTEGER|BIGINT)\b", re.IGNORECASE)
+                                ddl_stmt = pattern.sub(r"\1 UUID", ddl_stmt)
+                            elif any(i_kw == c_dtype or c_dtype.startswith(i_kw) for i_kw in ("int", "bigint", "smallint", "integer")):
+                                pattern = re.compile(rf"\b({re.escape(c_name)})\s+UUID\b", re.IGNORECASE)
+                                ddl_stmt = pattern.sub(rf"\1 {c_dtype.upper()}", ddl_stmt)
+                synced_ddl.append(ddl_stmt)
+            ast.pre_migration_ddl = synced_ddl
 
         # 3. Iterate through table mappings
         for table_map in ast.table_mappings:
@@ -230,6 +266,34 @@ class MigrationPlanValidator:
                             f"which may violate NOT NULL constraints. Add the correct column_name "
                             f"from each source database to source_columns."
                         )
+
+            # Stage B3: Cross-table column scope binding check for MERGE tables
+            # Detects the critical AI hallucination bug where the LLM references a source column
+            # from a table that is NOT declared as a source_table for this merge.
+            # Example: merge 'customers' from [src_db_1.customers, src_db_2.accounts] but
+            # source_columns references src_db_5.customer_profiles.full_name — which is NOT
+            # a declared source table, causing full_name to be incorrectly mapped into phone/etc.
+            if table_map.transformation_type == "merge":
+                # Build (identifier, table_name) pairs for all declared source tables
+                declared_src_pairs = {
+                    (st.identifier, st.table_name.lower()) for st in table_map.source_tables
+                }
+                skip_types_b3 = {"new_column_added", "default_constant", "lookup_join"}
+                for col_map in table_map.column_mappings:
+                    if col_map.transformation_type in skip_types_b3:
+                        continue
+                    for src_col in col_map.source_columns:
+                        pair = (src_col.identifier, src_col.table_name.lower())
+                        if pair not in declared_src_pairs:
+                            errors.append(
+                                f"CRITICAL Cross-Table Column Binding Error in MERGE table '{target_table_name}': "
+                                f"Target column '{col_map.target_column_name}' references source column "
+                                f"'{src_col.column_name}' from '{src_col.identifier}.{src_col.table_name}', "
+                                f"but that table is NOT declared as a source_table for this merge. "
+                                f"Declared source tables: {[(s.identifier, s.table_name) for s in table_map.source_tables]}. "
+                                f"This indicates the AI incorrectly borrowed a column from an unrelated table. "
+                                f"Remove this source_column entry or add '{src_col.table_name}' to source_tables."
+                            )
 
             # Stage C: Deduplication Key Validity
             if table_map.conflict_resolution and table_map.conflict_resolution.deduplication_key:

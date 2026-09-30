@@ -87,7 +87,10 @@ class Agent(Base):
     # Relationships
     user: Mapped["User"] = relationship("User", back_populates="agents")
     data_sources: Mapped[List["DataSource"]] = relationship(
-        "DataSource", back_populates="agent", cascade="all, delete-orphan"
+        "DataSource",
+        back_populates="agent",
+        cascade="all, delete-orphan",
+        order_by="DataSource.created_at",
     )
     migration_plans: Mapped[List["MigrationPlan"]] = relationship(
         "MigrationPlan", back_populates="agent"
