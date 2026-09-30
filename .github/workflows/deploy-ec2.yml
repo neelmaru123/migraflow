@@ -13,6 +13,7 @@ concurrency:
 jobs:
   deploy:
     name: Deploy Application to EC2
+    if: github.repository == 'jtqtech/migraflow'
     runs-on: ubuntu-latest
     permissions:
       contents: read
