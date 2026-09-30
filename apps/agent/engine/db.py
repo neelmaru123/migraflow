@@ -36,7 +36,11 @@ def _get_engine(db_url: str):
             return _ENGINE_CACHE[clean_url]
 
         connect_args = {}
-        if "postgres" in clean_url:
+        # Check the URL *scheme/dialect* prefix — NOT a plain substring match, because
+        # a MySQL URL like mysql+pymysql://postgres:pass@host/db also contains "postgres"
+        # in the username and would incorrectly receive psycopg2-only keepalive args.
+        is_postgres = clean_url.startswith("postgresql") or clean_url.startswith("postgres+")
+        if is_postgres:
             connect_args = {
                 "keepalives": 1,
                 "keepalives_idle": 30,

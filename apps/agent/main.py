@@ -50,24 +50,24 @@ def sync_metadata_snapshots(backend_url: str, agent_token: str):
         seen_identifiers.add(ident)
 
         logger.info(f"Executing metadata schema introspection for database '{ident}'...")
-            snapshot_data = AgentMetadataEngine.introspect_database(ident, v)
-            if not snapshot_data:
-                continue
+        snapshot_data = AgentMetadataEngine.introspect_database(ident, v)
+        if not snapshot_data:
+            continue
 
-            payload = json.dumps(snapshot_data, default=str).encode("utf-8")
-            req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-            try:
-                with urllib.request.urlopen(req, timeout=15.0) as resp:
-                    if resp.status in (200, 201):
-                        res_body = json.loads(resp.read().decode("utf-8"))
-                        logger.info(
-                            f"Metadata snapshot v{res_body.get('version')} successfully synced for database '{ident}' "
-                            f"(Snapshot ID: {res_body.get('id')}, Tables: {res_body.get('total_tables')}, Columns: {res_body.get('total_columns')})."
-                        )
-            except urllib.error.HTTPError as err:
-                logger.error(f"Metadata sync failed for '{ident}' with HTTP status {err.code}: {err.reason}")
-            except Exception as exc:
-                logger.error(f"Could not transmit metadata snapshot for '{ident}' to {url}: {exc}")
+        payload = json.dumps(snapshot_data, default=str).encode("utf-8")
+        req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=15.0) as resp:
+                if resp.status in (200, 201):
+                    res_body = json.loads(resp.read().decode("utf-8"))
+                    logger.info(
+                        f"Metadata snapshot v{res_body.get('version')} successfully synced for database '{ident}' "
+                        f"(Snapshot ID: {res_body.get('id')}, Tables: {res_body.get('total_tables')}, Columns: {res_body.get('total_columns')})."
+                    )
+        except urllib.error.HTTPError as err:
+            logger.error(f"Metadata sync failed for '{ident}' with HTTP status {err.code}: {err.reason}")
+        except Exception as exc:
+            logger.error(f"Could not transmit metadata snapshot for '{ident}' to {url}: {exc}")
 
 
 def _mask_url(url_val: str) -> str:
