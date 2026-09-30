@@ -18,8 +18,10 @@ class AgentMetadataEngine:
 
     @staticmethod
     def _clean_url_for_sync_engine(url_val: str) -> str:
-        """Converts async drivers (e.g. postgresql+asyncpg) to sync drivers and unquotes encoded database names."""
+        """Converts async drivers (e.g. postgresql+asyncpg) to sync drivers, unquotes encoded database names, and fixes accidental spaces."""
         cleaned = urllib.parse.unquote(url_val.strip())
+        # Strip accidental whitespace before port or after host (e.g. host.docker.internal :3306 -> host.docker.internal:3306)
+        cleaned = re.sub(r'([a-zA-Z0-9_.-]+)\s+:\s*([0-9]+)', r'\1:\2', cleaned)
         if cleaned.startswith("postgresql+asyncpg://"):
             cleaned = "postgresql+psycopg2://" + cleaned[len("postgresql+asyncpg://") :]
         elif cleaned.startswith("postgresql://"):
@@ -46,8 +48,8 @@ class AgentMetadataEngine:
         scheme = parsed.scheme.lower() if parsed.scheme else "postgresql"
 
         # Check for MongoDB scheme
-        if "mongo" in scheme or url_val.strip().startswith("mongodb"):
-            return cls._introspect_mongodb(identifier, url_val)
+        if "mongo" in scheme or sync_url.startswith("mongodb"):
+            return cls._introspect_mongodb(identifier, sync_url)
 
         # For target/destination databases, ensure database exists before connecting
         if any(tag in identifier.lower() for tag in ["dest", "dst", "target"]):

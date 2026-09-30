@@ -2,10 +2,11 @@
 Agents Domain Schemas (Pydantic boundaries)
 """
 
+import re
 from datetime import datetime
 from typing import List, Literal, Optional
 from uuid import UUID
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.modules.sources.sources_schemas import (
     DataSourceResponse,
@@ -127,6 +128,26 @@ class AgentDetailResponse(AgentResponse):
         None,
         description="Formatted .env file template containing all agent and database environment variables.",
     )
+
+    @field_validator("data_sources", mode="after")
+    @classmethod
+    def sort_data_sources_list(cls, v: List[DataSourceResponse]) -> List[DataSourceResponse]:
+        if not v:
+            return []
+
+        def _key(ds: DataSourceResponse):
+            role = str(getattr(ds, "role", "source")).lower()
+            ident = str(getattr(ds, "identifier", "")).lower()
+            name = str(getattr(ds, "name", "")).lower()
+            is_dest = 1 if any(tag in role or tag in ident for tag in ("dest", "dst", "target")) else 0
+            digits_id = re.findall(r'\d+', ident)
+            num_id = int(digits_id[-1]) if digits_id else 0
+            digits_name = re.findall(r'\d+', name)
+            num_name = int(digits_name[-1]) if digits_name else 0
+            num = num_id or num_name
+            return (is_dest, num, name, ident)
+
+        return sorted(v, key=_key)
 
     model_config = ConfigDict(from_attributes=True)
 

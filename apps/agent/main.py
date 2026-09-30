@@ -31,16 +31,25 @@ def sync_metadata_snapshots(backend_url: str, agent_token: str):
     }
 
     seen_identifiers = set()
-    for k, v in os.environ.items():
-        if (k.startswith("SRC_") or k.startswith("DEST_") or k in ("SOURCE_DB_URL", "DEST_DB_URL")) and (
-            "URL" in k or "URI" in k
-        ):
-            ident = extract_identifier_from_env_key(k)
-            if ident in seen_identifiers:
-                continue
-            seen_identifiers.add(ident)
+    db_env_keys = sorted(
+        [
+            k for k in os.environ.keys()
+            if (k.startswith("SRC_") or k.startswith("DEST_") or k in ("SOURCE_DB_URL", "DEST_DB_URL")) and ("URL" in k or "URI" in k)
+        ],
+        key=lambda k: (
+            1 if any(tag in k for tag in ("DEST_", "DEST_DB", "DST_")) else 0,
+            int(re.findall(r'\d+', k)[-1]) if re.findall(r'\d+', k) else 0,
+            k,
+        ),
+    )
+    for k in db_env_keys:
+        v = os.environ[k]
+        ident = extract_identifier_from_env_key(k)
+        if ident in seen_identifiers:
+            continue
+        seen_identifiers.add(ident)
 
-            logger.info(f"Executing metadata schema introspection for database '{ident}'...")
+        logger.info(f"Executing metadata schema introspection for database '{ident}'...")
             snapshot_data = AgentMetadataEngine.introspect_database(ident, v)
             if not snapshot_data:
                 continue
@@ -75,7 +84,7 @@ def extract_identifier_from_env_key(env_key: str) -> str:
     e.g. 'DEST_MYSQL_WAREHOUSE_URL' -> 'mysql_warehouse'
     e.g. 'SOURCE_DB_URL' -> 'source_db'
     """
-    k = env_key.upper()
+    k = env_key.upper() 
     if k.endswith("_URL"):
         k = k[:-4]
     elif k.endswith("_URI"):
@@ -95,12 +104,23 @@ def extract_identifier_from_env_key(env_key: str) -> str:
     return k.lower()
 
 
+def _sanitize_db_url(url_val: str) -> str:
+    """Strips whitespace from URL and fixes accidental spaces before port numbers or after hosts."""
+    if not url_val:
+        return ""
+    cleaned = url_val.strip()
+    # Remove accidental space before port: e.g. host.docker.internal :3307 -> host.docker.internal:3307
+    cleaned = re.sub(r'([a-zA-Z0-9_.-]+)\s+:\s*([0-9]+)', r'\1:\2', cleaned)
+    return cleaned
+
+
 def test_database_connection(identifier: str, url_val: str) -> Dict[str, Any]:
     """
     Tests network reachability, socket connection, and credential completeness for a database URL.
     Returns structured diagnostic health result with actionable troubleshooting advice.
     """
-    if not url_val or not url_val.strip():
+    url_val = _sanitize_db_url(url_val)
+    if not url_val:
         return {
             "identifier": identifier,
             "is_healthy": False,
@@ -126,7 +146,7 @@ def test_database_connection(identifier: str, url_val: str) -> Dict[str, Any]:
     try:
         parsed = urllib.parse.urlparse(url_val)
         scheme = parsed.scheme.lower() if parsed.scheme else "unknown"
-        hostname = parsed.hostname or "localhost"
+        hostname = (parsed.hostname or "localhost").strip()
         db_name = parsed.path.lstrip("/") if parsed.path else None
 
         default_ports = {
@@ -256,6 +276,14 @@ def collect_data_sources_health() -> List[Dict[str, Any]]:
                     "latency_ms": 0.0,
                 })
 
+    def _report_sort_key(rep: Dict[str, Any]):
+        ident = rep.get("identifier", "").lower()
+        is_dest = 1 if any(tag in ident for tag in ("dest", "dst", "target")) else 0
+        digits = re.findall(r'\d+', ident)
+        num = int(digits[-1]) if digits else 0
+        return (is_dest, num, ident)
+
+    reports.sort(key=_report_sort_key)
     return reports
 
 
