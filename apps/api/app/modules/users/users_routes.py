@@ -16,6 +16,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.db import get_db
+from app.core.email import send_password_reset_email
+from app.core.redis_client import PasswordResetCache
 from app.core.security import (
     create_access_token,
     create_refresh_token,
@@ -27,8 +29,10 @@ from app.modules.users.users_dependencies import (
 )
 from app.modules.users.users_models import User
 from app.modules.users.users_schemas import (
+    ForgotPasswordRequest,
     GoogleAuthRequest,
     MessageResponse,
+    ResetPasswordRequest,
     TokenResponse,
     UserLogin,
     UserRegister,
@@ -409,6 +413,113 @@ async def refresh_tokens(
     return TokenResponse(
         message="Tokens refreshed successfully.",
         user=UserResponse.model_validate(user),
+    )
+
+
+@router.post(
+    "/auth/forgot-password",
+    response_model=MessageResponse,
+    summary="Request a password reset link (5-min expiration, 1-min cooldown via Redis)",
+)
+async def forgot_password(
+    payload: ForgotPasswordRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Generate a 5-minute password reset link and dispatch it via Google Gmail SMTP.
+    Rate-limited via Redis: Users must wait 60 seconds before requesting another reset email.
+    """
+    # 1. Check Redis 1-minute rate limiting cooldown
+    remaining_seconds = await PasswordResetCache.check_rate_limit(payload.email)
+    if remaining_seconds is not None:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Please wait {remaining_seconds} seconds before requesting another password reset email.",
+        )
+
+    # 2. Check if user exists
+    user = await UserService.get_user_by_email(db, payload.email)
+    if user:
+        # Check if user registered via Google only without password
+        if user.google_id and not user.password_hash:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="This account was registered using Google Sign-In. Please sign in with Google.",
+            )
+
+        if not user.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="This user account is deactivated.",
+            )
+
+        # 3. Generate cryptographic token and store in Redis with 5-minute TTL
+        token = secrets.token_urlsafe(32)
+        ttl_seconds = settings.RESET_PASSWORD_TOKEN_EXPIRE_MINUTES * 60
+        await PasswordResetCache.set_reset_token(
+            token=token,
+            user_id=str(user.id),
+            email=user.email,
+            ttl_seconds=ttl_seconds,
+        )
+
+        # 4. Set 1-minute rate limiting cooldown lock in Redis
+        await PasswordResetCache.set_rate_limit(
+            email=payload.email,
+            cooldown_seconds=settings.RESET_PASSWORD_COOLDOWN_SECONDS,
+        )
+
+        # 5. Dispatch email via Google SMTP (executed non-blocking in threadpool)
+        await send_password_reset_email(
+            to_email=user.email,
+            reset_token=token,
+            user_name=user.name,
+        )
+
+    # Always return a consistent success message to prevent user enumeration
+    return MessageResponse(
+        message="If an account exists with this email, a password reset link (valid for 5 minutes) has been sent."
+    )
+
+
+@router.post(
+    "/auth/reset-password",
+    response_model=MessageResponse,
+    summary="Reset password using 5-minute expiring token",
+)
+async def reset_password(
+    payload: ResetPasswordRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Validate password reset token from Redis, encrypt new password via bcrypt,
+    update database record, and invalidate token immediately (single-use).
+    """
+    # 1. Fetch and validate token from Redis
+    token_data = await PasswordResetCache.get_reset_token(payload.token)
+    if not token_data:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Password reset link is invalid or has expired (links expire after 5 minutes). Please request a new one.",
+        )
+
+    user_id_str = token_data.get("user_id")
+    if not user_id_str:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Corrupted token payload. Please request a new password reset link.",
+        )
+
+    user_id = uuid.UUID(user_id_str)
+
+    # 2. Update password in database with fresh bcrypt hash
+    await UserService.reset_user_password(db, user_id, payload.new_password)
+
+    # 3. Invalidate token immediately to ensure single-use protection
+    await PasswordResetCache.delete_reset_token(payload.token)
+
+    return MessageResponse(
+        message="Password reset successfully. You can now log in with your new password."
     )
 
 

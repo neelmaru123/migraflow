@@ -8,9 +8,27 @@ import {
   TokenResponse,
   MessageResponse,
   GoogleLoginUrlResponse,
+  ForgotPasswordPayload,
+  ResetPasswordPayload,
 } from '../types/auth';
 
 export const authService = {
+  /**
+   * Request password reset link (POST /auth/forgot-password)
+   */
+  async forgotPassword(payload: ForgotPasswordPayload): Promise<MessageResponse> {
+    const response = await apiClient.post<MessageResponse>('/auth/forgot-password', payload);
+    return response.data;
+  },
+
+  /**
+   * Reset password using token (POST /auth/reset-password)
+   */
+  async resetPassword(payload: ResetPasswordPayload): Promise<MessageResponse> {
+    const response = await apiClient.post<MessageResponse>('/auth/reset-password', payload);
+    return response.data;
+  },
+
   /**
    * Register a new user account (POST /auth/register)
    */

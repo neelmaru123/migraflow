@@ -4,6 +4,37 @@ This file records all key architectural decisions, technology selections, trade-
 
 ---
 
+## [2026-09-30] - Forgot Password Flow with 5-Minute Expiring Link, Redis TTL & 1-Minute Rate Limiting
+
+### 1. Decision Summary
+Implemented a secure, high-performance Forgot Password and Reset Password workflow utilizing **Redis** for stateful 5-minute link expiration (`pwd_reset:token:<token>`, TTL=300s) and 1-minute client request rate-limiting (`pwd_reset:rate_limit:<email>`, TTL=60s). Outgoing notification emails are dispatched via **Google Gmail SMTP** with STARTTLS over port 587 using Python's standard library `smtplib` and `email.mime` inside `asyncio.to_thread` for non-blocking execution. The frontend provides a dedicated `/forgot-password` request screen with an active countdown retry timer, and `/reset-password` screen with password complexity validation and automatic token expiration detection.
+
+### 2. Why This Approach? (Rationale)
+- **Problem Being Solved**:
+  1. Users who forget their login credentials require a self-service password recovery flow.
+  2. Password reset links must be temporary (exactly 5 minutes) and single-use to minimize exposure windows and prevent replay attacks.
+  3. The request endpoint must prevent email flooding, spamming, and SMTP quota exhaustion by enforcing a 60-second cooldown between requests.
+- **Chosen Solution**:
+  - **Redis Auto-Eviction (TTL = 300s)**: Reset tokens are keyed in Redis with a 5-minute Time-To-Live. Expired links are automatically evicted by Redis without requiring recurring cleanup database cron jobs.
+  - **Single-Use Invalidation**: Upon successful password update, the token is explicitly deleted from Redis (`DEL`), preventing replay attacks within the remaining 5-minute window.
+  - **Redis Rate Limiting (TTL = 60s)**: Rate limit keys with 60-second TTL track cooldowns per email address. If a user repeats a request within 60 seconds, `redis.ttl()` returns the exact remaining wait time and the API issues an HTTP 429 Too Many Requests response.
+  - **Google Gmail SMTP via `asyncio.to_thread`**: Leverages standard Python `smtplib` and Google App Passwords without bloating `pyproject.toml` with extra unneeded dependencies.
+  - **Consistent Enumeration Defense**: The forgot-password endpoint returns an identical success message regardless of whether an email exists, preventing unauthorized email harvesting.
+
+### 3. Alternatives Considered & Rejected
+- **Alternative A: Database-backed Reset Tokens with Cron Cleanup**
+  - _Rejected_: Requires adding migration tables or extra columns (`reset_token`, `reset_token_expires_at`) to PostgreSQL and running periodic database cleanup cron jobs to purge expired tokens. Redis natively handles TTL expiry in memory at sub-millisecond latency.
+- **Alternative B: Pure Stateless JWT Tokens in URL**
+  - _Rejected_: Stateless JWTs cannot be easily revoked or invalidated after first use without maintaining a revocation blocklist, allowing an attacker who intercepts the link to reuse it within the 5-minute window even after the password has already been changed.
+- **Alternative C: External Third-Party Email APIs (SendGrid / Postmark)**
+  - _Rejected_: The user explicitly specified Google/Gmail integration. Built-in SMTP support allows straightforward deployment with existing Google Workspace or Gmail accounts without requiring external SaaS API subscriptions.
+
+### 4. Trade-offs & Future Considerations
+- Requires Redis to be available for password reset tokens and rate limiting (Redis is already containerized as part of the core platform stack).
+- Gmail SMTP imposes daily sending quotas suitable for transactional recovery; if user volume scales into tens of thousands of emails per hour in large production deployments, transitioning to AWS SES or dedicated SMTP relays can be configured transparently via `SMTP_HOST`.
+
+---
+
 ## [2026-09-29] - Intelligent Database Failure Diagnosis with Gemini & Dry Run Schema Validation
 
 ### 1. Decision Summary

@@ -34,6 +34,16 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres_password@localhost:5432/migration_platform"
     REDIS_URL: str = "redis://redis:6379/0"
 
+    # Google Gmail SMTP Settings
+    SMTP_HOST: str = "smtp.gmail.com"
+    SMTP_PORT: int = 587
+    SMTP_USER: str = ""
+    SMTP_PASSWORD: str = ""
+    EMAILS_FROM_EMAIL: str = ""
+    EMAILS_FROM_NAME: str = "Migraflow Platform"
+    RESET_PASSWORD_TOKEN_EXPIRE_MINUTES: int = 5
+    RESET_PASSWORD_COOLDOWN_SECONDS: int = 60
+
     GEMINI_API_KEY: str = ""
     OPENAI_API_KEY: str = ""
     LLM_PROVIDER: Literal["gemini", "openai"] = "gemini"
