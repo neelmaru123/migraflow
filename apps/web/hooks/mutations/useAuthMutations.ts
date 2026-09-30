@@ -6,6 +6,8 @@ import {
   UserLoginPayload,
   GoogleAuthRequestPayload,
   UserUpdatePayload,
+  ForgotPasswordPayload,
+  ResetPasswordPayload,
   TokenResponse,
   MessageResponse,
   UserResponse,
@@ -128,3 +130,36 @@ export function useUpdateProfile() {
     },
   });
 }
+
+/**
+ * Forgot Password mutation hook (POST /auth/forgot-password)
+ */
+export function useForgotPassword() {
+  return useMutation<MessageResponse, any, ForgotPasswordPayload>({
+    mutationFn: (payload) => authService.forgotPassword(payload),
+    onSuccess: (data) => {
+      toast.success(data.message || 'Password reset link sent!');
+    },
+    onError: (error) => {
+      const message = error?.response?.data?.detail || error?.message || 'Failed to send reset link';
+      toast.error(message);
+    },
+  });
+}
+
+/**
+ * Reset Password mutation hook (POST /auth/reset-password)
+ */
+export function useResetPassword() {
+  return useMutation<MessageResponse, any, ResetPasswordPayload>({
+    mutationFn: (payload) => authService.resetPassword(payload),
+    onSuccess: (data) => {
+      toast.success(data.message || 'Password reset successfully!');
+    },
+    onError: (error) => {
+      const message = error?.response?.data?.detail || error?.message || 'Password reset failed';
+      toast.error(message);
+    },
+  });
+}
+

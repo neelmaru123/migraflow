@@ -90,6 +90,12 @@ export default function LoginForm() {
             <label className="block text-[11px] font-semibold uppercase tracking-wider text-zinc-300">
               Password
             </label>
+            <Link
+              href="/forgot-password"
+              className="text-[11px] text-sky-400 hover:text-sky-300 transition-colors font-medium"
+            >
+              Forgot Password?
+            </Link>
           </div>
           <div className="relative">
             <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-sky-400">
