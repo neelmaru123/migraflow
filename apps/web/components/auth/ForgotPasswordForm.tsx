@@ -70,7 +70,7 @@ export default function ForgotPasswordForm() {
               <span>Reset Link Dispatched</span>
             </div>
             <p className="text-zinc-300 leading-relaxed font-sans">
-              If an account with <strong className="text-white">{submittedEmail}</strong> exists, an email containing your reset link has been dispatched.
+              A password reset link has been dispatched to <strong className="text-white">{submittedEmail}</strong>. Please check your inbox and spam folder.
             </p>
             <div className="flex items-center gap-1.5 pt-1 text-[11px] font-mono text-amber-400">
               <Clock className="w-3.5 h-3.5" />

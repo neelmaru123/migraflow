@@ -429,7 +429,28 @@ async def forgot_password(
     Generate a 5-minute password reset link and dispatch it via Google Gmail SMTP.
     Rate-limited via Redis: Users must wait 60 seconds before requesting another reset email.
     """
-    # 1. Check Redis 1-minute rate limiting cooldown
+    # 1. Check if user exists
+    user = await UserService.get_user_by_email(db, payload.email)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No account found with this email address. Please check your email or register.",
+        )
+
+    # Check if user registered via Google only without password
+    if user.google_id and not user.password_hash:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This account was registered using Google Sign-In. Please sign in with Google.",
+        )
+
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This user account is deactivated.",
+        )
+
+    # 2. Check 1-minute rate limiting cooldown
     remaining_seconds = await PasswordResetCache.check_rate_limit(payload.email)
     if remaining_seconds is not None:
         raise HTTPException(
@@ -437,48 +458,31 @@ async def forgot_password(
             detail=f"Please wait {remaining_seconds} seconds before requesting another password reset email.",
         )
 
-    # 2. Check if user exists
-    user = await UserService.get_user_by_email(db, payload.email)
-    if user:
-        # Check if user registered via Google only without password
-        if user.google_id and not user.password_hash:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="This account was registered using Google Sign-In. Please sign in with Google.",
-            )
+    # 3. Generate cryptographic token and store in cache with 5-minute TTL
+    token = secrets.token_urlsafe(32)
+    ttl_seconds = settings.RESET_PASSWORD_TOKEN_EXPIRE_MINUTES * 60
+    await PasswordResetCache.set_reset_token(
+        token=token,
+        user_id=str(user.id),
+        email=user.email,
+        ttl_seconds=ttl_seconds,
+    )
 
-        if not user.is_active:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="This user account is deactivated.",
-            )
+    # 4. Set 1-minute rate limiting cooldown lock
+    await PasswordResetCache.set_rate_limit(
+        email=payload.email,
+        cooldown_seconds=settings.RESET_PASSWORD_COOLDOWN_SECONDS,
+    )
 
-        # 3. Generate cryptographic token and store in Redis with 5-minute TTL
-        token = secrets.token_urlsafe(32)
-        ttl_seconds = settings.RESET_PASSWORD_TOKEN_EXPIRE_MINUTES * 60
-        await PasswordResetCache.set_reset_token(
-            token=token,
-            user_id=str(user.id),
-            email=user.email,
-            ttl_seconds=ttl_seconds,
-        )
+    # 5. Dispatch email via Google SMTP (executed non-blocking in threadpool)
+    await send_password_reset_email(
+        to_email=user.email,
+        reset_token=token,
+        user_name=user.name,
+    )
 
-        # 4. Set 1-minute rate limiting cooldown lock in Redis
-        await PasswordResetCache.set_rate_limit(
-            email=payload.email,
-            cooldown_seconds=settings.RESET_PASSWORD_COOLDOWN_SECONDS,
-        )
-
-        # 5. Dispatch email via Google SMTP (executed non-blocking in threadpool)
-        await send_password_reset_email(
-            to_email=user.email,
-            reset_token=token,
-            user_name=user.name,
-        )
-
-    # Always return a consistent success message to prevent user enumeration
     return MessageResponse(
-        message="If an account exists with this email, a password reset link (valid for 5 minutes) has been sent."
+        message=f"Password reset link has been dispatched to {user.email}."
     )
 
 

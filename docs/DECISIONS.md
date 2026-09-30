@@ -4,6 +4,37 @@ This file records all key architectural decisions, technology selections, trade-
 
 ---
 
+## [2026-09-30] - Forgot Password Flow: Explicit Account Existence Validation & In-Memory Redis Fallback
+
+### 1. Decision Summary
+Enhanced the Forgot Password recovery flow to provide immediate, actionable feedback to users when an email address is not found in the platform (`HTTP 404 Not Found`), rather than masking the absence behind a deceptive `200 OK` message. Additionally added an in-memory dictionary fallback in `PasswordResetCache` so password reset tokens and rate limits function reliably even if Redis is temporarily offline or experiencing connection hiccups.
+
+### 2. Why This Approach? (Rationale)
+- **Problem Being Solved**:
+  1. Generic "If an account exists..." messages cause poor developer and user experience. Users who mistype their email or enter an unregistered address sit waiting indefinitely for emails that will never arrive.
+  2. If the local Redis container was stopped, the previous implementation raised unhandled exceptions during token persistence, resulting in cryptic HTTP 500 errors.
+- **Chosen Solution**:
+  - **Explicit Account Verification**:
+    - Queries `User` by email immediately in `forgot_password()`.
+    - If user not found -> returns `HTTP 404 Not Found` with `"No account found with this email address. Please check your email or register."`.
+    - If Google OAuth only (no password) -> returns `HTTP 400 Bad Request` with `"This account was registered using Google Sign-In. Please sign in with Google."`.
+    - If deactivated -> returns `HTTP 400 Bad Request` with `"This user account is deactivated."`.
+    - If valid -> generates token, dispatches SMTP email, and returns `HTTP 200 OK`.
+  - **In-Memory Cache Fallback**:
+    - `PasswordResetCache` maintains `_memory_tokens` and `_memory_rate_limits` with epoch timestamps.
+    - If Redis connection fails (`Errno 10061`), operations gracefully fall back to in-memory tracking without crashing the server.
+
+### 3. Alternatives Considered & Rejected
+- **Alternative A: Full User Enumeration Protection (Blind 200 OK)**:
+  - _Rejected_: While common in high-risk banking applications, in self-service developer platforms it causes severe user confusion when emails fail to arrive due to typos.
+- **Alternative B: Hard-Crash Without Redis**:
+  - _Rejected_: Forcing Redis as a hard blocker causes local development friction if the Redis container is paused.
+
+### 4. Trade-offs & Future Considerations
+- Disclosing that an email does not exist permits determining whether an address is registered on the platform. This is standard and expected for developer and internal tools where usability and clarity are prioritized.
+
+---
+
 ## [2026-09-30] - Forgot Password Flow with 5-Minute Expiring Link, Redis TTL & 1-Minute Rate Limiting
 
 ### 1. Decision Summary

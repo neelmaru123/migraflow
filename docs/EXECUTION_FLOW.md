@@ -13,14 +13,19 @@
 ### 2. Step-by-Step Execution Sequence
 
 #### Phase 1: Forgot Password Request & Cooldown
-1. **User Submission**: User submits registered email address on `/forgot-password`.
-2. **Frontend Rate Limit Protection**: `ForgotPasswordForm` initializes a 60-second cooldown timer. If a previous request was made, the button shows a countdown (e.g., `Resend available in 45s`).
-3. **API Rate Limit Guard**: `forgot_password()` calls `PasswordResetCache.check_rate_limit(email)`. If TTL > 0 in Redis, immediately aborts with `HTTP 429 Too Many Requests` indicating remaining cooldown seconds.
-4. **User Verification**: Queries `User` by email in PostgreSQL. If the account was created using Google OAuth without password credentials, rejects with `HTTP 400 Bad Request` directing user to sign in with Google.
-5. **Token Generation & Redis Cache**: Generates a 32-byte URL-safe cryptographic token (`secrets.token_urlsafe(32)`).
-6. **Redis TTL Storage**: Calls `PasswordResetCache.set_reset_token()` storing `pwd_reset:token:<token>` with `EX = 300` (5 minutes). Redis will automatically purge this token after 300 seconds.
-7. **Redis Cooldown Lock**: Calls `PasswordResetCache.set_rate_limit()` setting `pwd_reset:rate_limit:<email>` with `EX = 60` (1 minute cooldown).
+1. **User Submission**: User submits email address on `/forgot-password`.
+2. **Account Existence & Type Guard**:
+   - `forgot_password()` immediately queries `User` by email in PostgreSQL.
+   - If user does not exist: aborts with `HTTP 404 Not Found` (`"No account found with this email address. Please check your email or register."`).
+   - If user registered via Google OAuth without password: aborts with `HTTP 400 Bad Request` (`"This account was registered using Google Sign-In. Please sign in with Google."`).
+   - If user is deactivated: aborts with `HTTP 400 Bad Request` (`"This user account is deactivated."`).
+3. **Frontend Rate Limit Protection**: `ForgotPasswordForm` initializes a 60-second cooldown timer. If a previous request was made, the button shows a countdown (e.g., `Resend available in 45s`).
+4. **API Rate Limit Guard**: `forgot_password()` calls `PasswordResetCache.check_rate_limit(email)`. If TTL > 0 in Redis (or in-memory fallback), immediately aborts with `HTTP 429 Too Many Requests` indicating remaining cooldown seconds.
+5. **Token Generation & Cache**: Generates a 32-byte URL-safe cryptographic token (`secrets.token_urlsafe(32)`).
+6. **Token TTL Storage**: Calls `PasswordResetCache.set_reset_token()` storing token with 5-minute expiration (in Redis with in-memory fallback).
+7. **Cooldown Lock**: Calls `PasswordResetCache.set_rate_limit()` setting 60-second cooldown lock.
 8. **Email Dispatch**: `send_password_reset_email()` connects to Google Gmail SMTP (`smtp.gmail.com:587`) via `asyncio.to_thread` and sends a responsive HTML email with the reset button pointing to `${FRONTEND_URL}/reset-password?token=<token>`.
+9. **Success Response**: Returns `HTTP 200 OK` confirming `"Password reset link has been dispatched to <email>."`. Frontend displays the green confirmation banner.
 
 #### Phase 2: Password Reset Execution
 1. **User Navigation**: User opens email and clicks link, navigating to `/reset-password?token=<token>`.
