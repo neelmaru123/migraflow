@@ -48,8 +48,8 @@ jobs:
 
             echo "=== Seamlessly replacing and recreating containers ==="
             docker compose down --remove-orphans || true
-            docker stop migration_platform_postgres migration_platform_api migration_platform_web 2>/dev/null || true
-            docker rm -f migration_platform_postgres migration_platform_api migration_platform_web 2>/dev/null || true
+            docker stop migration_platform_postgres migration_platform_redis migration_platform_api migration_platform_web 2>/dev/null || true
+            docker rm -f migration_platform_postgres migration_platform_redis migration_platform_api migration_platform_web 2>/dev/null || true
             docker rm -f $(docker ps -aq --filter "name=migration_platform") 2>/dev/null || true
             docker compose up -d --force-recreate --remove-orphans
 

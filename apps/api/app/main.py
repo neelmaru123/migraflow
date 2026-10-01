@@ -51,6 +51,14 @@ async def stale_agent_watchdog():
 async def lifespan(app: FastAPI):
     """Modern application lifespan context manager managing background tasks & cleanup."""
     logger.info(f"Starting {settings.PROJECT_NAME} in environment: {settings.ENVIRONMENT}")
+    try:
+        from app.core.db import engine, Base
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        logger.info("Database tables initialized and verified.")
+    except Exception as exc:
+        logger.warning(f"Startup table verification note: {exc}")
+
     watchdog_task = asyncio.create_task(stale_agent_watchdog())
     yield
     watchdog_task.cancel()

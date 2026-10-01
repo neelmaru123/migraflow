@@ -2,6 +2,35 @@
 
 This file records all key architectural decisions, technology selections, trade-offs, and design rationale for the **AI Data Migration Platform**.
 
+## [2026-10-01] - Production EC2 Deployment: Redis Promotion to Core Service & Orchestration Hardening
+
+### 1. Decision Summary
+Promoted the **Redis** container from an optional profile (`profiles: ["redis", "all"]`) to a first-class, primary infrastructure service in `docker-compose.yml` with healthchecks, persistent storage volume (`redis_data`), and explicit dependencies in the FastAPI `api` service. Configured automatic environment variable forwarding for Gmail SMTP transactional emails and password recovery, and updated the GitHub Actions EC2 deployment workflow to cleanly manage and recreate the Redis container alongside Postgres, API, and Web.
+
+### 2. Why This Approach? (Rationale)
+- **Problem Being Solved**:
+  1. Previously, Redis was gated behind Docker Compose profiles (`profiles: ["redis", "all"]`). When `docker compose up -d` executed on the EC2 production instance, Redis was skipped, leaving the backend unable to persist reset tokens or enforce rate limits.
+  2. The `api` service container did not declare `redis` under `depends_on`, allowing the API to start before Redis was ready.
+  3. SMTP credentials (`SMTP_USER`, `SMTP_PASSWORD`) and reset token configurations were absent from `docker-compose.yml` environment declarations, preventing containerized instances from dispatching outgoing recovery emails.
+  4. If `.env` contained `REDIS_URL="redis://localhost:6379/0"`, the containerized API attempted to reach `127.0.0.1` inside its own isolated network namespace rather than the Redis container.
+- **Chosen Solution**:
+  - Removed `profiles` from `redis` in `docker-compose.yml`, ensuring it boots on every `docker compose up -d`.
+  - Added `redis: condition: service_healthy` to `api`'s `depends_on`.
+  - Routed containerized Redis traffic through `${DOCKER_REDIS_URL:-redis://redis:6379/0}`, isolating internal Docker network DNS from local host IP addresses.
+  - Forwarded all SMTP and password recovery variables (`SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `EMAILS_FROM_EMAIL`, `RESET_PASSWORD_...`) directly to the API container.
+  - Added `redis_data` named volume to persist cache and rate limit data across container replacements.
+  - Added `migration_platform_redis` to the EC2 zero-downtime container replacement sequence in `.github/workflows/deploy-ec2.yml`.
+  - Ensured idempotent database table initialization runs in `lifespan` in `apps/api/app/main.py`.
+
+### 3. Alternatives Considered & Rejected
+- **Alternative A: Running Redis as an external AWS ElastiCache instance**
+  - _Rejected_: Introduces significant AWS infrastructure cost ($15–$30/month) for simple token caching and rate-limiting. A lightweight containerized Alpine Redis image consumes < 15MB RAM and is completely sufficient.
+- **Alternative B: Retaining `--profile redis` in deploy scripts**
+  - _Rejected_: Fragile. Any developer or CI/CD script running standard `docker compose up` would forget the `--profile` flag, causing silent cache failures. Core platform features must start by default.
+
+### 4. Trade-offs & Future Considerations
+- Redis memory is capped by Docker host limits; memory eviction (`maxmemory-policy allkeys-lru`) can be enabled if cache usage grows under high load.
+
 ---
 
 ## [2026-09-30] - Forgot Password Flow: Explicit Account Existence Validation & In-Memory Redis Fallback
