@@ -28,7 +28,7 @@ services:
       - ENVIRONMENT=${ENVIRONMENT:-production}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres_password}@postgres:5432/${POSTGRES_DB:-migration_platform}
-      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      - REDIS_URL=${DOCKER_REDIS_URL:-redis://redis:6379/0}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - JWT_SECRET_KEY=${JWT_SECRET_KEY:-default_jwt_secret_key_change_me_in_production}
@@ -48,8 +48,19 @@ services:
       - LANGSMITH_API_KEY=${LANGSMITH_API_KEY:-}
       - LANGSMITH_PROJECT=${LANGSMITH_PROJECT:-Migraflow Platform}
       - LANGSMITH_ENDPOINT=${LANGSMITH_ENDPOINT:-https://api.smith.langchain.com}
+      # Transactional Email (Google SMTP) and Password Reset Config
+      - SMTP_HOST=${SMTP_HOST:-smtp.gmail.com}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USER=${SMTP_USER:-}
+      - SMTP_PASSWORD=${SMTP_PASSWORD:-}
+      - EMAILS_FROM_EMAIL=${EMAILS_FROM_EMAIL:-}
+      - EMAILS_FROM_NAME=${EMAILS_FROM_NAME:-Migraflow Platform}
+      - RESET_PASSWORD_TOKEN_EXPIRE_MINUTES=${RESET_PASSWORD_TOKEN_EXPIRE_MINUTES:-5}
+      - RESET_PASSWORD_COOLDOWN_SECONDS=${RESET_PASSWORD_COOLDOWN_SECONDS:-60}
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     restart: unless-stopped
 
@@ -132,9 +143,10 @@ services:
   redis:
     image: redis:7-alpine
     container_name: migration_platform_redis
-    profiles: ["redis", "all"]
     ports:
       - "6379:6379"
+    volumes:
+      - redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -146,4 +158,5 @@ volumes:
   postgres_data:
   mysql_data:
   mongo_data:
+  redis_data:
 
