@@ -1308,5 +1308,49 @@ sequenceDiagram
 - **[FIXED]**: Database `alembic_version` state synchronized to head revision `c9f0a2b3456e`, resolving API container crash loop.
 - **[VERIFIED]**: `web`, `api`, and `agent` Docker images built cleanly and tested with HTTP 200 OK.
 
+---
+
+# Execution Flow - NoSQL/Document-Oriented Domain in PostgreSQL & MySQL Provisioning
+
+## 1. Entry Point
+- **File**: [`apps/api/scripts/seed_gaming_nosql_dbs.py:L316`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/scripts/seed_gaming_nosql_dbs.py#L316)
+- **Trigger**: CLI execution `python apps/api/scripts/seed_gaming_nosql_dbs.py` or automated CI/CD database seeding runner.
+
+## 2. Step-by-Step Execution Sequence
+
+1. **Environment & Connection Resolution**:
+   - `main()` in [`apps/api/scripts/seed_gaming_nosql_dbs.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/scripts/seed_gaming_nosql_dbs.py) parses host, port, user, and password credentials from environment variables (`POSTGRES_PORT=5434`, `MYSQL_PORT=3307`).
+   - Resolves admin URLs (`postgresql://.../postgres`, `mysql+pymysql://.../mysql`).
+2. **PostgreSQL Database & Schema Lifecycle**:
+   - `ensure_postgres_database()` executes `SELECT 1 FROM pg_database WHERE datname = 'gaming_telemetry_pg'`, and executes `CREATE DATABASE "gaming_telemetry_pg"` with autocommit if absent.
+   - `seed_postgres()` connects to target URL `postgresql://.../gaming_telemetry_pg`.
+   - Cleans old tables (`DROP TABLE IF EXISTS ... CASCADE`).
+   - Executes DDL for 5 tables: `players`, `player_characters`, `inventory_items`, `match_sessions`, `combat_events`.
+   - Provisions 5 `GIN` indexes (`idx_players_settings`, `idx_characters_attributes`, `idx_inventory_payload`, `idx_sessions_hardware`, `idx_combat_telemetry`) for efficient JSONB querying.
+3. **PostgreSQL Bulk Seeding (2,500 Rows)**:
+   - Synthesizes 500 records per table with deep nested structures (audio/graphics/privacy settings, character stat attributes and talent trees, inventory socket arrays and affixes, client hardware performance metrics, and combat telemetry with coordinates and modifiers).
+   - Uses SQLAlchemy `conn.execute()` bulk dictionary parameter binding for high-speed batch inserts.
+   - Runs verification query `SELECT COUNT(*) FROM <table>` verifying exactly 500 rows per table.
+4. **MySQL Database & Schema Lifecycle**:
+   - `ensure_mysql_database()` executes `CREATE DATABASE IF NOT EXISTS \`gaming_economy_mysql\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;`.
+   - `seed_mysql()` connects to target URL `mysql+pymysql://.../gaming_economy_mysql`.
+   - Disables foreign key checks (`SET FOREIGN_KEY_CHECKS = 0;`), drops legacy tables, and creates 5 tables: `guilds`, `guild_members`, `auction_listings`, `auction_transactions`, `quest_progressions`.
+5. **MySQL Bulk Seeding (2,500 Rows)**:
+   - Synthesizes 500 records per table with native JSON fields (guild perk unlock trees and heraldic crests, role permission matrices, dynamic auction item crafting tags and enchantments, escrow and audit hashes, and multi-branch quest milestone trees).
+   - Re-enables foreign key checks (`SET FOREIGN_KEY_CHECKS = 1;`).
+   - Runs verification query `SELECT COUNT(*) FROM \`<table>\`` verifying exactly 500 rows per table.
+6. **Container Rebuild Persistence Hook**:
+   - Container startup automatically runs [`infra/docker/init-postgres-dbs.sql`](file:///d:/GitHub/Ai_data_migration_platform/infra/docker/init-postgres-dbs.sql) and [`infra/docker/init-mysql-dbs.sql`](file:///d:/GitHub/Ai_data_migration_platform/infra/docker/init-mysql-dbs.sql), creating the database schemas if the container volumes are regenerated.
+
+## 3. Impact & Delta Analysis (AI Modifications)
+- **[NEW]**: [`apps/api/scripts/seed_gaming_nosql_dbs.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/scripts/seed_gaming_nosql_dbs.py) — End-to-end database creation and deterministic 5,000-record seeder.
+- **[MODIFIED]**: [`infra/docker/init-postgres-dbs.sql`](file:///d:/GitHub/Ai_data_migration_platform/infra/docker/init-postgres-dbs.sql) — Added database creation for `gaming_telemetry_pg`.
+- **[MODIFIED]**: [`infra/docker/init-mysql-dbs.sql`](file:///d:/GitHub/Ai_data_migration_platform/infra/docker/init-mysql-dbs.sql) — Added database creation for `gaming_economy_mysql`.
+- **[MODIFIED]**: [`DATABASE_CREDENTIALS.md`](file:///d:/GitHub/Ai_data_migration_platform/DATABASE_CREDENTIALS.md) & [`docs/DATABASE_CREDENTIALS.md`](file:///d:/GitHub/Ai_data_migration_platform/docs/DATABASE_CREDENTIALS.md) — Documented table schemas, row counts, and 3-way connection strings.
+- **[MODIFIED]**: [`database_credentials.env`](file:///d:/GitHub/Ai_data_migration_platform/database_credentials.env) — Added `PG_GAMING_TELEMETRY_URL` and `MYSQL_GAMING_ECONOMY_URL`.
+- **[MODIFIED]**: [`docs/DECISIONS.md`](file:///d:/GitHub/Ai_data_migration_platform/docs/DECISIONS.md) — Recorded architectural decision log for modeling document-oriented NoSQL domains in RDBMS.
+- **[UNCHANGED]**: Existing databases (`migration_platform`, `ecommerce_db`, `crm_db`, `inventory_db`, etc.) and API service routes.
+
+
 
 

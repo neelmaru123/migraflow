@@ -2285,5 +2285,40 @@ Parameterized `BACKEND_URL` across `apps/api/app/core/config.py`, `docker-compos
 - **Trade-offs**: Requires DevOps/operators to supply `BACKEND_URL` in their production `.env` file or cloud secrets manager.
 - **Future Considerations**: Support auto-detecting the public hostname via incoming request headers (`X-Forwarded-Host`, `Host`) if `BACKEND_URL` is left unconfigured in production.
 
+---
+
+## [2026-10-01] - NoSQL/Document-Oriented Domain Architecture in PostgreSQL & MySQL (Gaming Telemetry & Virtual Economy)
+
+### 1. Decision Summary
+Designed, provisioned, and seeded two enterprise databases—**`gaming_telemetry_pg`** in PostgreSQL 16 and **`gaming_economy_mysql`** in MySQL 8.0—addressing a client requirement where a document-oriented domain (typically architected in MongoDB collections with polymorphic, nested JSON structures) must be built inside relational database management systems (RDBMS). Each database contains 5 interconnected tables, with exactly **500 rows per table** (5,000 total rows across 10 tables).
+
+- **PostgreSQL (`gaming_telemetry_pg` - Port 5434)**: Modeled the player telemetry, session hardware metrics, character talent trees, inventory socket/affix payloads, and high-frequency combat event logs using relational schemas augmented with `JSONB` columns and `GIN` indexes.
+- **MySQL (`gaming_economy_mysql` - Port 3307)**: Modeled the multiplayer virtual economy, guild perk trees, role permission matrices, dynamic auction listings with custom enchantments, transaction audits, and branching quest progression milestone trees using native `JSON` columns and InnoDB foreign keys.
+
+### 2. Why This Approach? (Rationale)
+- **Problem Being Solved**: Clients frequently encounter scenarios where an application domain naturally calls for a document store (e.g., MongoDB due to polymorphic event schemas, jagged arrays, variable hardware diagnostics, dynamic game item affixes, and hierarchical quest trees), yet corporate compliance, licensing, existing DBA skillsets, or infrastructure mandates dictate using PostgreSQL and MySQL. The developer must model these document structures within relational engines while preserving queryability and relational integrity.
+- **Chosen Solution**:
+  1. **Hybrid Relational-Document Modeling**: Retained relational primary keys, foreign keys (`ON DELETE CASCADE`), and scalar metadata (e.g. `player_id`, `created_at`, `status`, `price`) for referential integrity, while encapsulating polymorphic and variable sub-structures in `JSONB` (PostgreSQL) and `JSON` (MySQL).
+  2. **Dedicated Provisioning & Seeding Pipeline**: Created [`apps/api/scripts/seed_gaming_nosql_dbs.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/scripts/seed_gaming_nosql_dbs.py) with bulk parameter binding for ultra-fast, deterministic insertion of 500 records per table.
+  3. **Container Rebuild Persistence**: Integrated database definitions into [`infra/docker/init-postgres-dbs.sql`](file:///d:/GitHub/Ai_data_migration_platform/infra/docker/init-postgres-dbs.sql) and [`infra/docker/init-mysql-dbs.sql`](file:///d:/GitHub/Ai_data_migration_platform/infra/docker/init-mysql-dbs.sql) to survive Docker container lifecycle events.
+  4. **Catalog & Environment Integration**: Updated [`DATABASE_CREDENTIALS.md`](file:///d:/GitHub/Ai_data_migration_platform/DATABASE_CREDENTIALS.md) and [`database_credentials.env`](file:///d:/GitHub/Ai_data_migration_platform/database_credentials.env) with connection URLs across localhost, Docker Agent, and Docker Compose networks.
+- **Why This Library / Technology**:
+  - PostgreSQL `JSONB`: Stores decomposed binary format with full expression indexing (`GIN`), offering near-NoSQL read speeds while enforcing relational constraints.
+  - MySQL 8.0 `JSON`: Provides RFC 7159 compliance, automatic JSON document validation, and in-place document updates.
+  - SQLAlchemy Core with bulk parameter binding: Provides cross-dialect compatibility and high-throughput bulk insertion without ORM overhead.
+
+### 3. Alternatives Considered & Rejected
+- **Alternative A: Entity-Attribute-Value (EAV) Table Modeling**
+  - *Rejected*: Creating separate `attribute_names` and `attribute_values` tables causes severe JOIN explosion, poor query performance, and excessive schema complexity when modeling deep hierarchies (e.g., nested combat coordinates, hardware specs).
+- **Alternative B: Pure String/TEXT Columns with Serialization**
+  - *Rejected*: Storing JSON as raw unstructured text prevents database-level validation, prohibits indexed JSON path queries (`->>`, `json_extract`), and increases parsing overhead on the application layer.
+- **Alternative C: Deploying MongoDB Collections Directly**
+  - *Rejected*: Rejected per explicit client requirement mandating PostgreSQL and MySQL deployment.
+
+### 4. Trade-offs & Future Considerations
+- **Trade-offs**: Hybrid relational-JSON schemas require careful index management (`GIN` on PostgreSQL, generated functional index columns on MySQL) to avoid unindexed table scans on deeply nested JSON keys.
+- **Future Considerations**: Add synthetic workload benchmarks or migration agent pipelines to demonstrate bi-directional schema inference and transformations between `gaming_telemetry_pg`, `gaming_economy_mysql`, and NoSQL sinks.
+
+
 
 
