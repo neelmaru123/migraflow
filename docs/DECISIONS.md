@@ -2,6 +2,97 @@
 
 This file records all key architectural decisions, technology selections, trade-offs, and design rationale for the **AI Data Migration Platform**.
 
+## [2026-10-01] - Production EC2 Deployment: Redis Promotion to Core Service & Orchestration Hardening
+
+### 1. Decision Summary
+Promoted the **Redis** container from an optional profile (`profiles: ["redis", "all"]`) to a first-class, primary infrastructure service in `docker-compose.yml` with healthchecks, persistent storage volume (`redis_data`), and explicit dependencies in the FastAPI `api` service. Configured automatic environment variable forwarding for Gmail SMTP transactional emails and password recovery, and updated the GitHub Actions EC2 deployment workflow to cleanly manage and recreate the Redis container alongside Postgres, API, and Web.
+
+### 2. Why This Approach? (Rationale)
+- **Problem Being Solved**:
+  1. Previously, Redis was gated behind Docker Compose profiles (`profiles: ["redis", "all"]`). When `docker compose up -d` executed on the EC2 production instance, Redis was skipped, leaving the backend unable to persist reset tokens or enforce rate limits.
+  2. The `api` service container did not declare `redis` under `depends_on`, allowing the API to start before Redis was ready.
+  3. SMTP credentials (`SMTP_USER`, `SMTP_PASSWORD`) and reset token configurations were absent from `docker-compose.yml` environment declarations, preventing containerized instances from dispatching outgoing recovery emails.
+  4. If `.env` contained `REDIS_URL="redis://localhost:6379/0"`, the containerized API attempted to reach `127.0.0.1` inside its own isolated network namespace rather than the Redis container.
+- **Chosen Solution**:
+  - Removed `profiles` from `redis` in `docker-compose.yml`, ensuring it boots on every `docker compose up -d`.
+  - Added `redis: condition: service_healthy` to `api`'s `depends_on`.
+  - Routed containerized Redis traffic through `${DOCKER_REDIS_URL:-redis://redis:6379/0}`, isolating internal Docker network DNS from local host IP addresses.
+  - Forwarded all SMTP and password recovery variables (`SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `EMAILS_FROM_EMAIL`, `RESET_PASSWORD_...`) directly to the API container.
+  - Added `redis_data` named volume to persist cache and rate limit data across container replacements.
+  - Added `migration_platform_redis` to the EC2 zero-downtime container replacement sequence in `.github/workflows/deploy-ec2.yml`.
+  - Ensured idempotent database table initialization runs in `lifespan` in `apps/api/app/main.py`.
+
+### 3. Alternatives Considered & Rejected
+- **Alternative A: Running Redis as an external AWS ElastiCache instance**
+  - _Rejected_: Introduces significant AWS infrastructure cost ($15–$30/month) for simple token caching and rate-limiting. A lightweight containerized Alpine Redis image consumes < 15MB RAM and is completely sufficient.
+- **Alternative B: Retaining `--profile redis` in deploy scripts**
+  - _Rejected_: Fragile. Any developer or CI/CD script running standard `docker compose up` would forget the `--profile` flag, causing silent cache failures. Core platform features must start by default.
+
+### 4. Trade-offs & Future Considerations
+- Redis memory is capped by Docker host limits; memory eviction (`maxmemory-policy allkeys-lru`) can be enabled if cache usage grows under high load.
+
+---
+
+## [2026-09-30] - Forgot Password Flow: Explicit Account Existence Validation & In-Memory Redis Fallback
+
+### 1. Decision Summary
+Enhanced the Forgot Password recovery flow to provide immediate, actionable feedback to users when an email address is not found in the platform (`HTTP 404 Not Found`), rather than masking the absence behind a deceptive `200 OK` message. Additionally added an in-memory dictionary fallback in `PasswordResetCache` so password reset tokens and rate limits function reliably even if Redis is temporarily offline or experiencing connection hiccups.
+
+### 2. Why This Approach? (Rationale)
+- **Problem Being Solved**:
+  1. Generic "If an account exists..." messages cause poor developer and user experience. Users who mistype their email or enter an unregistered address sit waiting indefinitely for emails that will never arrive.
+  2. If the local Redis container was stopped, the previous implementation raised unhandled exceptions during token persistence, resulting in cryptic HTTP 500 errors.
+- **Chosen Solution**:
+  - **Explicit Account Verification**:
+    - Queries `User` by email immediately in `forgot_password()`.
+    - If user not found -> returns `HTTP 404 Not Found` with `"No account found with this email address. Please check your email or register."`.
+    - If Google OAuth only (no password) -> returns `HTTP 400 Bad Request` with `"This account was registered using Google Sign-In. Please sign in with Google."`.
+    - If deactivated -> returns `HTTP 400 Bad Request` with `"This user account is deactivated."`.
+    - If valid -> generates token, dispatches SMTP email, and returns `HTTP 200 OK`.
+  - **In-Memory Cache Fallback**:
+    - `PasswordResetCache` maintains `_memory_tokens` and `_memory_rate_limits` with epoch timestamps.
+    - If Redis connection fails (`Errno 10061`), operations gracefully fall back to in-memory tracking without crashing the server.
+
+### 3. Alternatives Considered & Rejected
+- **Alternative A: Full User Enumeration Protection (Blind 200 OK)**:
+  - _Rejected_: While common in high-risk banking applications, in self-service developer platforms it causes severe user confusion when emails fail to arrive due to typos.
+- **Alternative B: Hard-Crash Without Redis**:
+  - _Rejected_: Forcing Redis as a hard blocker causes local development friction if the Redis container is paused.
+
+### 4. Trade-offs & Future Considerations
+- Disclosing that an email does not exist permits determining whether an address is registered on the platform. This is standard and expected for developer and internal tools where usability and clarity are prioritized.
+
+---
+
+## [2026-09-30] - Forgot Password Flow with 5-Minute Expiring Link, Redis TTL & 1-Minute Rate Limiting
+
+### 1. Decision Summary
+Implemented a secure, high-performance Forgot Password and Reset Password workflow utilizing **Redis** for stateful 5-minute link expiration (`pwd_reset:token:<token>`, TTL=300s) and 1-minute client request rate-limiting (`pwd_reset:rate_limit:<email>`, TTL=60s). Outgoing notification emails are dispatched via **Google Gmail SMTP** with STARTTLS over port 587 using Python's standard library `smtplib` and `email.mime` inside `asyncio.to_thread` for non-blocking execution. The frontend provides a dedicated `/forgot-password` request screen with an active countdown retry timer, and `/reset-password` screen with password complexity validation and automatic token expiration detection.
+
+### 2. Why This Approach? (Rationale)
+- **Problem Being Solved**:
+  1. Users who forget their login credentials require a self-service password recovery flow.
+  2. Password reset links must be temporary (exactly 5 minutes) and single-use to minimize exposure windows and prevent replay attacks.
+  3. The request endpoint must prevent email flooding, spamming, and SMTP quota exhaustion by enforcing a 60-second cooldown between requests.
+- **Chosen Solution**:
+  - **Redis Auto-Eviction (TTL = 300s)**: Reset tokens are keyed in Redis with a 5-minute Time-To-Live. Expired links are automatically evicted by Redis without requiring recurring cleanup database cron jobs.
+  - **Single-Use Invalidation**: Upon successful password update, the token is explicitly deleted from Redis (`DEL`), preventing replay attacks within the remaining 5-minute window.
+  - **Redis Rate Limiting (TTL = 60s)**: Rate limit keys with 60-second TTL track cooldowns per email address. If a user repeats a request within 60 seconds, `redis.ttl()` returns the exact remaining wait time and the API issues an HTTP 429 Too Many Requests response.
+  - **Google Gmail SMTP via `asyncio.to_thread`**: Leverages standard Python `smtplib` and Google App Passwords without bloating `pyproject.toml` with extra unneeded dependencies.
+  - **Consistent Enumeration Defense**: The forgot-password endpoint returns an identical success message regardless of whether an email exists, preventing unauthorized email harvesting.
+
+### 3. Alternatives Considered & Rejected
+- **Alternative A: Database-backed Reset Tokens with Cron Cleanup**
+  - _Rejected_: Requires adding migration tables or extra columns (`reset_token`, `reset_token_expires_at`) to PostgreSQL and running periodic database cleanup cron jobs to purge expired tokens. Redis natively handles TTL expiry in memory at sub-millisecond latency.
+- **Alternative B: Pure Stateless JWT Tokens in URL**
+  - _Rejected_: Stateless JWTs cannot be easily revoked or invalidated after first use without maintaining a revocation blocklist, allowing an attacker who intercepts the link to reuse it within the 5-minute window even after the password has already been changed.
+- **Alternative C: External Third-Party Email APIs (SendGrid / Postmark)**
+  - _Rejected_: The user explicitly specified Google/Gmail integration. Built-in SMTP support allows straightforward deployment with existing Google Workspace or Gmail accounts without requiring external SaaS API subscriptions.
+
+### 4. Trade-offs & Future Considerations
+- Requires Redis to be available for password reset tokens and rate limiting (Redis is already containerized as part of the core platform stack).
+- Gmail SMTP imposes daily sending quotas suitable for transactional recovery; if user volume scales into tens of thousands of emails per hour in large production deployments, transitioning to AWS SES or dedicated SMTP relays can be configured transparently via `SMTP_HOST`.
+
 ---
 
 ## [2026-09-29] - Intelligent Database Failure Diagnosis with Gemini & Dry Run Schema Validation

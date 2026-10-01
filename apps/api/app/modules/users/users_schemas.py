@@ -54,3 +54,14 @@ class TokenResponse(BaseModel):
 class MessageResponse(BaseModel):
     """Standard message response structure."""
     message: str
+
+
+class ForgotPasswordRequest(BaseModel):
+    """Payload to request password reset link."""
+    email: EmailStr = Field(..., examples=["user@example.com"])
+
+
+class ResetPasswordRequest(BaseModel):
+    """Payload to reset password using token."""
+    token: str = Field(..., min_length=10, description="Password reset token from email link")
+    new_password: str = Field(..., min_length=8, examples=["NewSecurePassword123!"])
