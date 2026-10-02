@@ -40,6 +40,7 @@ from app.modules.migration_plans.migration_plans_schemas import (
     TransformationPlanAST,
 )
 from app.modules.sources.sources_models import DataSource
+from app.modules.users.users_models import User
 
 logger = logging.getLogger(__name__)
 
@@ -713,13 +714,21 @@ class MigrationPlanService:
         return list(res.scalars().all())
 
     @staticmethod
-    async def _check_active_execution_lock(session: AsyncSession, plan_id: uuid.UUID):
+    async def _check_active_execution_lock(
+        session: AsyncSession, plan_id: uuid.UUID, ignore_job_id: Optional[uuid.UUID] = None
+    ):
         """Verifies that no active execution job is running for the given migration plan."""
         from app.modules.execution.execution_models import MigrationJob
-        stmt = select(MigrationJob).where(
+        conditions = [
             MigrationJob.migration_plan_id == plan_id,
-            MigrationJob.status.in_(["queued", "preparing", "running"]),
-        )
+            MigrationJob.status.in_([
+                "queued", "claimed", "preparing", "running",
+                "paused", "recovering", "ask_user", "verifying",
+            ]),
+        ]
+        if ignore_job_id is not None:
+            conditions.append(MigrationJob.id != ignore_job_id)
+        stmt = select(MigrationJob).where(*conditions)
         res = await session.execute(stmt)
         active_job = res.scalar_one_or_none()
         if active_job:
@@ -738,6 +747,7 @@ class MigrationPlanService:
         from app.modules.migration_plans.migration_plans_engine.migration_plans_validator import (
             MigrationPlanValidator,
         )
+        from app.modules.execution.safety_services import DestructiveApprovalManager
 
         await MigrationPlanService._check_active_execution_lock(session, plan.id)
 
@@ -750,9 +760,14 @@ class MigrationPlanService:
             val_dict = val_res.model_dump(mode="json")
             plan.is_valid = val_res.is_valid
             plan.validation_errors = val_dict
-            plan.status = "edited" if val_res.is_valid else "invalid_edits"
+            plan.status = "awaiting_approval" if val_res.is_valid else "invalid_edits"
         else:
-            plan.status = "edited"
+            plan.status = "awaiting_approval"
+
+        # Approval Invalidation: manual edits revoke previous approval
+        plan.approved_version_number = None
+        plan.approved_by_user_id = None
+        plan.approved_at = None
 
         # Compute next version number and persist version snapshot
         stmt_ver = select(func.coalesce(func.max(MigrationPlanVersion.version_number), 0)).where(
@@ -772,6 +787,11 @@ class MigrationPlanService:
         )
         session.add(version_snapshot)
 
+        # Invalidate existing destructive approvals upon plan AST mutation
+        await DestructiveApprovalManager.invalidate_all_for_plan(
+            session, plan.id, f"Plan edited to version {next_ver}"
+        )
+
         await session.commit()
         return plan
 
@@ -780,13 +800,15 @@ class MigrationPlanService:
         session: AsyncSession,
         plan: MigrationPlan,
         user_feedback: str,
+        ignore_job_id: Optional[uuid.UUID] = None,
     ) -> MigrationPlan:
         """Core execution logic for plan refinement, shared by sync and async pathways."""
         from app.modules.migration_plans.migration_plans_engine.migration_plans_validator import (
             MigrationPlanValidator,
         )
+        from app.modules.execution.safety_services import DestructiveApprovalManager
 
-        await MigrationPlanService._check_active_execution_lock(session, plan.id)
+        await MigrationPlanService._check_active_execution_lock(session, plan.id, ignore_job_id=ignore_job_id)
 
         # Acquire row lock to serialize concurrent refinement updates (EC-24)
         stmt_lock = select(MigrationPlan).where(MigrationPlan.id == plan.id).with_for_update()
@@ -795,15 +817,17 @@ class MigrationPlanService:
         if locked_plan:
             plan = locked_plan
 
-        if not plan.agent:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="Migration plan has no attached agent.",
-            )
+        if not plan.agent and plan.agent_id:
+            stmt_agent = select(Agent).where(Agent.id == plan.agent_id).options(selectinload(Agent.data_sources))
+            res_agent = await session.execute(stmt_agent)
+            plan.agent = res_agent.scalar_one_or_none()
 
-        snapshots, alias_map = await MigrationPlanService._fetch_latest_snapshots_for_agent(
-            session, plan.agent
-        )
+        if plan.agent:
+            snapshots, alias_map = await MigrationPlanService._fetch_latest_snapshots_for_agent(
+                session, plan.agent
+            )
+        else:
+            snapshots, alias_map = [], {}
 
         target_db_type = (
             plan.target_config.get("database_type", "postgresql")
@@ -847,7 +871,11 @@ class MigrationPlanService:
         plan.plan_data = refined_ast_dict
         plan.is_valid = val_res.is_valid
         plan.validation_errors = val_dict
-        plan.status = "edited" if val_res.is_valid else "invalid_edits"
+        # Invalidate previous approval on structural refinement
+        plan.status = "awaiting_approval" if val_res.is_valid else "invalid_edits"
+        plan.approved_version_number = None
+        plan.approved_by_user_id = None
+        plan.approved_at = None
 
         # Compute next version number and insert version snapshot
         stmt_ver = select(func.coalesce(func.max(MigrationPlanVersion.version_number), 0)).where(
@@ -865,8 +893,16 @@ class MigrationPlanService:
             is_valid=val_res.is_valid,
             confidence_score=refined_ast_dict.get("confidence_score", 0.9) if isinstance(refined_ast_dict, dict) else 0.9,
             validation_errors=val_dict,
+            is_approved=False,
+            approved_by_user_id=None,
+            approved_at=None,
         )
         session.add(version_snapshot)
+
+        # Invalidate existing destructive approvals upon LLM refinement
+        await DestructiveApprovalManager.invalidate_all_for_plan(
+            session, plan.id, f"Plan refined to version {next_ver}"
+        )
 
         await session.commit()
         return plan
@@ -876,9 +912,12 @@ class MigrationPlanService:
         session: AsyncSession,
         plan: MigrationPlan,
         user_feedback: str,
+        ignore_job_id: Optional[uuid.UUID] = None,
     ) -> MigrationPlan:
         """Synchronously refines a plan using natural language user feedback via LLM + Validator."""
-        return await MigrationPlanService.execute_refinement_core(session, plan, user_feedback)
+        return await MigrationPlanService.execute_refinement_core(
+            session, plan, user_feedback, ignore_job_id=ignore_job_id
+        )
 
     @staticmethod
     async def start_async_refinement(
@@ -1053,8 +1092,9 @@ class MigrationPlanService:
     async def approve_plan(
         session: AsyncSession,
         plan: MigrationPlan,
+        user: Optional[User] = None,
     ) -> MigrationPlan:
-        """Approves a plan for execution."""
+        """Approves a plan for execution with cryptographic and audit governance."""
         from app.modules.migration_plans.migration_plans_engine.migration_plans_validator import (
             MigrationPlanValidator,
         )
@@ -1076,7 +1116,31 @@ class MigrationPlanService:
                     detail=f"Cannot approve invalid plan: {val_res.explanation}",
                 )
 
+        now = datetime.now(timezone.utc)
+
+        # Query highest version number for this plan
+        stmt_ver = select(func.coalesce(func.max(MigrationPlanVersion.version_number), 1)).where(
+            MigrationPlanVersion.migration_plan_id == plan.id
+        )
+        latest_ver = (await session.execute(stmt_ver)).scalar_one()
+
         plan.status = "approved"
+        plan.approved_version_number = latest_ver
+        plan.approved_by_user_id = user.id if user else None
+        plan.approved_at = now
+
+        # Update latest version record
+        stmt_latest = select(MigrationPlanVersion).where(
+            MigrationPlanVersion.migration_plan_id == plan.id,
+            MigrationPlanVersion.version_number == latest_ver,
+        )
+        res_latest = await session.execute(stmt_latest)
+        latest_version_rec = res_latest.scalar_one_or_none()
+        if latest_version_rec:
+            latest_version_rec.is_approved = True
+            latest_version_rec.approved_by_user_id = user.id if user else None
+            latest_version_rec.approved_at = now
+
         await session.commit()
 
         if plan.agent_id:
@@ -1088,6 +1152,7 @@ class MigrationPlanService:
                         "plan_id": str(plan.id),
                         "agent_id": str(plan.agent_id),
                         "status": "approved",
+                        "approved_version": latest_ver,
                     },
                 },
             )

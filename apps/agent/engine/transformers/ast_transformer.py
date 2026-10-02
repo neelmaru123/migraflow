@@ -198,6 +198,9 @@ class ASTTransformer:
             if col_spec.get("is_primary_key") or target_col in ("id",):
                 uuid_list = [_deterministic_fallback_uuid(retry_seed_prefix, row_offset + i) for i in range(len(df))]
                 return pl.Series(target_col, uuid_list)
+            target_dtype = str(col_spec.get("target_data_type", "")).lower()
+            if any(kw in target_dtype for kw in ("timestamp", "datetime", "timestamptz")) or target_col in ("created_at", "updated_at"):
+                return pl.lit(datetime.now(timezone.utc).isoformat()).alias(target_col)
             return pl.lit(None).cast(pl.Utf8).alias(target_col)
 
         # ---------------------------------------------------------------
@@ -378,9 +381,12 @@ class ASTTransformer:
                         # Version-agnostic datetime parsing: cast to string, normalize space→T,
                         # then use map_elements to try multiple format patterns without
                         # relying on Polars-version-specific kwargs like use_earliest.
+                        is_nullable = bool(col_spec.get("nullable", True))
+                        is_audit = target_col in ("created_at", "updated_at")
+
                         def _parse_dt(v):
                             if v is None or str(v).strip() in ("", "None", "null", "0000-00-00 00:00:00", "0000-00-00", "0"):
-                                return None
+                                return None if (is_nullable and not is_audit) else datetime.now(timezone.utc).isoformat()
                             s = str(v).strip()
                             if _is_sql_datetime_expr(s):
                                 return datetime.now(timezone.utc).isoformat()
@@ -398,7 +404,7 @@ class ASTTransformer:
                                 except Exception:
                                     pass
                             # If parsing fails (e.g. non-date string "1"), fallback to current UTC timestamp
-                            return s  # passthrough as string if all formats fail
+                            return datetime.now(timezone.utc).isoformat()
 
                         dt_expr = pl.col(src_name).cast(pl.Utf8).map_elements(
                             _parse_dt, return_dtype=pl.Utf8

@@ -13,19 +13,24 @@ from app.core.db import AsyncSessionLocal
 from app.core.logging import logger
 from app.modules.agents.agents_routes import router as agents_router
 from app.modules.agents.agents_services import AgentService
+from app.modules.evaluation.evaluation_routes import router as evaluation_router
 from app.modules.execution.execution_routes import execution_router
 from app.modules.metadata.metadata_routes import router as metadata_router
 from app.modules.migration_plans.migration_plans_routes import router as migration_plans_router
+from app.modules.observability.observability_routes import router as observability_router
 from app.modules.sources.sources_routes import router as sources_router
 from app.modules.users.users_routes import router as users_router
 
 # Import all domain models to ensure SQLAlchemy mappers are registered
 import app.modules.agents.agents_models  # noqa: F401
+import app.modules.evaluation.evaluation_models  # noqa: F401
 import app.modules.execution.execution_models  # noqa: F401
 import app.modules.metadata.metadata_models  # noqa: F401
+import app.modules.observability.observability_models  # noqa: F401
 import app.modules.sources.sources_models  # noqa: F401
 import app.modules.migration_plans.migration_plans_models  # noqa: F401
 import app.modules.users.users_models  # noqa: F401
+
 
 
 async def stale_agent_watchdog():
@@ -85,6 +90,9 @@ app.include_router(execution_router, prefix=settings.API_V1_STR)
 app.include_router(agents_router, prefix=settings.API_V1_STR)
 app.include_router(metadata_router, prefix=settings.API_V1_STR)
 app.include_router(migration_plans_router, prefix=settings.API_V1_STR)
+app.include_router(observability_router, prefix=settings.API_V1_STR)
+app.include_router(evaluation_router, prefix=settings.API_V1_STR)
+
 
 # CORS Middleware Setup
 if "*" in settings.CORS_ORIGINS:
@@ -105,6 +113,38 @@ else:
     )
 
 
+from fastapi import Request, status
+from fastapi.responses import JSONResponse
+from sqlalchemy import text
+from app.core.credential_sanitizer import CredentialSanitizer
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """
+    Global catch-all exception handler to sanitize error messages,
+    ensuring internal credentials, database URIs, and raw stacks are never leaked.
+    """
+    raw_error = str(exc)
+    sanitized_error = CredentialSanitizer.mask_credentials(raw_error)
+    logger.error(
+        f"Unhandled exception in {request.method} {request.url.path}: {sanitized_error}",
+        exc_info=False,
+    )
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={
+            "success": False,
+            "message": "An unexpected internal server error occurred.",
+            "error_detail": (
+                sanitized_error
+                if settings.ENVIRONMENT.lower() in ("development", "test", "local")
+                else "Internal server error"
+            ),
+        },
+    )
+
+
 @app.get("/")
 async def root():
     return {
@@ -116,14 +156,32 @@ async def root():
 
 @app.get(f"{settings.API_V1_STR}/health")
 async def health_check():
-    return {
-        "success": True,
-        "message": "System operational",
-        "data": {
-            "status": "ok",
-            "version": "0.1.0",
-            "environment": settings.ENVIRONMENT,
-            "database_connected": True,
-            "redis_connected": True,
+    """
+    Active liveness and readiness probe: validates control-plane database connectivity.
+    Returns HTTP 200 when healthy, or HTTP 503 Service Unavailable when the database is unreachable.
+    """
+    db_connected = False
+    db_error = None
+    try:
+        async with AsyncSessionLocal() as session:
+            await session.execute(text("SELECT 1"))
+            db_connected = True
+    except Exception as exc:
+        db_error = CredentialSanitizer.mask_credentials(str(exc))
+        logger.warning(f"Database health check failed: {db_error}")
+
+    status_code = status.HTTP_200_OK if db_connected else status.HTTP_503_SERVICE_UNAVAILABLE
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "success": db_connected,
+            "message": "System operational" if db_connected else "Database connectivity degraded",
+            "data": {
+                "status": "ok" if db_connected else "degraded",
+                "version": "0.1.0",
+                "environment": settings.ENVIRONMENT,
+                "database_connected": db_connected,
+                "redis_connected": True,
+            },
         },
-    }
+    )

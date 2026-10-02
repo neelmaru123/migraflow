@@ -2,20 +2,33 @@
 Execution Domain REST API Routes
 """
 
-from typing import List
+from typing import List, Optional
 from uuid import UUID
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
 from app.modules.agents.agents_dependencies import get_current_agent
 from app.modules.agents.agents_models import Agent
 from app.modules.execution.execution_schemas import (
+    AgentRunResponse,
     AgentTaskItemResponse,
     ExecutionCancelRequest,
+    ExecutionCheckpointCreate,
+    ExecutionCheckpointResponse,
+    ExecutionEventResponse,
     ExecutionJobResponse,
+    ExecutionPlanResponse,
     ExecutionProgressUpdate,
     ExecutionStartRequest,
+    ExecutionStepClaimRequest,
+    ExecutionStepCompleteRequest,
+    ExecutionStepFailRequest,
+    ExecutionStepResponse,
+    UserInterventionRespondRequest,
+    UserInterventionResponse,
+    VerificationResultResponse,
+    VerificationRunRequest,
 )
 from app.modules.execution.execution_services import ExecutionService
 from app.modules.users.users_models import User
@@ -33,19 +46,23 @@ execution_router = APIRouter(tags=["Execution"])
 async def start_plan_execution(
     plan_id: UUID,
     body: ExecutionStartRequest = ExecutionStartRequest(),
+    idempotency_key_header: Optional[str] = Header(None, alias="Idempotency-Key"),
     current_user: User = Depends(get_current_active_user),
     session: AsyncSession = Depends(get_db),
 ):
     """
     Triggers local migration execution for the specified plan ID.
     Queues a MigrationJob record and notifies the assigned Docker Agent.
+    Supports idempotency via Idempotency-Key header or request body.
     """
+    effective_idempotency_key = idempotency_key_header or body.idempotency_key
     return await ExecutionService.create_execution_job(
         session=session,
         user_id=current_user.id,
         plan_id=plan_id,
         is_dry_run=body.is_dry_run,
         truncate_target=body.truncate_target,
+        idempotency_key=effective_idempotency_key,
     )
 
 
@@ -104,6 +121,38 @@ async def get_execution_details(
 
 
 @execution_router.get(
+    "/executions/{id}/runs",
+    response_model=List[AgentRunResponse],
+    summary="List all agent execution runs for a migration job",
+)
+async def list_job_runs(
+    id: UUID,
+    current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_db),
+):
+    """Returns all execution attempts (AgentRuns) for a specific migration job."""
+    return await ExecutionService.list_runs_for_job(
+        session=session, job_id=id, user_id=current_user.id
+    )
+
+
+@execution_router.get(
+    "/executions/{id}/events",
+    response_model=List[ExecutionEventResponse],
+    summary="List append-only audit event history for a migration job",
+)
+async def list_job_events(
+    id: UUID,
+    current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_db),
+):
+    """Returns durable audit event history for a specific migration job."""
+    return await ExecutionService.list_events_for_job(
+        session=session, job_id=id, user_id=current_user.id
+    )
+
+
+@execution_router.get(
     "/agents/tasks",
     response_model=List[AgentTaskItemResponse],
     summary="Poll for pending tasks (Docker Agent authentication required)",
@@ -123,6 +172,8 @@ async def poll_agent_tasks(
         AgentTaskItemResponse(
             job_id=job.id,
             migration_plan_id=job.migration_plan_id,
+            agent_run_id=job.current_run_id,
+            execution_plan_id=getattr(job, "execution_plan_id", None),
             status=job.status,
             is_dry_run=job.is_dry_run,
             truncate_target=job.truncate_target,
@@ -130,6 +181,133 @@ async def poll_agent_tasks(
         )
         for job in jobs
     ]
+
+
+@execution_router.get(
+    "/executions/{id}/plan",
+    response_model=Optional[ExecutionPlanResponse],
+    summary="Get derived MigrationExecutionPlan with steps and checkpoints",
+)
+async def get_execution_plan(
+    id: UUID,
+    current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_db),
+):
+    """Returns the granular execution DAG, steps, and authoritative checkpoints for a job."""
+    plan = await ExecutionService.get_execution_plan_for_job(
+        session=session, job_id=id, user_id=current_user.id
+    )
+    if not plan:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Execution plan for job '{id}' not found.",
+        )
+    return plan
+
+
+@execution_router.post(
+    "/executions/plans/{plan_id}/steps/claim",
+    response_model=Optional[ExecutionStepResponse],
+    summary="Claim the next eligible execution step for an agent run",
+)
+async def claim_execution_step(
+    plan_id: UUID,
+    body: ExecutionStepClaimRequest,
+    agent: Agent = Depends(get_current_agent),
+    session: AsyncSession = Depends(get_db),
+):
+    """
+    Atomically claims the next eligible step whose dependencies are satisfied.
+    Authenticated via X-Agent-Token request header.
+    """
+    return await ExecutionService.claim_next_step(
+        session=session,
+        execution_plan_id=plan_id,
+        agent_id=agent.id,
+        agent_run_id=body.agent_run_id,
+    )
+
+
+@execution_router.post(
+    "/executions/steps/{step_id}/checkpoint",
+    response_model=ExecutionCheckpointResponse,
+    summary="Save an authoritative execution checkpoint in the control plane",
+)
+async def save_checkpoint(
+    step_id: UUID,
+    body: ExecutionCheckpointCreate,
+    agent: Agent = Depends(get_current_agent),
+    session: AsyncSession = Depends(get_db),
+):
+    """
+    Persists an authoritative checkpoint to PostgreSQL/SQLite to support safe resumes.
+    Authenticated via X-Agent-Token request header.
+    """
+    return await ExecutionService.save_step_checkpoint(
+        session=session,
+        step_id=step_id,
+        source_identifier=body.source_identifier,
+        source_table=body.source_table,
+        target_table=body.target_table,
+        cursor_offset=body.cursor_offset,
+        rows_processed=body.rows_processed,
+        source_position=body.source_position,
+    )
+
+
+@execution_router.get(
+    "/executions/steps/{step_id}/checkpoints",
+    response_model=List[ExecutionCheckpointResponse],
+    summary="Get authoritative checkpoints for an execution step",
+)
+async def get_step_checkpoints(
+    step_id: UUID,
+    agent: Agent = Depends(get_current_agent),
+    session: AsyncSession = Depends(get_db),
+):
+    """Fetches all authoritative checkpoints associated with a step."""
+    return await ExecutionService.get_step_checkpoints(session=session, step_id=step_id)
+
+
+@execution_router.post(
+    "/executions/steps/{step_id}/complete",
+    response_model=ExecutionStepResponse,
+    summary="Mark an execution step completed",
+)
+async def complete_step(
+    step_id: UUID,
+    body: ExecutionStepCompleteRequest = ExecutionStepCompleteRequest(),
+    agent: Agent = Depends(get_current_agent),
+    session: AsyncSession = Depends(get_db),
+):
+    """
+    Marks a step completed, advances DAG dependencies, and completes the execution plan if all steps finish.
+    """
+    return await ExecutionService.complete_step(
+        session=session, step_id=step_id, output_summary=body.output_summary
+    )
+
+
+@execution_router.post(
+    "/executions/steps/{step_id}/fail",
+    response_model=ExecutionStepResponse,
+    summary="Report failure on an execution step and evaluate retry policy",
+)
+async def fail_step(
+    step_id: UUID,
+    body: ExecutionStepFailRequest,
+    agent: Agent = Depends(get_current_agent),
+    session: AsyncSession = Depends(get_db),
+):
+    """
+    Evaluates retry policy against the reported error. If retryable, marks step RETRYING; otherwise FAILED.
+    """
+    return await ExecutionService.fail_step(
+        session=session,
+        step_id=step_id,
+        error_type=body.error_type,
+        error_message=body.error_message,
+    )
 
 
 @execution_router.get(
@@ -180,3 +358,85 @@ async def update_execution_progress(
     return await ExecutionService.update_job_progress(
         session=session, job_id=id, update=update, agent_id=agent.id
     )
+
+
+@execution_router.get(
+    "/executions/{id}/interventions",
+    response_model=List[UserInterventionResponse],
+    summary="List all user interventions for an execution job",
+)
+async def list_job_interventions(
+    id: UUID,
+    current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_db),
+):
+    """Lists human-in-the-loop (ASK_USER) intervention requests for an execution job."""
+    return await ExecutionService.list_user_interventions(session=session, job_id=id)
+
+
+@execution_router.post(
+    "/executions/{id}/interventions/{intervention_id}/respond",
+    response_model=UserInterventionResponse,
+    summary="Respond to a pending user intervention",
+)
+async def respond_to_intervention(
+    id: UUID,
+    intervention_id: UUID,
+    body: UserInterventionRespondRequest,
+    current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_db),
+):
+    """
+    Submits user response/decision for an ASK_USER intervention, resuming or redirecting execution.
+    """
+    return await ExecutionService.resolve_user_intervention(
+        session=session,
+        intervention_id=intervention_id,
+        user_id=current_user.id,
+        action=body.action,
+        response_data=body.response_data,
+    )
+
+
+@execution_router.get(
+    "/executions/{id}/verifications",
+    response_model=List[VerificationResultResponse],
+    summary="List all post-migration verification results for an execution job",
+)
+async def list_job_verifications(
+    id: UUID,
+    current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_db),
+):
+    """Lists durable verification check results for an execution job."""
+    from app.modules.execution.execution_plan_services import ExecutionPlanService
+    return await ExecutionPlanService.list_verification_results(session=session, job_id=id)
+
+
+@execution_router.post(
+    "/executions/{id}/verify",
+    response_model=List[VerificationResultResponse],
+    summary="Trigger post-migration verification suite for an execution job",
+)
+async def run_job_verification(
+    id: UUID,
+    body: VerificationRunRequest = VerificationRunRequest(),
+    current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_db),
+):
+    """Manually executes or re-evaluates the verification suite for an execution job."""
+    from app.modules.execution.execution_plan_services import ExecutionPlanService
+    from app.modules.execution.verification_services import VerificationPolicy
+    policy = VerificationPolicy(
+        allow_warnings=body.allow_warnings,
+        row_count_tolerance_pct=body.row_count_tolerance_pct,
+        max_failed_rows_allowed=body.max_failed_rows_allowed,
+    )
+    verdict, results = await ExecutionPlanService.run_job_verification(
+        session=session,
+        job_id=id,
+        policy=policy,
+        verification_data=body.verification_data,
+    )
+    return results
+

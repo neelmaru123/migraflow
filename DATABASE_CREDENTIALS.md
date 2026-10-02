@@ -99,6 +99,8 @@ When creating an agent or configuring a migration pipeline in the web UI at `htt
 | **`retail_commerce_pg`** | Polyglot Enterprise Commerce Core (Interconnected with MySQL & Mongo) | `customers`, `orders`, `order_items`, `payment_transactions`, `invoices` | 250+ rows | `postgresql://postgres:postgres_password@localhost:5434/retail_commerce_pg` | `postgresql://postgres:postgres_password@host.docker.internal:5434/retail_commerce_pg` | `postgresql://postgres:postgres_password@postgres:5432/retail_commerce_pg` |
 | **`complex_pg_db`** | Relational Benchmark Schema (Composite keys & deep relational links) | `pg_customers`, `pg_products`, `pg_orders`, `pg_order_items` | 200 rows | `postgresql://postgres:postgres_password@localhost:5434/complex_pg_db` | `postgresql://postgres:postgres_password@host.docker.internal:5434/complex_pg_db` | `postgresql://postgres:postgres_password@postgres:5432/complex_pg_db` |
 | **`ecommerce_production`** | Production-scale transactional benchmark dataset | `categories`, `products`, `customers`, `orders`, `order_items` | 5,000 rows | `postgresql://postgres:postgres_password@localhost:5434/ecommerce_production` | `postgresql://postgres:postgres_password@host.docker.internal:5434/ecommerce_production` | `postgresql://postgres:postgres_password@postgres:5432/ecommerce_production` |
+| **`gaming_telemetry_pg`** | Gaming Universe Telemetry (NoSQL/Document Domain in PostgreSQL with JSONB) | `players`, `player_characters`, `inventory_items`, `match_sessions`, `combat_events` | 2,500 rows (500/table) | `postgresql://postgres:postgres_password@localhost:5434/gaming_telemetry_pg` | `postgresql://postgres:postgres_password@host.docker.internal:5434/gaming_telemetry_pg` | `postgresql://postgres:postgres_password@postgres:5432/gaming_telemetry_pg` |
+
 
 ---
 
@@ -127,6 +129,8 @@ When creating an agent or configuring a migration pipeline in the web UI at `htt
 | **`retail_logistics_mysql`** | Polyglot Enterprise Logistics & Fulfillment (Linked with PG orders) | `warehouses`, `products_catalog`, `shipment_consignments`, `carriers`, `dispatch_logs` | 250+ rows | `mysql+pymysql://root:mysql_password@localhost:3307/retail_logistics_mysql` | `mysql+pymysql://root:mysql_password@host.docker.internal:3307/retail_logistics_mysql` | `mysql+pymysql://root:mysql_password@mysql_source:3306/retail_logistics_mysql` |
 | **`complex_mysql_db`** | Legacy ERP Enterprise System (Chart of accounts, journals) | `mysql_accounts`, `mysql_inventory`, `mysql_audit_logs` | 300+ rows | `mysql+pymysql://root:mysql_password@localhost:3307/complex_mysql_db` | `mysql+pymysql://root:mysql_password@host.docker.internal:3307/complex_mysql_db` | `mysql+pymysql://root:mysql_password@mysql_source:3306/complex_mysql_db` |
 | **`inventory_production`** | High-volume production supply chain dataset | `warehouses`, `suppliers`, `products_catalog`, `inventory_items`, `stock_transfers` | 5,000 rows | `mysql+pymysql://root:mysql_password@localhost:3307/inventory_production` | `mysql+pymysql://root:mysql_password@host.docker.internal:3307/inventory_production` | `mysql+pymysql://root:mysql_password@mysql_source:3306/inventory_production` |
+| **`gaming_economy_mysql`** | Gaming Virtual Economy & Auctions (NoSQL/Document Domain in MySQL with JSON) | `guilds`, `guild_members`, `auction_listings`, `auction_transactions`, `quest_progressions` | 2,500 rows (500/table) | `mysql+pymysql://root:mysql_password@localhost:3307/gaming_economy_mysql` | `mysql+pymysql://root:mysql_password@host.docker.internal:3307/gaming_economy_mysql` | `mysql+pymysql://root:mysql_password@mysql_source:3306/gaming_economy_mysql` |
+
 
 ---
 
@@ -248,6 +252,8 @@ PG_CRM_URL="postgresql://postgres:postgres_password@localhost:5434/crm_db"
 PG_RETAIL_COMMERCE_URL="postgresql://postgres:postgres_password@localhost:5434/retail_commerce_pg"
 PG_COMPLEX_URL="postgresql://postgres:postgres_password@localhost:5434/complex_pg_db"
 PG_PRODUCTION_URL="postgresql://postgres:postgres_password@localhost:5434/ecommerce_production"
+PG_GAMING_TELEMETRY_URL="postgresql://postgres:postgres_password@localhost:5434/gaming_telemetry_pg"
+
 
 # ------------------------------------------------------------------------------
 # MySQL (Host: localhost)
@@ -262,6 +268,8 @@ MYSQL_INVENTORY_URL="mysql+pymysql://root:mysql_password@localhost:3307/inventor
 MYSQL_RETAIL_LOGISTICS_URL="mysql+pymysql://root:mysql_password@localhost:3307/retail_logistics_mysql"
 MYSQL_COMPLEX_URL="mysql+pymysql://root:mysql_password@localhost:3307/complex_mysql_db"
 MYSQL_PRODUCTION_URL="mysql+pymysql://root:mysql_password@localhost:3307/inventory_production"
+MYSQL_GAMING_ECONOMY_URL="mysql+pymysql://root:mysql_password@localhost:3307/gaming_economy_mysql"
+
 
 # ------------------------------------------------------------------------------
 # MongoDB (Host: localhost)
