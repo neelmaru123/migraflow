@@ -80,7 +80,47 @@ def test_source_origin_fallback_when_none():
     print("[PASS] test_source_origin_fallback_when_none passed successfully.")
 
 
+def test_datetime_fallback_for_non_date_string():
+    """Verify that when a non-date string or integer ID (e.g. '1', '25') is mapped to a timestamptz column, it safely falls back to a valid ISO datetime."""
+    raw_df = pl.DataFrame({
+        "category_id": ["1", "25"],
+        "name": ["Electronics", "Books"],
+    })
+
+    column_mappings = [
+        {
+            "target_column_name": "id",
+            "source_columns": [{"column_name": "category_id"}],
+            "transformation_type": "type_cast",
+            "target_data_type": "uuid",
+            "is_primary_key": True,
+        },
+        {
+            "target_column_name": "created_at",
+            "source_columns": [{"column_name": "category_id"}],
+            "transformation_type": "type_cast",
+            "target_data_type": "timestamptz",
+            "nullable": False,
+        },
+    ]
+
+    df_trans, errors = ASTTransformer.transform_chunk(
+        raw_df,
+        column_mappings,
+        source_origin="src_db_1.categories",
+    )
+
+    assert errors == 0, f"Expected 0 errors, got {errors}"
+    assert "created_at" in df_trans.columns
+    # Check that each created_at value is an ISO datetime string, NOT "1" or "25"
+    for val in df_trans["created_at"].to_list():
+        assert val not in ("1", "25")
+        assert "T" in val or "-" in val
+    print("[PASS] test_datetime_fallback_for_non_date_string passed successfully.")
+
+
 if __name__ == "__main__":
     test_source_origin_auto_population()
     test_source_origin_fallback_when_none()
+    test_datetime_fallback_for_non_date_string()
     print("ALL TESTS PASSED!")

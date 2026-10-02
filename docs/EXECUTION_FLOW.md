@@ -3,6 +3,7 @@
 ## Execution Flow — Password Recovery & Reset Flow (Redis TTL & Google SMTP)
 
 ### 1. Entry Points
+
 - **Web Routes**:
   - [`apps/web/app/forgot-password/page.tsx`](file:///c:/Users/91873/Desktop/Data_migration_tool/Ai_data_migration_platform/apps/web/app/forgot-password/page.tsx)
   - [`apps/web/app/reset-password/page.tsx`](file:///c:/Users/91873/Desktop/Data_migration_tool/Ai_data_migration_platform/apps/web/app/reset-password/page.tsx)
@@ -13,6 +14,7 @@
 ### 2. Step-by-Step Execution Sequence
 
 #### Phase 1: Forgot Password Request & Cooldown
+
 1. **User Submission**: User submits email address on `/forgot-password`.
 2. **Account Existence & Type Guard**:
    - `forgot_password()` immediately queries `User` by email in PostgreSQL.
@@ -28,6 +30,7 @@
 9. **Success Response**: Returns `HTTP 200 OK` confirming `"Password reset link has been dispatched to <email>."`. Frontend displays the green confirmation banner.
 
 #### Phase 2: Password Reset Execution
+
 1. **User Navigation**: User opens email and clicks link, navigating to `/reset-password?token=<token>`.
 2. **Token Extraction**: `ResetPasswordForm` extracts token from search params. If absent, renders warning state prompting for a fresh request.
 3. **Password Validation**: User enters new password and confirmation (minimum 8 characters).
@@ -39,6 +42,7 @@
 8. **Success Transition**: Returns `MessageResponse`; frontend displays success banner and redirects user to `/login`.
 
 ### 3. Impact & Delta Analysis (AI Modifications)
+
 - **[NEW]**: [`apps/api/app/core/redis_client.py`](file:///c:/Users/91873/Desktop/Data_migration_tool/Ai_data_migration_platform/apps/api/app/core/redis_client.py) — Async Redis helper managing token TTL (5 min) and rate limit cooldown (1 min).
 - **[NEW]**: [`apps/api/app/core/email.py`](file:///c:/Users/91873/Desktop/Data_migration_tool/Ai_data_migration_platform/apps/api/app/core/email.py) — Google Gmail SMTP transactional email dispatcher with branded HTML template.
 - **[NEW]**: [`apps/web/app/forgot-password/page.tsx`](file:///c:/Users/91873/Desktop/Data_migration_tool/Ai_data_migration_platform/apps/web/app/forgot-password/page.tsx) — Forgot password request route.
@@ -1170,10 +1174,12 @@ sequenceDiagram
 # Execution Flow — MySQL Duplicate Index Name (1061) Benign Handling in Post-Migration DDL
 
 ## 1. Entry Point
+
 - **File**: [`apps/agent/engine/ddl_executor.py:L365`](file:///d:/GitHub/Ai_data_migration_platform/apps/agent/engine/ddl_executor.py#L365) (`DDLExecutor.execute_ddl_list`)
 - **Trigger**: Invoked by [`ExecutionOrchestrator.run_job()`](file:///d:/GitHub/Ai_data_migration_platform/apps/agent/engine/orchestrator.py#L350) in Step 3 (Post-Migration DDL) after all data chunks are bulk-inserted into the target database.
 
 ## 2. Step-by-Step Execution Sequence
+
 1. **DDL Statement Sanitation**:
    - `DDLExecutor._sanitize_ddl_statement()` strips incompatible dialect keywords (e.g., PostgreSQL `CREATE EXTENSION` on MySQL).
 2. **DDL Statement Execution**:
@@ -1188,18 +1194,742 @@ sequenceDiagram
    - `ExecutionOrchestrator` completes job cleanly and reports status `completed` to Control Plane.
 
 ## 3. Impact & Delta Analysis
+
 - **[MODIFIED]**: [`apps/agent/engine/ddl_executor.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/agent/engine/ddl_executor.py) — Added `"duplicate key name"`, `"duplicate key"`, and `"1061"` to `benign_keywords`.
 - **[MODIFIED]**: [`apps/api/tests/unit/test_bug_fix11_ddl_and_sql_correctness.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/tests/unit/test_bug_fix11_ddl_and_sql_correctness.py) — Added unit test assertion validating MySQL error 1061 does not raise RuntimeError.
+
+---
+
+# Execution Flow — Phase 1: Control-Plane State Machine, Run Identity & Event History
+
+## 1. Entry Point
+
+- **Files**:
+  - [`apps/api/app/modules/execution/execution_routes.py:L40`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_routes.py#L40) (`POST /api/v1/plans/{plan_id}/execute`)
+  - [`apps/api/app/modules/execution/execution_routes.py:L114`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_routes.py#L114) (`GET /api/v1/agents/tasks`)
+  - [`apps/api/app/modules/execution/execution_routes.py:L149`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_routes.py#L149) (`POST /api/v1/execution/jobs/{job_id}/progress`)
+  - [`apps/api/app/modules/execution/execution_routes.py:L186`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_routes.py#L186) (`POST /api/v1/execution/jobs/{job_id}/cancel`)
+- **Triggers**:
+  - User submits plan execution with optional `Idempotency-Key` header or body.
+  - Agent polls for pending tasks.
+  - Agent reports execution progress or errors.
+  - User cancels in-flight execution.
+
+## 2. Step-by-Step Execution Sequence
+
+### Step 1: Idempotent Execution Job Creation & Event Stamping
+
+1. **Request Intake**: `start_plan_execution()` extracts `idempotency_key` from header or body (`ExecutionStartRequest`).
+2. **Idempotency Guard**: `ExecutionService.create_execution_job()` checks for existing `MigrationJob` with the specified `idempotency_key`. If matched, returns the existing job directly without queuing duplicates.
+3. **Active Job Concurrency Guard**: Rejects duplicate execution if an active job (`QUEUED`, `CLAIMED`, `PREPARING`, `RUNNING`) already exists for the plan.
+4. **Job Persistence & Event Emission**:
+   - Persists `MigrationJob` with `status="queued"` and `idempotency_key`.
+   - `ExecutionStateMachine` writes append-only `ExecutionEvent` (`event_type="JOB_CREATED"`).
+
+### Step 2: Agent Task Claiming & Run Identity Provisioning
+
+1. **Agent Poll**: Docker Agent polls `GET /api/v1/agents/tasks`.
+2. **Atomic Task Claim**: `ExecutionService.get_pending_tasks_for_agent()` locks the pending job with `FOR UPDATE SKIP LOCKED`.
+3. **Agent Run Creation**:
+   - `ExecutionStateMachine.create_agent_run()` generates a distinct `agent_run_id` in `agent_runs`.
+   - Links `job.current_run_id = run.id`.
+   - Emits `JOB_CLAIMED` and `JOB_STARTED` execution events.
+4. **Task Dispatch**: Returns task payload containing `agent_run_id` along with plan details to the Docker agent.
+
+### Step 3: Progress Synchronization & State Enforcement
+
+1. **Agent Progress Reporting**: Agent sends `POST /api/v1/execution/jobs/{job_id}/progress` with `agent_run_id`, row counts, and status.
+2. **State Transition Validation**:
+   - `ExecutionStateMachine.validate_transition(from_state, to_state)` verifies transition legality against `LEGAL_TRANSITIONS`.
+   - Invalid jumps (e.g. `COMPLETED -> RUNNING`) raise `InvalidStateTransitionError` (yielding HTTP 409 Conflict).
+   - Auto-advances intermediate states (e.g., `QUEUED -> PREPARING -> RUNNING -> COMPLETED`) for resilient progress reporting.
+   - Synchronizes `agent_runs.status` and `agent_runs.finished_at` when terminal status is reached.
+3. **Audit Event Logging**: Emits corresponding event (`STEP_STARTED`, `STEP_COMPLETED`, `JOB_COMPLETED`, `JOB_FAILED`) in `execution_events`.
+
+### Step 4: Stale Recovery & Multi-Run Resumption
+
+1. **Watchdog Detection**: If an agent stops responding, `check_stale_jobs()` identifies stale jobs.
+2. **Run Marking**: Marks previous `AgentRun` as `FAILED` with `failure_reason="Agent heartbeat timed out"`.
+3. **Job Reassignment / Recovery**: Next execution attempt or recovery generates a fresh `AgentRun` (`agent_run_id`), preserving historical runs for audit and comparison.
+
+## 3. Impact & Delta Analysis
+
+- **[NEW]**: [`apps/api/app/core/state.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/core/state.py) — Centralized `AgentLifecycle`, `MigrationPlanLifecycle`, `ExecutionLifecycle`, `ExecutionStepLifecycle`, and `ExecutionEventType` enums.
+- **[NEW]**: [`apps/api/app/modules/execution/execution_state_machine.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_state_machine.py) — `ExecutionStateMachine` service validating transitions, provisioning `AgentRun`, and appending `ExecutionEvent`.
+- **[NEW]**: [`apps/api/alembic/versions/013_add_agent_runs_and_execution_events.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/alembic/versions/013_add_agent_runs_and_execution_events.py) — Linear database migration for `agent_runs`, `execution_events`, `current_run_id`, and `idempotency_key`.
+- **[NEW]**: [`apps/api/tests/unit/test_phase1_state_machine_and_events.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/tests/unit/test_phase1_state_machine_and_events.py) — Full unit test suite for transitions, events, idempotency, runs, cancellations, and recovery.
+- **[MODIFIED]**: [`apps/api/app/modules/execution/execution_models.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_models.py) — Added `AgentRun` and `ExecutionEvent` ORM models, plus `current_run_id` and `idempotency_key` fields on `MigrationJob`.
+- **[MODIFIED]**: [`apps/api/app/modules/agents/agents_models.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/agents/agents_models.py) — Added `agent_runs` relationship on `Agent`.
+- **[MODIFIED]**: [`apps/api/app/modules/execution/execution_schemas.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_schemas.py) — Added `AgentRunResponse`, `ExecutionEventResponse`, `agent_run_id`, and `idempotency_key`.
+- **[MODIFIED]**: [`apps/api/app/modules/execution/execution_services.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_services.py) — Integrated state machine transitions, run provisioning, idempotency checks, and event listings.
+- **[MODIFIED]**: [`apps/api/app/modules/execution/execution_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_routes.py) — Exposed runs and events endpoints, and handled `Idempotency-Key` headers.
+- **[UNCHANGED]**: `apps/agent/engine/orchestrator.py`, `checkpoint.py`, `target_writer.py`, `ast_transformer.py`, DuckDB staging, and database connectors.
+
+---
+
+# Execution Flow — Phase 2: Durable Execution Plan, Steps, Checkpointing & Recovery
+
+## 1. Entry Point
+
+- **Files**:
+  - [`apps/api/app/modules/execution/execution_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_routes.py) (`POST /api/v1/plans/{plan_id}/execute`, `GET /api/v1/executions/{id}/plan`, `POST /api/v1/executions/plans/{plan_id}/steps/claim`, `POST /api/v1/executions/steps/{step_id}/checkpoint`)
+  - [`apps/agent/main.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/agent/main.py) (`poll_and_execute_tasks()`)
+  - [`apps/agent/engine/checkpoint.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/agent/engine/checkpoint.py) (`CheckpointManager.save_checkpoint()`, `CheckpointManager.get_last_offset()`)
+
+## 2. Step-by-Step Execution Sequence
+
+### Step 1: Execution Plan & DAG Step Derivation
+
+1. **Trigger**: User starts migration execution for an approved plan (`POST /api/v1/plans/{plan_id}/execute`).
+2. **DAG Construction**: `ExecutionPlanService.create_execution_plan_for_job()` constructs:
+   - `MigrationExecutionPlan` with `concurrency_limit = 2` and `status = 'pending'`.
+   - Step 1: `PREFLIGHT` (sequence: 1, dependencies: `[]`).
+   - Step 2: `PRE_DDL` (sequence: 2, dependencies: `["preflight"]`).
+   - Steps 3..N: `LOAD:<table_name>` for each table mapping in `table_mappings` (sequence: 3..N, dependencies: `["pre_ddl"]`).
+   - Step N+1: `POST_DDL` (dependencies: all `load:*` steps).
+   - Step N+2: `VERIFY` (dependencies: `["post_ddl"]`).
+3. **Event Emission**: Emits `EXECUTION_PLAN_CREATED` in `execution_events`.
+
+### Step 2: Concurrency-Controlled Step Claiming
+
+1. **Poll & Claim**: Docker Agent polls for tasks and requests step claims via `POST /api/v1/executions/plans/{plan_id}/steps/claim`.
+2. **Locking & Prerequisite Validation**:
+   - `ExecutionPlanService.claim_next_step()` queries steps with `with_for_update(skip_locked=True)`.
+   - Checks active running count against `concurrency_limit` (blocks claiming if limit is reached).
+   - Validates that all items in `step.dependencies` are in `status == 'completed'`.
+3. **State Mutation**:
+   - Transitions step to `status = 'running'`, sets `agent_run_id`, sets `started_at = now()`, increments `attempt_count += 1`.
+   - Emits `STEP_CLAIMED` and `STEP_STARTED` events.
+
+### Step 3: Authoritative Checkpoint Persistence
+
+1. **ETL Chunk Processing**: Docker Agent extracts and bulk loads chunks.
+2. **Dual-Layer Checkpoint**:
+   - Local fast file cache saved under `/tmp/checkpoint_{job_id}_{table}_{src_id}_{src_tbl}.json`.
+   - Control-Plane persistence via `POST /api/v1/executions/steps/{step_id}/checkpoint` (`ExecutionPlanService.save_checkpoint()`).
+   - Writes `cursor_offset`, `rows_processed`, `source_position`, increments `checkpoint_version`, and emits `CHECKPOINT_SAVED`.
+
+### Step 4: Step Completion & Cascade Finalization
+
+1. **Step Finish**: Agent reports `POST /api/v1/executions/steps/{step_id}/complete` with `output_summary`.
+2. **DAG Finalization Check**:
+   - Step status set to `completed`.
+   - If all steps in the plan are `completed`:
+     - Sets `MigrationExecutionPlan.status = 'completed'`.
+     - Sets `MigrationJob.status = 'completed'` (or `'dry_run_completed'`) and `progress = 100.0`.
+     - Emits `EXECUTION_PLAN_COMPLETED` and `JOB_COMPLETED` events.
+
+### Step 5: Failover Reassignment & Checkpoint Resume
+
+1. **Watchdog Detection**: If an agent dies mid-step, `recover_stale_steps()` detects `updated_at < now - 300s`.
+2. **Run Marking & Re-queuing**:
+   - Marks previous `agent_run` as `failed`.
+   - If `attempt_count < max_attempts`: resets step status to `retrying`.
+3. **Failover Claim**:
+   - Agent B claims the `retrying` step with its own `agent_run_id_B`.
+   - Fetches authoritative `ExecutionCheckpoint` from the database.
+   - Resumes extraction from `checkpoint.cursor_offset` without restarting the table or already completed steps.
+
+## 3. Impact & Delta Analysis
+
+- **[NEW]**: [`apps/api/app/modules/execution/execution_plan_services.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_plan_services.py) — ExecutionPlanService managing DAG derivation, step claiming with locks, authoritative checkpoints, and stale recovery.
+- **[NEW]**: [`apps/api/app/modules/execution/retry_policy.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/retry_policy.py) — Reusable retry policy abstraction with exponential backoff, jitter, and error classification.
+- **[NEW]**: [`apps/api/alembic/versions/014_add_execution_plans_steps_checkpoints.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/alembic/versions/014_add_execution_plans_steps_checkpoints.py) — Linear database migration adding `migration_execution_plans`, `migration_execution_steps`, and `execution_checkpoints`.
+- **[NEW]**: [`apps/api/tests/unit/test_phase2_execution_plans_and_checkpoints.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/tests/unit/test_phase2_execution_plans_and_checkpoints.py) — 8 unit tests covering DAG creation, concurrency limits, checkpoints, failover recovery, retry policy, and REST routes.
+- **[MODIFIED]**: [`apps/api/app/core/state.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/core/state.py) — Added `ExecutionPlanLifecycle`, `ExecutionStepType`, and execution plan event constants.
+- **[MODIFIED]**: [`apps/api/app/modules/execution/execution_models.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_models.py) — Defined `MigrationExecutionPlan`, `MigrationExecutionStep`, and `ExecutionCheckpoint` ORM models.
+- **[MODIFIED]**: [`apps/api/app/modules/execution/execution_schemas.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_schemas.py) — Added Pydantic schemas for execution plans, steps, checkpoints, claim, complete, and fail requests.
+- **[MODIFIED]**: [`apps/api/app/modules/execution/execution_services.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_services.py) — Hooked plan creation into job creation and stale step recovery into watchdog.
+- **[MODIFIED]**: [`apps/api/app/modules/execution/execution_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_routes.py) — Added routes for plan details, step claiming, checkpoint persistence, and completion.
+- **[MODIFIED]**: [`apps/agent/engine/checkpoint.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/agent/engine/checkpoint.py) — Added control plane database sync and fallback lookup.
+- **[MODIFIED]**: [`apps/api/tests/unit/test_alembic_migrations.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/tests/unit/test_alembic_migrations.py) — Updated expected migration revision DAG head to `e2f3a4b5c6d7`.
+
+---
+
+# Execution Flow — Failure Classification, Recovery Router & Agentic Replanning (Phase 3)
+
+## 1. Entry Point
+
+- **Failure Reporter**: Docker Agent reporting step failure via `POST /api/v1/executions/steps/{step_id}/fail` in [`apps/api/app/modules/execution/execution_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_routes.py).
+- **Control-Plane Evaluator**: `ExecutionPlanService.fail_step()` in [`apps/api/app/modules/execution/execution_plan_services.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_plan_services.py).
+- **Classification Engine**: `FailureClassifier` in [`apps/api/app/modules/execution/failure_taxonomy.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/failure_taxonomy.py).
+- **Decision Engine**: `RecoveryRouter` in [`apps/api/app/modules/execution/recovery_router.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/recovery_router.py).
+- **Agentic Replanner**: `AgenticReplanService` in [`apps/api/app/modules/execution/agentic_replan_services.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/agentic_replan_services.py).
+- **User Intervention Endpoint**: `POST /api/v1/executions/{id}/interventions/{intervention_id}/respond`.
+
+## 2. Step-by-Step Execution Sequence
+
+```
+Execution Step Failure
+         ↓
+FailureClassifier.classify_error_payload()
+         ↓
+ClassifiedFailure (category, domain, severity, retryable, recoverable, requires_replan, requires_user)
+         ↓
+RecoveryRouter.evaluate()
+         ↓
+┌─────────────────┬─────────────────┬─────────────────┬─────────────────┬─────────────────┐
+│     RETRY       │    RECOVER      │     REPLAN      │    ASK_USER     │      FAIL       │
+└────────┬────────┴────────┬────────┴────────┬────────┴────────┬────────┴────────┬────────┘
+         │                 │                 │                 │                 │
+         ↓                 ↓                 ↓                 ↓                 ↓
+   Exponential       Reassign Step     Sanitize Error    Create User       Mark Step &
+   Backoff Delay     to Agent B;       Context (No raw   Intervention;     Job as FAILED;
+   (Full Jitter);    Resume from       creds/rows);      Pause Step &      Emit failure
+   Step -> RETRYING  Checkpoint        LangGraph Replan; Job in ASK_USER;  events
+                                       Revoke Approval;  Await Human Res
+                                       Status -> AWAITING
+```
+
+### Step 1: Centralized Error Classification
+
+1. **Input Parsing**: `FailureClassifier.classify_exception()` or `FailureClassifier.classify_error_payload()` parses raw error strings, SQLSTATE codes, or Python exception hierarchies.
+2. **Domain Segregation**: Assigns specific domain:
+   - `LLM_INFRASTRUCTURE`: 429 rate limit, 503 unavailable, OpenAI/Anthropic/Google timeouts.
+   - `LLM_OUTPUT_VALIDATION`: Invalid plan AST schema, unparseable JSON, structurally infeasible plan.
+   - `DATABASE_ENGINE`: Unique constraint violation (`23505`), Foreign key violation (`23503`), Not-null violation (`23502`).
+   - `MIGRATION_EXECUTION`: Missing tables/columns (`42P01`, `42703`), connection dropped, query timeout.
+   - `SECURITY_AUTH`: Invalid database password, permission/authorization denied (`401`, `403`).
+   - `SYSTEM_ORCHESTRATION`: Agent lost, container crash, heartbeat timeout.
+
+### Step 2: Deterministic Recovery Routing & Hard Bounds
+
+1. **Operational Limits (Anti-Infinite Loop)**:
+   - Checks `replan_count < 3`, `attempt_count < 3`, `recovery_count < 2`, `llm_call_count < 5`, `total_retry_duration < 300s`.
+   - If any bound is exceeded, immediately terminates loop with `FAIL` or `ASK_USER`.
+2. **Destructive Ambiguity Guard**:
+   - If error occurred during destructive operations (`DROP`, `TRUNCATE`, `CASCADE`), blind retry is blocked and routed to `ASK_USER`.
+3. **Decision Execution**:
+   - `RETRY`: Computes backoff delay with full jitter; step transitions to `retrying`.
+   - `RECOVER`: Marks step as `retrying` and invalidates dead agent run for failover claim.
+   - `REPLAN`: Initiates agentic replanning pipeline.
+   - `ASK_USER`: Persists `UserIntervention` record; step & job transition to `ask_user`.
+   - `FAIL`: Transitions step & job to `failed`.
+
+### Step 3: Agentic Replanning & Approval Invalidation
+
+1. **Context Sanitization**: `AgenticReplanService.sanitize_error_context()` strips passwords, bearer tokens, connection URIs, and raw table rows, injecting `***REDACTED***`.
+2. **LangGraph Refinement**: Calls `MigrationPlanService.refine_plan()` to generate a new AST version repairing mappings, type casts, or table definitions.
+3. **Approval Revocation**:
+   - Resets `MigrationPlan.status = 'awaiting_approval'`.
+   - Clears `approved_version_number = None`, `approved_by_user_id = None`, `approved_at = None`.
+   - Emits `PLAN_APPROVAL_REVOKED` and `REPLAN_COMPLETED` events.
+   - Blocks new execution until the human user reviews and approves the new plan version.
+
+### Step 4: Human-in-the-Loop Intervention Resolution
+
+1. **User Notification & Options**: Frontend queries `GET /api/v1/executions/{id}/interventions` to view the required decision and selectable options.
+2. **User Response**: User submits choice via `POST /api/v1/executions/{id}/interventions/{intervention_id}/respond` (`action: "retry" | "replan" | "fail"`).
+3. **Execution Resumption**:
+   - If `retry`: Step transitions from `ask_user` $\to$ `retrying`.
+   - If `replan`: Triggers `AgenticReplanService.replan_execution_failure()`.
+   - If `fail`: Transitions job and step to `failed`.
+   - Emits `USER_INTERVENTION_RESOLVED` event.
+
+### Phase G: Post-Migration Verification, Safety Controls, and Approval Integrity
+
+```
+                                  Migration Execution Loop
+                                             │
+                                             ↓
+                                 ETL Steps Completed (DAG)
+                                             │
+                                             ↓
+                                     Status: VERIFYING
+                                             │
+                                             ↓
+                                ┌─────────────────────────┐
+                                │   VerificationEngine    │
+                                └────────────┬────────────┘
+                                             │
+               ┌─────────────────────────────┼─────────────────────────────┐
+               ↓                             ↓                             ↓
+     [1] Row Count Comp.           [5] Primary Key Integ.        [9] Column / Type Comp.
+     [2] Processed Rows            [6] Foreign Key Integ.        [10] Trans. Sanity
+     [3] Failed Rows Threshold     [7] Nullability Check         [11] Sample Data Comp.
+     [4] Duplicate Detection       [8] Target Table Exists
+               │                             │                             │
+               └─────────────────────────────┼─────────────────────────────┘
+                                             │
+                                             ↓
+                                ┌─────────────────────────┐
+                                │ VerificationCoordinator │
+                                └────────────┬────────────┘
+                                             │
+               ┌─────────────────────────────┼─────────────────────────────┐
+               ↓                             ↓                             ↓
+         [All Passed]                [Minor Warning]             [Hard Check Failed]
+               │                             │                             │
+               │                   allow_warnings=False?                   │
+               │                   ┌─────────┴─────────┐                   │
+               │                   ↓                   ↓                   │
+               │              NEEDS_REVIEW         COMPLETED               │
+               │                                                           │
+               ↓                                                           ↓
+        Job: COMPLETED                                                Job: FAILED
+                                                                           │
+                                                                           ↓
+                                                                ClassifiedFailure
+                                                                (DATA_VALIDATION)
+                                                                           │
+                                                                           ↓
+                                                                 Phase 3 RecoveryRouter
+                                                                 (REPLAN / ASK_USER)
+```
+
+### Step 1: Deterministic Verification Execution
+
+1. **Triggering Verification**:
+   - As the final DAG step `verify` executes, or via manual API trigger (`POST /api/v1/executions/{id}/verify`), `VerificationCoordinator.run_plan_verification()` is invoked.
+   - The job state transitions from `RUNNING` $\to$ `VERIFYING`.
+2. **11 Standardized Checks**:
+   - `check_row_counts`: Verifies source count vs target count against `policy.row_count_tolerance_pct`.
+   - `check_rows_processed`: Checks that processed rows match source row counts.
+   - `check_failed_rows`: Enforces `max_failed_rows_allowed` limit.
+   - `check_duplicate_records`: Detects duplicate keys in target tables.
+   - `check_primary_key_integrity`: Ensures primary keys are non-null and strictly unique.
+   - `check_foreign_key_integrity`: Verifies child foreign keys exist in parent tables; flags orphaned references.
+   - `check_nullability`: Detects NULL values in columns designated NOT NULL.
+   - `check_target_table_existence`: Verifies physical target table creation.
+   - `check_schema_compatibility`: Checks expected columns and types against target database catalog.
+   - `check_transformation_sanity`: Validates required target columns are populated without corruption.
+   - `check_sample_data_comparison`: Compares sampled records between source and target for value parity.
+3. **Durable Result Persistence**:
+   - Persists every individual check as a `VerificationResult` record with `status` (`passed`, `failed`, `warning`, `skipped`), `expected`, `actual`, `tolerance`, and detailed JSON metadata.
+   - Emits `VERIFICATION_COMPLETED` audit event.
+
+### Step 2: Verification Failure & Recovery Loop Integration
+
+1. **Failure Cascade**:
+   - If critical checks fail, the job status transitions to `FAILED` (never `COMPLETED`).
+   - The coordinator constructs a `ClassifiedFailure` (`DATA_VALIDATION`, code `ERR_POST_MIGRATION_VERIFICATION_FAILED`).
+   - Feeds the failure directly into the Phase 3 `RecoveryRouter`, triggering automatic self-healing replanning (`REPLAN`) or presenting clear human options (`ASK_USER`).
+2. **Review Mode**:
+   - If warnings are encountered and `policy.allow_warnings = False`, the job transitions to `NEEDS_REVIEW`, halting automated handoff until explicit human confirmation.
+
+### Step 3: Safety Classification & Destructive Operation Governance
+
+1. **Safety Tiers**:
+   - `SafetyClassifier` tags statements as `READ_ONLY`, `WRITE`, or `DESTRUCTIVE` (e.g., `DROP TABLE`, `TRUNCATE`, `DELETE FROM`, `CASCADE`, `ALTER TABLE ... DROP COLUMN`).
+2. **Strict Approval Binding**:
+   - Any destructive operation requires an explicit `DestructiveOperationApproval` record bound strictly to:
+     `plan_id`, `plan_version_number`, `target_table`, `operation_type`, `approved_by_user_id`, and timestamp.
+3. **Invalidation on Plan Modification or Replan**:
+   - Whenever a plan AST is edited (`PUT /api/v1/plans/{id}`) or refined by the LLM (`replan_execution_failure`), `DestructiveApprovalManager.invalidate_all_for_plan()` marks all prior approvals as `is_valid = False`.
+   - Execution jobs cannot start until the human explicitly re-approves destructive actions on the new version.
+4. **Approval REST Endpoints**:
+   - `GET /api/v1/plans/{plan_id}/destructive-approvals`: List pending and active approvals.
+   - `POST /api/v1/plans/{plan_id}/destructive-approvals/{approval_id}/grant`: Explicitly grant approval.
+   - `POST /api/v1/plans/{plan_id}/destructive-approvals/{approval_id}/reject`: Explicitly reject approval with reason.
+
+### Step 4: Credential Boundary & Security Hardening
+
+1. **`CredentialSanitizer`**:
+   - Intercepts connection URIs (`postgresql://user:pass@host`), assignment patterns (`password=...`, `token=...`), Bearer tokens, and private keys.
+   - Traverses nested dictionary structures and event payloads to redact secrets.
+   - Hardens AI diagnosis context: strictly strips raw database rows (`<N rows redacted for security>`), guaranteeing zero customer data leakage to LLM providers.
+
+## 3. Impact & Delta Analysis
+
+- **[NEW]**: [`apps/api/app/modules/execution/verification_services.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/verification_services.py) — 11 deterministic verification checks, `VerificationPolicy`, and `VerificationCoordinator`.
+- **[NEW]**: [`apps/api/app/modules/execution/safety_services.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/safety_services.py) — Operation risk tiering (`SafetyClassifier`) and version-bound destructive approval manager (`DestructiveApprovalManager`).
+- **[NEW]**: [`apps/api/app/core/credential_sanitizer.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/core/credential_sanitizer.py) — Centralized credential scrubber and raw data row redaction guard.
+- **[NEW]**: [`apps/api/alembic/versions/016_add_verification_and_safety_controls.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/alembic/versions/016_add_verification_and_safety_controls.py) — Linear database migration adding `verification_results` and `destructive_operation_approvals` tables.
+- **[NEW]**: [`apps/api/tests/unit/test_phase4_verification_safety_and_approvals.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/tests/unit/test_phase4_verification_safety_and_approvals.py) — 21 unit tests covering verification checks, coordinator lifecycles, safety classifiers, approval invalidation, and credential redaction.
+- **[MODIFIED]**: [`apps/api/app/core/state.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/core/state.py) — Added `NEEDS_REVIEW` state, `VerificationStatus`, `VerificationCheckType`, `OperationRiskLevel`, and verification/safety event types.
+- **[MODIFIED]**: [`apps/api/app/modules/execution/execution_state_machine.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_state_machine.py) — Registered transitions for `VERIFYING` and `NEEDS_REVIEW`.
+- **[MODIFIED]**: [`apps/api/app/modules/execution/execution_models.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_models.py) — Added `VerificationResult` and `DestructiveOperationApproval` models and relationships.
+- **[MODIFIED]**: [`apps/api/app/modules/execution/execution_schemas.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_schemas.py) — Added verification and destructive approval DTOs.
+- **[MODIFIED]**: [`apps/api/app/modules/execution/execution_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_routes.py) — Exposed verification results retrieval and manual run trigger routes.
+- **[MODIFIED]**: [`apps/api/app/modules/migration_plans/migration_plans_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/migration_plans/migration_plans_routes.py) — Exposed destructive approval listing, grant, and reject endpoints.
+- **[MODIFIED]**: [`apps/api/app/modules/execution/execution_services.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_services.py) — Gated execution job creation against unapproved destructive operations.
+- **[MODIFIED]**: [`apps/api/app/modules/migration_plans/migration_plans_services.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/migration_plans/migration_plans_services.py) — Invalided destructive approvals on plan AST edit and refinement.
+- **[MODIFIED]**: [`apps/api/app/modules/execution/agentic_replan_services.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/agentic_replan_services.py) — Invalidated approvals upon agentic replan execution.
+- **[MODIFIED]**: [`apps/api/tests/unit/test_alembic_migrations.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/tests/unit/test_alembic_migrations.py) — Updated expected DAG head to `a4b5c6d7e8f9`.
+
+---
+
+# Execution Flow — Phase 5: Production Observability, Tracing, Budgets and Operational Controls
+
+## 1. Entry Points
+
+- **Tracing & Flamegraph Tree**:
+  - `GET /api/v1/observability/traces/{trace_id}/tree`
+  - `GET /api/v1/observability/jobs/{job_id}/traces`
+- **LLM Provenance & Audit**:
+  - `GET /api/v1/observability/llm-calls`
+  - `GET /api/v1/observability/plans/{plan_id}/provenance`
+- **Resource Budgets**:
+  - `GET /api/v1/observability/budgets/{job_id}`
+  - `PUT /api/v1/observability/budgets/{job_id}`
+- **Operational Metrics & Decoupled Health**:
+  - `GET /api/v1/observability/metrics`
+  - `GET /api/v1/observability/health`
+
+## 2. Step-by-Step Execution Sequence
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client as UI / Operator
+    participant API as Observability Router
+    participant Tracer as ExecutionTracer
+    participant LLM as LLMTracker
+    participant Budget as ResourceBudgetManager
+    participant Health as OperationalHealthService
+    participant DB as PostgreSQL / SQLite
+
+    Note over Client, Tracer: 1. Hierarchical Execution Tracing
+    Client->>Tracer: span("AgentRun", operation_type=AGENT_RUN)
+    Tracer->>DB: INSERT into execution_traces (parent_run_id=None, trace_id=span_id)
+    Tracer->>Tracer: span("NodeRun", operation_type=NODE_RUN, parent=root)
+    Tracer->>DB: INSERT into execution_traces (parent_run_id=root.id, trace_id=root.trace_id)
+    Tracer->>Tracer: span("ToolRun", operation_type=TOOL_RUN, parent=step)
+    Tracer->>DB: INSERT into execution_traces (parent_run_id=step.id, trace_id=root.trace_id)
+    Tracer->>Tracer: finish_span(status=COMPLETED, duration_ms)
+    Tracer->>DB: UPDATE execution_traces finished_at, duration_ms, status
+
+    Note over Client, Budget: 2. Deterministic Resource Budget Enforcement
+    Client->>Budget: record_usage(job_id, llm_calls=1, tokens=1200, cost_usd=0.015)
+    Budget->>DB: SELECT resource_budgets WHERE job_id
+    alt Usage > Limits (e.g. max_llm_calls, max_tokens, max_cost_usd)
+        Budget-->>Client: RAISE BudgetExceededError(limit_type, limit_val, curr_val)
+        Budget->>DB: INSERT ExecutionEvent(BUDGET_EXCEEDED)
+    else Usage <= Limits
+        Budget->>DB: UPDATE resource_budgets counters
+    end
+
+    Note over Client, LLM: 3. LLM Call Recording & Secret Sanitization
+    Client->>LLM: record_llm_call(model="gpt-4o", prompt="...", tokens=1250)
+    LLM->>LLM: CredentialSanitizer.mask_credentials(prompt)
+    LLM->>LLM: estimate_cost(provider, prompt_tokens, completion_tokens)
+    LLM->>DB: INSERT into llm_call_records
+    LLM->>Budget: record_usage(job_id, llm_calls=1, tokens, cost)
+
+    Note over Client, Health: 4. Decoupled Operational Health Evaluation
+    Client->>API: GET /api/v1/observability/health
+    API->>Health: evaluate_health(session)
+    Health->>DB: Query agents table (last_seen_at >= now - 60s)
+    Health->>DB: Query migration_jobs table (recent active/failed jobs)
+    Note over Health: Agent Health (Online) != Job Health (Degraded/Failed)
+    Health-->>Client: OperationalHealthResponse(agent_health_summary, job_health_summary)
+```
+
+### Detailed Flow Specifications
+
+### Step 1: Hierarchical Trace Propagation & Tree Reconstruction
+
+1. **Span Context**:
+   - `ExecutionTracer.start_span()` assigns `span_id = uuid.uuid4()`.
+   - If `parent_run_id` is passed, `trace_id` is automatically inherited from the parent span.
+   - If no parent is passed, `trace_id` defaults to `span_id` (forming the root of the distributed trace).
+   - Metadata is passed through `CredentialSanitizer.sanitize_structure()`, strictly scrubbing passwords, tokens, and authorization headers.
+2. **Context Manager Guard**:
+   - `async with ExecutionTracer.span(...) as span:` captures start time, calculates `duration_ms` on exit, and intercepts unhandled exceptions to record `error_type` and sanitized `error_message`, setting status to `FAILED`.
+3. **OpenTelemetry Mapping**:
+   - `span.to_otel_span()` serializes internal traces directly into OpenTelemetry Span dictionaries (`name`, `context.trace_id`, `context.span_id`, `parent_id`, `attributes`, `status.code`).
+4. **Tree Reconstruction**:
+   - `ExecutionTracer.get_trace_tree(trace_id)` executes an indexed self-referential tree traversal, returning a nested `TraceTreeResponse` with child spans and OpenTelemetry payloads for visual inspection.
+
+### Step 2: LLM Observability & Provenance Tracking
+
+1. **Invocation Record**:
+   - `LLMTracker.record_llm_call()` captures model, provider, prompt_version, planner_version, latency_ms, token counts, and structured output validation.
+2. **Pricing Estimation**:
+   - Deterministic provider pricing tiers estimate spend (USD) per 1,000 tokens for OpenAI, Anthropic, Google, and local fallbacks.
+3. **Plan Provenance**:
+   - `get_plan_provenance(plan_id)` extracts exact model, model_version, prompt_version, planner_version, and schema_version from the approved plan blueprint, definitively answering _"Which model/prompt generated this migration plan?"_.
+
+### Step 3: Deterministic Resource Budget Enforcement
+
+1. **Durable Budgets**:
+   - `ResourceBudget` records store job limits: `max_llm_calls`, `max_replans`, `max_retries`, `max_execution_duration_seconds`, `max_concurrent_steps`, `max_tokens`, `max_cost_usd`.
+2. **Deterministic Evaluation**:
+   - `ResourceBudgetManager.record_usage()` increments live counters and immediately evaluates against hard limits in Python code.
+   - If any limit is breached, it immediately sets `is_exceeded = True`, emits a `BUDGET_EXCEEDED` event, and raises `BudgetExceededError`. The platform never relies on the LLM to self-police.
+
+### Step 4: Explicit Operational Timeouts
+
+1. **Timeout Standards**:
+   - `TimeoutPolicy` declares centralized limits: LLM calls (60s), DB connections (10s), Metadata inspection (120s), Steps (600s), Verification (180s), Jobs (7200s), Communication (30s).
+2. **Async Guard**:
+   - `execute_with_timeout(coro, timeout_seconds, operation_type)` wraps operations in `asyncio.wait_for`.
+   - On timeout expiry, it logs the timeout and raises `ExecutionTimeoutError`.
+
+### Step 5: Credential-Safe Structured Logging
+
+1. **Correlation Context**:
+   - `StructuredLogger` leverages Python `contextvars` to correlate `migration_job_id`, `agent_run_id`, `execution_step_id`, and `trace_id` automatically across async coroutines.
+2. **Automatic Scrubbing**:
+   - Every log message and extra payload is passed through `CredentialSanitizer`, redacting connection URIs, Bearer tokens, and sensitive key values (`password`, `token`, `secret`).
+
+### Step 6: Operational Health Separation
+
+1. **Decoupled Evaluation**:
+   - `OperationalHealthService.evaluate_health()` evaluates agent container availability and recent heartbeats (`last_seen_at >= now - 60s`).
+   - Simultaneously evaluates active migration job statuses and error rates.
+   - Outputs separate health verdicts: an online agent hosting a failed job reports `agent_health = HEALTHY` and `job_health = DEGRADED/UNHEALTHY`.
+
+## 3. Impact & Delta Analysis
+
+- **[NEW]**: [`apps/api/app/modules/observability/observability_models.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/observability/observability_models.py) — Models for `ExecutionTrace` (with OTel exporter), `LLMCallRecord`, and `ResourceBudget`.
+- **[NEW]**: [`apps/api/app/modules/observability/observability_schemas.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/observability/observability_schemas.py) — DTO schemas for traces, trace trees, LLM records, budgets, metrics, health, and plan provenance.
+- **[NEW]**: [`apps/api/app/modules/observability/tracer.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/observability/tracer.py) — Hierarchical `ExecutionTracer` with `start_span`, `finish_span`, async context manager `span()`, and tree reconstruction.
+- **[NEW]**: [`apps/api/app/modules/observability/llm_tracker.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/observability/llm_tracker.py) — `LLMTracker` for AI call tracking, token/cost estimation, prompt preview scrubbing, and budget incrementing.
+- **[NEW]**: [`apps/api/app/modules/observability/budget_manager.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/observability/budget_manager.py) — `ResourceBudgetManager` for hard deterministic limits enforcement raising `BudgetExceededError`.
+- **[NEW]**: [`apps/api/app/modules/observability/timeout_policy.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/observability/timeout_policy.py) — `TimeoutPolicy` constants and `execute_with_timeout` async execution wrapper.
+- **[NEW]**: [`apps/api/app/modules/observability/structured_logger.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/observability/structured_logger.py) — Context-aware `StructuredLogger` with correlation IDs and credential masking.
+- **[NEW]**: [`apps/api/app/modules/observability/health_service.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/observability/health_service.py) — `OperationalHealthService` decoupling Agent health from Job health.
+- **[NEW]**: [`apps/api/app/modules/observability/metrics_service.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/observability/metrics_service.py) — `ObservabilityMetricsService` computing real-time operational metrics.
+- **[NEW]**: [`apps/api/app/modules/observability/observability_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/observability/observability_routes.py) — REST endpoints for traces, trace trees, LLM records, budgets, metrics, operational health, and plan provenance.
+- **[NEW]**: [`apps/api/alembic/versions/017_add_observability_tracing_and_budgets.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/alembic/versions/017_add_observability_tracing_and_budgets.py) — Linear database migration (`b5c6d7e8f9a0`, revises `a4b5c6d7e8f9`).
+- **[NEW]**: [`apps/api/tests/unit/test_phase5_observability_tracing_budgets.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/tests/unit/test_phase5_observability_tracing_budgets.py) — 11 comprehensive unit tests validating trace propagation, OTel export, LLM tracking, budget enforcement, timeouts, logging, and health decoupling.
+- **[MODIFIED]**: [`apps/api/app/core/state.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/core/state.py) — Added `TraceOperationType` (including `NODE_RUN`), `TraceStatus`, `BudgetLimitType`, observability event types, and exceptions (`BudgetExceededError`, `ExecutionTimeoutError`).
+- **[MODIFIED]**: [`apps/api/app/main.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/main.py) — Registered `observability_router` under `/api/v1` and loaded `observability_models`.
+- **[MODIFIED]**: [`apps/api/tests/unit/test_alembic_migrations.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/tests/unit/test_alembic_migrations.py) — Updated expected migration head to `b5c6d7e8f9a0`.
+
+---
+
+### Phase G: Agentic Evaluation, Regression Testing & Failure Simulation (Phase 6)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Client as Test Suite / CI/CD Runner
+    participant EvalRouter as EvaluationRoutes (/api/v1/evaluation)
+    participant EvalService as EvaluationService
+    participant Dataset as EvaluationDataset (15 Scenarios)
+    participant PlanEval as PlanningEvaluator (8 Dimensions)
+    participant RecovEval as RecoveryEvaluator (Deterministic Router)
+    participant LLMEval as LLMOutputEvaluator (AST Schemas)
+    participant FailSim as FailureInjectionSimulator (7 Failure Modes)
+    participant Gates as QualityGateValidator (Engineering Criteria)
+    participant DB as Evaluation Database Models
+
+    Client->>EvalRouter: POST /api/v1/evaluation/runs (suite_name, model, prompt_version, planner_version)
+    EvalRouter->>EvalService: run_evaluation_suite(db, request)
+    EvalService->>Dataset: build_evaluation_scenarios() (15 Synthetic Scenarios)
+
+    loop For each Scenario in Dataset
+        EvalService->>PlanEval: evaluate(scenario, baseline_ast)
+        Note over PlanEval: Measures Schema, Table, Column, Constraint, Validation, Unsupported Ops, Unnecessary Transforms, Confidence Calibration
+        PlanEval-->>EvalService: PlanningMetricsReport
+
+        EvalService->>RecovEval: evaluate_failure_scenario(error, expected_category, expected_action)
+        Note over RecovEval: Tests Classifier & Router (RETRY / RECOVER / REPLAN / ASK_USER) + Circuit Breakers
+        RecovEval-->>EvalService: RecoveryMetricsReport
+
+        EvalService->>LLMEval: evaluate_response(raw_output, expected_ast)
+        Note over LLMEval: Strict AST validation, schema violation counts, self-correction tracking
+        LLMEval-->>EvalService: LLMOutputMetricsReport
+
+        opt Failure Injection Scenario (Drift / Constraint / Verification)
+            EvalService->>FailSim: simulate operational failure
+            FailSim-->>EvalService: FailureInjectionResult (Safe transition, zero unhandled)
+        end
+
+        Note over EvalService: Calculate tokens, LLM calls, latency (ms), and cost (USD)
+    end
+
+    EvalService->>Gates: evaluate(scenario_results)
+    Note over Gates: Check Validation Rate >= 95%, Safety Violations == 0, Credential Leaks == 0, Unhandled == 0
+    Gates-->>EvalService: QualityGateEvaluationResponse(overall_passed, gates)
+
+    EvalService->>DB: Persist EvaluationSuiteRun + EvaluationScenarioResult records
+    EvalService-->>EvalRouter: EvaluationSuiteRunResponse
+    EvalRouter-->>Client: 201 Created (Metrics, Costs, Gate Status)
+
+    opt Regression Diff Request
+        Client->>EvalRouter: POST /api/v1/evaluation/regression/compare (baseline_id, target_id)
+        EvalRouter->>EvalService: compare_suite_runs(db, baseline_id, target_id)
+        Note over EvalService: Compute pass rate delta, planning delta, cost delta, latency delta, regressed/improved scenarios
+        EvalService-->>EvalRouter: RegressionComparisonResponse(verdict, summary)
+        EvalRouter-->>Client: 200 OK (Regression Verdict)
+    end
+```
+
+### Detailed Flow Specifications
+
+### Step 1: Synthetic Evaluation Dataset Isolation
+
+1. **Zero Production Data Leakage**:
+   - `build_evaluation_scenarios()` synthesizes 15 canonical migration scenarios spanning standard relational 1:1, cross-dialect type casting, MongoDB document unflattening, multi-source consolidation, column/PK conflict resolution, nullable mismatch, deduplication, FK dependencies, schema drift, missing table rejection, unsupported spatial data types, expression transforms, destructive truncations, and ambiguous schema calibration.
+   - All sample rows and schemas use purely synthetic identifiers; zero real customer credentials or PII exist.
+
+### Step 2: Multi-Dimensional Planning Evaluation
+
+1. **8 Engineering Dimensions**:
+   - `PlanningEvaluator.evaluate()` deterministically measures:
+     - `schema_correctness`: Correct target column data types.
+     - `table_mapping_correctness`: Participation of expected source tables in target construction.
+     - `column_mapping_correctness`: Presence and proper mapping of all required target attributes.
+     - `constraint_correctness`: Enforcement of primary keys and two-phase foreign key creation hygiene.
+     - `validation_accuracy`: Deterministic validator agreement with expected validity / rejection ground truth.
+     - `unsupported_operation_detection`: Automatic flagging of proprietary spatial/geometry types with fallback text/JSON mapping.
+     - `unnecessary_transformations`: Penalization of redundant identity casts and nested trivial transformations.
+     - `confidence_calibration`: Proper penalization of overconfidence when schema mappings are ambiguous.
+
+### Step 3: Deterministic Failure Recovery & Circuit Breakers
+
+1. **Recovery Routing**:
+   - `RecoveryEvaluator.evaluate_failure_scenario()` runs errors through `FailureClassifier` and `RecoveryRouter`.
+   - Transient network/database errors map deterministically to `RETRY` with backoff.
+   - Schema drift maps to `REPLAN`.
+   - Agent heartbeat loss maps to `RECOVER`.
+   - Destructive target operations without prior approval route to `ASK_USER`.
+2. **Anti-Infinite-Loop Circuit Breakers**:
+   - Prevents runaway recursion loops by terminating retries (`> MAX_RETRIES_PER_STEP`), replans (`> MAX_REPLANS_PER_JOB`), and LLM calls (`> MAX_LLM_CALLS`), forcing escalation to `FAIL` or `ASK_USER`.
+
+### Step 4: Strict Schema LLM Output Validation
+
+1. **AST Compliance**:
+   - `LLMOutputEvaluator.evaluate_response()` parses JSON outputs and evaluates against `TransformationPlanAST`.
+   - Tracks JSON syntax validity, Pydantic model compliance, validation failure rates, and self-correction success rates across model retry attempts.
+
+### Step 5: Controlled Operational Failure Injection
+
+1. **Resilience Verification**:
+   - `FailureInjectionSimulator` runs controlled simulations of 7 failure scenarios:
+     1. Agent crash
+     2. Network drop
+     3. Database timeout
+     4. Schema drift
+     5. Corrupted/invalid AST
+     6. Target constraint violation
+     7. Post-ETL verification row count mismatch
+   - Proves that platform lifecycle state machine transitions safely (`FAILED` or `NEEDS_REVIEW`) and never crashes into unhandled execution states.
+
+### Step 6: Engineering Quality Gates
+
+1. **Measurable Engineering Thresholds**:
+   - `QualityGateValidator.evaluate()` enforces strict engineering criteria:
+     - `Deterministic Validation Pass Rate >= 95%`
+     - `Critical Safety Violations == 0` (zero unauthorized destructive drops or safety bypasses)
+     - `Credential Leakage == 0` (regex scanning for passwords, tokens, connection URIs)
+     - `Unhandled Execution State == 0` (zero unhandled exceptions or runaway loops)
+     - `Recovery Routing Accuracy >= 90%`
+     - `LLM Output AST Validity >= 95%`
+
+### Step 7: Version Regression Diffing
+
+1. **Automated Version Comparisons**:
+   - `EvaluationService.compare_suite_runs()` compares baseline and candidate benchmark runs.
+   - Computes deltas in pass rate, planning score, token cost (USD), and latency (ms).
+   - Generates definitive verdicts: `NO_REGRESSION`, `IMPROVED`, or `REGRESSION_DETECTED`.
+
+## 4. Impact & Delta Analysis
+
+- **[NEW]**: [`apps/api/app/modules/evaluation/__init__.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/evaluation/__init__.py) — Module entry point exporting evaluation models, router, and service.
+- **[NEW]**: [`apps/api/app/modules/evaluation/evaluation_models.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/evaluation/evaluation_models.py) — SQLAlchemy models `EvaluationSuiteRun` and `EvaluationScenarioResult`.
+- **[NEW]**: [`apps/api/app/modules/evaluation/evaluation_schemas.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/evaluation/evaluation_schemas.py) — Pydantic DTOs for scenarios, suite runs, scenario results, regression diffs, and quality gates.
+- **[NEW]**: [`apps/api/app/modules/evaluation/evaluation_dataset.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/evaluation/evaluation_dataset.py) — Standardized 15-scenario synthetic migration evaluation dataset with ground truth.
+- **[NEW]**: [`apps/api/app/modules/evaluation/evaluator_planning.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/evaluation/evaluator_planning.py) — Planning evaluator across 8 engineering dimensions.
+- **[NEW]**: [`apps/api/app/modules/evaluation/evaluator_recovery.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/evaluation/evaluator_recovery.py) — Recovery evaluator verifying failure classification, deterministic routing, and circuit breakers.
+- **[NEW]**: [`apps/api/app/modules/evaluation/evaluator_llm_output.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/evaluation/evaluator_llm_output.py) — Strict AST schema validator tracking syntax errors, violation rates, and self-correction.
+- **[NEW]**: [`apps/api/app/modules/evaluation/failure_injection.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/evaluation/failure_injection.py) — Operational failure simulation harness for 7 critical failure modes.
+- **[NEW]**: [`apps/api/app/modules/evaluation/quality_gates.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/evaluation/quality_gates.py) — Quality gate validation engine enforcing measurable engineering thresholds.
+- **[NEW]**: [`apps/api/app/modules/evaluation/evaluation_service.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/evaluation/evaluation_service.py) — Evaluation service orchestrating suite benchmarks, regression comparisons, cost/latency tracking, and failure simulations.
+- **[NEW]**: [`apps/api/app/modules/evaluation/evaluation_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/evaluation/evaluation_routes.py) — REST endpoints for scenarios, suite runs, regression diff comparisons, and failure simulations.
+- **[NEW]**: [`apps/api/alembic/versions/018_add_evaluation_and_regression_testing.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/alembic/versions/018_add_evaluation_and_regression_testing.py) — Linear database migration (`c6d7e8f9a0b1`, revises `b5c6d7e8f9a0`).
+- **[NEW]**: [`apps/api/tests/unit/test_phase6_evaluation_and_regression.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/tests/unit/test_phase6_evaluation_and_regression.py) — 13 comprehensive unit tests validating dataset integrity, planning metrics, recovery circuit breakers, LLM output evaluation, failure injections, quality gates, and version regression analysis.
+- **[MODIFIED]**: [`apps/api/app/core/state.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/core/state.py) — Added evaluation event types (`EVALUATION_SUITE_STARTED`, `EVALUATION_SUITE_COMPLETED`, etc.) and enums (`EvaluationScenarioCategory`, `EvaluationStatus`, `QualityGateStatus`).
+- **[MODIFIED]**: [`apps/api/app/main.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/main.py) — Registered `evaluation_router` under `/api/v1` and loaded `evaluation_models`.
+- **[MODIFIED]**: [`apps/api/app/modules/migration_plans/migration_plans_schemas.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/migration_plans/migration_plans_schemas.py) — Added model validators, defaults, and aliases for concise AST specification.
+- **[MODIFIED]**: [`apps/api/app/modules/execution/failure_taxonomy.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/failure_taxonomy.py) — Added `classify` convenience method and expanded network/agent crash pattern recognition.
+- **[MODIFIED]**: [`apps/api/tests/unit/test_alembic_migrations.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/tests/unit/test_alembic_migrations.py) — Updated expected migration head to `c6d7e8f9a0b1`.
+
+---
+
+# Execution Flow — Phase 7: Production Hardening, Watchdog Recovery, and Concurrency Controls
+
+## 1. Entry Points
+
+- **Watchdog Execution Loop**: [`apps/api/app/main.py:L36`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/main.py#L36) (`stale_agent_watchdog()`) runs background timer checking agents and jobs every 20 seconds.
+- **Job Cancellation**: [`apps/api/app/modules/execution/execution_routes.py:L70`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_routes.py#L70) (`POST /api/v1/executions/{id}/cancel`).
+- **Health / Readiness Probe**: [`apps/api/app/main.py:L148`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/main.py#L148) (`GET /api/v1/health`).
+- **Granular Step Claiming**: [`apps/api/app/modules/execution/execution_routes.py:L209`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_routes.py#L209) (`POST /api/v1/executions/plans/{plan_id}/steps/claim`).
+- **Checkpoint Persistence**: [`apps/api/app/modules/execution/execution_routes.py:L231`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_routes.py#L231) (`POST /api/v1/executions/steps/{step_id}/checkpoint`).
+
+## 2. Step-by-Step Execution Sequence
+
+### Flow A: Stale Agent & Active Job Watchdog Recovery
+
+1. **Periodic Poll**:
+   - `stale_agent_watchdog()` wakes up every 20s and creates an `AsyncSessionLocal()`.
+   - Calls `AgentService.check_stale_agents_and_jobs(session, stale_threshold_seconds=60)`.
+2. **Active Status Candidate Scan**:
+   - Queries `Agent` with status in `["online", "busy", "degraded"]`.
+   - Compares `agent.last_seen_at` against `now - 60s` (or 360s for standby mode).
+   - Verifies if any job is actively reporting progress (`updated_at >= active_cutoff`).
+3. **Disconnection and Failure Cascade**:
+   - If timed out: transitions agent status to `offline`, sets `error_category = "DISCONNECTED_UNEXPECTEDLY"`.
+   - Broadcasts `AGENT_DISCONNECTED` event over WebSockets to UI subscribers.
+   - Queries all associated active jobs across ALL non-terminal states:
+     `status.in_(["queued", "claimed", "preparing", "running", "recovering", "verifying", "ask_user"])`.
+   - Transitions each active job to `failed` with diagnostic reason `"Agent disconnected or timed out during migration execution."`.
+   - Fetches attached `MigrationExecutionPlan` and marks plan `failed`.
+   - Iterates over execution steps: for all steps in `pending`, `running`, `retrying`, or `ask_user`, sets `status = "failed"`, `failure_category = "AGENT_DISCONNECTED"`, `finished_at = now`.
+   - Commits transaction.
+
+### Flow B: Cascading Execution Cancellation
+
+1. **User Cancellation Request**:
+   - User triggers `POST /api/v1/executions/{id}/cancel` via frontend dashboard.
+   - Enforces user ownership (`MigrationPlan.user_id == current_user.id`).
+2. **State Machine Transition**:
+   - Calls `ExecutionStateMachine.transition_job(job, target_state=CANCELLED)`.
+   - Resets assigned agent status to `online` and sets `agent.idle_since = now`.
+3. **Execution Plan & Step Cascade**:
+   - Queries attached `MigrationExecutionPlan` and all linked `MigrationExecutionStep` entities.
+   - If plan is active, sets `exec_plan.status = "cancelled"` and `exec_plan.finalized_at = now`.
+   - For all steps with status in `["pending", "running", "retrying", "ask_user"]`, transitions to `status = "cancelled"` and sets `s.finished_at = now`.
+   - Emits `EXECUTION_PROGRESS` WebSocket broadcast with `status = "cancelled"`.
+
+### Flow C: Monotonic Checkpoint Forward-Only Progression
+
+1. **Checkpoint Submission**:
+   - Worker agent posts `POST /api/v1/executions/steps/{step_id}/checkpoint` with `cursor_offset`, `rows_processed`, and `source_position`.
+2. **Atomic Row Lock & Monotonic Check**:
+   - `ExecutionPlanService.save_checkpoint()` locks existing checkpoint record with `.with_for_update()`.
+   - Compares incoming `cursor_offset` with `checkpoint.cursor_offset`:
+     - If `cursor_offset >= checkpoint.cursor_offset`: updates offset, updates `rows_processed = max(...)`, increments `checkpoint_version += 1`, updates `updated_at = now`.
+     - If `cursor_offset < checkpoint.cursor_offset` (stale delayed packet or duplicate runner): logs warning and ignores stale regression, preserving durable forward progress.
+
+### Flow D: Multi-Tenant Step Claiming Isolation
+
+1. **Step Claim Request**:
+   - Agent submits `POST /api/v1/executions/plans/{plan_id}/steps/claim` with `X-Agent-Token`.
+2. **Tenant Isolation Verification**:
+   - Acquires row lock on `MigrationExecutionPlan` with `.with_for_update()`.
+   - Loads `exec_plan.plan` and authenticates claiming agent.
+   - Verifies that `agent.user_id == exec_plan.plan.user_id`. If tenant IDs mismatch, rejects with unauthorized log warning and returns `None`.
+   - If valid: checks concurrency limit, evaluates dependencies, marks step `running`, and increments `attempt_count`.
+
+## 3. Impact & Delta Analysis
+
+- **[MODIFIED]**: [`apps/api/app/modules/agents/agents_services.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/agents/agents_services.py) — Expanded watchdog to monitor all active job states (`claimed`, `verifying`, `recovering`), fixed `limit(1)` multiple results query, and cascaded agent crash failures into execution plans and steps.
+- **[MODIFIED]**: [`apps/api/app/modules/execution/execution_services.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_services.py) — Added cascading cancellation to `MigrationExecutionPlan` and all active steps; expanded `check_stale_jobs` to include all non-terminal states.
+- **[MODIFIED]**: [`apps/api/app/modules/execution/execution_plan_services.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_plan_services.py) — Added monotonic checkpoint forward-only protection in `save_checkpoint`; added multi-tenant user isolation in `claim_next_step`.
+- **[MODIFIED]**: [`apps/api/app/modules/migration_plans/migration_plans_services.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/migration_plans/migration_plans_services.py) — Hardened `_check_active_execution_lock` to block edits/refinements during all active execution states (`queued`, `claimed`, `preparing`, `running`, `paused`, `recovering`, `ask_user`, `verifying`).
+- **[MODIFIED]**: [`apps/api/app/main.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/main.py) — Added active database connectivity probe (`SELECT 1`) to `/health` endpoint returning 200/503; added global exception handler with `CredentialSanitizer.mask_credentials`.
+- **[MODIFIED]**: [`apps/api/Dockerfile`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/Dockerfile) — Hardened runner container with non-root system user (`USER appuser`).
+- **[MODIFIED]**: [`apps/web/Dockerfile`](file:///d:/GitHub/Ai_data_migration_platform/apps/web/Dockerfile) — Hardened Next.js runner stage with non-root user (`USER node`).
+- **[MODIFIED]**: [`apps/agent/Dockerfile`](file:///d:/GitHub/Ai_data_migration_platform/apps/agent/Dockerfile) — Hardened agent container with non-root system user (`USER agentuser`).
+- **[MODIFIED]**: [`docker-compose.yml`](file:///d:/GitHub/Ai_data_migration_platform/docker-compose.yml) — Added active health checks for `api`, container resource limits (`deploy.resources.limits`), and dependency ordering.
+- **[NEW]**: [`docs/BACKUP_AND_DISASTER_RECOVERY.md`](file:///d:/GitHub/Ai_data_migration_platform/docs/BACKUP_AND_DISASTER_RECOVERY.md) — Comprehensive operational disaster recovery architecture, authoritative system of record matrix, RPO/RTO targets, and recovery runbooks.
+- **[NEW]**: [`apps/api/tests/unit/test_phase7_production_hardening_and_audit.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/tests/unit/test_phase7_production_hardening_and_audit.py) — 9 comprehensive unit and concurrency tests validating recovery, cancellation cascading, active plan locks, monotonic checkpoints, cross-tenant isolation, health probes, and credential scrubbing.
 
 ---
 
 # Execution Flow — Single-Container Database Provisioning & Orchestration
 
 ## 1. Entry Point
+
 - **File**: [`docker-compose.yml`](file:///d:/GitHub/Ai_data_migration_platform/docker-compose.yml)
 - **Trigger**: Invocation of `docker compose up -d` or `docker compose --profile sample-dbs up -d` by developer or CI/CD deployment pipeline.
 
 ## 2. Step-by-Step Execution Sequence
+
 1. **PostgreSQL Bootstrapping**:
    - `docker compose` starts `migration_platform_postgres` container.
    - Entrypoint runs initial cluster creation for default database `migration_platform` and user `postgres`.
@@ -1221,6 +1951,7 @@ sequenceDiagram
    - Local tools and seed scripts connect using credentials documented in [`DATABASE_CREDENTIALS.md`](file:///d:/GitHub/Ai_data_migration_platform/DATABASE_CREDENTIALS.md).
 
 ## 3. Impact & Delta Analysis
+
 - **[MODIFIED]**: [`docker-compose.yml`](file:///d:/GitHub/Ai_data_migration_platform/docker-compose.yml) — Consolidated to 1 container per engine (removed redundant `postgres_ecommerce` and `postgres_crm` containers).
 - **[NEW]**: [`infra/docker/init-postgres-dbs.sql`](file:///d:/GitHub/Ai_data_migration_platform/infra/docker/init-postgres-dbs.sql) — PostgreSQL multi-database init script.
 - **[NEW]**: [`infra/docker/init-mysql-dbs.sql`](file:///d:/GitHub/Ai_data_migration_platform/infra/docker/init-mysql-dbs.sql) — MySQL multi-database init script.
@@ -1233,6 +1964,7 @@ sequenceDiagram
 # Execution Flow — Client-Side Database Credential Auto-Fill & Command Substitution
 
 ## 1. Entry Point
+
 - **Files**:
   - [`apps/web/app/agents/create/page.tsx`](file:///d:/GitHub/Ai_data_migration_platform/apps/web/app/agents/create/page.tsx) (Agent Creation Wizard, Step 2: Database Topology)
   - [`apps/web/app/dashboard/page.tsx`](file:///d:/GitHub/Ai_data_migration_platform/apps/web/app/dashboard/page.tsx) (Agent Command Modal -> Auto-Fill Accordion)
@@ -1265,6 +1997,7 @@ sequenceDiagram
    - The developer copies and runs the command in PowerShell or Bash with zero missing database names or placeholder remnants.
 
 ## 3. Impact & Delta Analysis
+
 - **[MODIFIED]**: [`apps/web/lib/dockerCommandUtils.ts`](file:///d:/GitHub/Ai_data_migration_platform/apps/web/lib/dockerCommandUtils.ts) — Added `password` support, robust identifier matching, and `<DEST_DB_...>` alias fallback substitution.
 - **[MODIFIED]**: [`apps/web/components/agents/DatabaseConfigForm.tsx`](file:///d:/GitHub/Ai_data_migration_platform/apps/web/components/agents/DatabaseConfigForm.tsx) — Decoupled credential state from mutable identifier tags, added password inputs with visibility toggles, explicit database name labels, and dual-mode instruction callout.
 - **[MODIFIED]**: [`apps/web/app/agents/create/page.tsx`](file:///d:/GitHub/Ai_data_migration_platform/apps/web/app/agents/create/page.tsx) — Added typed `ConnectionDetails` integration and auto-population instructions.
@@ -1278,6 +2011,7 @@ sequenceDiagram
 # Execution Flow - Local Docker Build & Database Multi-Host Connectivity
 
 ## 1. Entry Point
+
 - **Trigger**: Developer runs `docker compose build` / `docker compose up -d` or configures database connections via the web UI at `http://localhost:3000/agents/create`.
 - **Files**:
   - [`docker-compose.yml`](file:///d:/GitHub/Ai_data_migration_platform/docker-compose.yml)
@@ -1303,6 +2037,7 @@ sequenceDiagram
    - **Inter-Container Access**: Inside the Docker Compose bridge network, services use internal DNS names: `postgres:5432`, `mysql_source:3306`, and `mongo_source:27017`.
 
 ## 3. Impact & Delta Analysis
+
 - **[MODIFIED]**: [`DATABASE_CREDENTIALS.md`](file:///d:/GitHub/Ai_data_migration_platform/DATABASE_CREDENTIALS.md) & [`docs/DATABASE_CREDENTIALS.md`](file:///d:/GitHub/Ai_data_migration_platform/docs/DATABASE_CREDENTIALS.md) — Added explicit Host columns, Web UI configuration tables, and 3-way connection URLs.
 - **[MODIFIED]**: [`database_credentials.env`](file:///d:/GitHub/Ai_data_migration_platform/database_credentials.env) — Added notes on host selection for local vs Docker agent containers.
 - **[FIXED]**: Database `alembic_version` state synchronized to head revision `c9f0a2b3456e`, resolving API container crash loop.
@@ -1313,6 +2048,7 @@ sequenceDiagram
 # Execution Flow - NoSQL/Document-Oriented Domain in PostgreSQL & MySQL Provisioning
 
 ## 1. Entry Point
+
 - **File**: [`apps/api/scripts/seed_gaming_nosql_dbs.py:L316`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/scripts/seed_gaming_nosql_dbs.py#L316)
 - **Trigger**: CLI execution `python apps/api/scripts/seed_gaming_nosql_dbs.py` or automated CI/CD database seeding runner.
 
@@ -1343,6 +2079,7 @@ sequenceDiagram
    - Container startup automatically runs [`infra/docker/init-postgres-dbs.sql`](file:///d:/GitHub/Ai_data_migration_platform/infra/docker/init-postgres-dbs.sql) and [`infra/docker/init-mysql-dbs.sql`](file:///d:/GitHub/Ai_data_migration_platform/infra/docker/init-mysql-dbs.sql), creating the database schemas if the container volumes are regenerated.
 
 ## 3. Impact & Delta Analysis (AI Modifications)
+
 - **[NEW]**: [`apps/api/scripts/seed_gaming_nosql_dbs.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/scripts/seed_gaming_nosql_dbs.py) — End-to-end database creation and deterministic 5,000-record seeder.
 - **[MODIFIED]**: [`infra/docker/init-postgres-dbs.sql`](file:///d:/GitHub/Ai_data_migration_platform/infra/docker/init-postgres-dbs.sql) — Added database creation for `gaming_telemetry_pg`.
 - **[MODIFIED]**: [`infra/docker/init-mysql-dbs.sql`](file:///d:/GitHub/Ai_data_migration_platform/infra/docker/init-mysql-dbs.sql) — Added database creation for `gaming_economy_mysql`.
@@ -1350,7 +2087,3 @@ sequenceDiagram
 - **[MODIFIED]**: [`database_credentials.env`](file:///d:/GitHub/Ai_data_migration_platform/database_credentials.env) — Added `PG_GAMING_TELEMETRY_URL` and `MYSQL_GAMING_ECONOMY_URL`.
 - **[MODIFIED]**: [`docs/DECISIONS.md`](file:///d:/GitHub/Ai_data_migration_platform/docs/DECISIONS.md) — Recorded architectural decision log for modeling document-oriented NoSQL domains in RDBMS.
 - **[UNCHANGED]**: Existing databases (`migration_platform`, `ecommerce_db`, `crm_db`, `inventory_db`, etc.) and API service routes.
-
-
-
-

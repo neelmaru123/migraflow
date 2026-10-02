@@ -89,7 +89,7 @@ RULES & INDUSTRY DATABASE ARCHITECTURE STANDARDS:
     - When target is MySQL/SQLite and source column is a Postgres Array (TEXT[], INT[]):
       - Use 'array_to_csv' for simple text arrays (e.g. tags -> "tag1,tag2").
       - Use 'array_to_json' for complex or structured arrays.
-    - When target is PostgreSQL: Preserve native JSONB / ARRAY types using 'type_cast'.
+    - When target is PostgreSQL: Preserve native JSONB / ARRAY types using 'type_cast'. 
 16. STRICT SOURCE DATABASE IDENTIFIER BINDING:
     - In each table_blueprint, source_table.source_db_id MUST strictly match the exact source database identifier (e.g. 'src_db_1', 'src_db_2', 'src_db_3') under which that specific table was provided in the metadata context.
     - NEVER assign a table (e.g., 'products', 'orders', 'customers') to a source_db_id where that table does NOT exist in the metadata context!
@@ -148,6 +148,10 @@ RULES & INDUSTRY DATABASE ARCHITECTURE STANDARDS:
     meanings. You MUST verify that the source table in each source_columns entry actually contributes
     to that SAME target table merge — never borrow a column from a table that is being mapped to a
     DIFFERENT target table.
+
+    CRITICAL SAFEGUARD FOR AUDIT TIMESTAMPS:
+    - NEVER map unrelated integer or primary key columns (e.g. 'category_id', 'product_id', 'item_id') to audit timestamp columns ('created_at', 'updated_at')!
+    - If a participating source table does NOT have a creation or update timestamp column, DO NOT map its ID column to 'created_at' or 'updated_at'. Instead, omit that source table from the source_columns for that timestamp, or set transformation_type to 'new_column_added' / 'expression' with 'CURRENT_TIMESTAMP'.
 
 18. TARGET DATABASE MONGODB RULES:
     When target_database_type is "mongodb":

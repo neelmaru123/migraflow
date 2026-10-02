@@ -14,7 +14,13 @@ services:
       - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-}
       - NEXT_PUBLIC_WS_URL=${NEXT_PUBLIC_WS_URL:-}
     depends_on:
-      - api
+      api:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1024M
     restart: unless-stopped
 
   api:
@@ -62,6 +68,18 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    healthcheck:
+      test:
+        ["CMD-SHELL", "curl -f http://localhost:8000/api/v1/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2048M
     restart: unless-stopped
 
   agent:
@@ -76,7 +94,13 @@ services:
       - API_URL=http://api:8000
       - AGENT_TOKEN=${AGENT_TOKEN:-}
     depends_on:
-      - api
+      api:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2048M
     restart: unless-stopped
 
   postgres:
@@ -94,7 +118,11 @@ services:
       - postgres_data:/var/lib/postgresql/data
       - ./infra/docker/init-postgres-dbs.sql:/docker-entrypoint-initdb.d/init-postgres-dbs.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-migration_platform}"]
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-migration_platform}",
+        ]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -113,7 +141,17 @@ services:
       - mysql_data:/var/lib/mysql
       - ./infra/docker/init-mysql-dbs.sql:/docker-entrypoint-initdb.d/init-mysql-dbs.sql:ro
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-pmysql_password"]
+      test:
+        [
+          "CMD",
+          "mysqladmin",
+          "ping",
+          "-h",
+          "localhost",
+          "-u",
+          "root",
+          "-pmysql_password",
+        ]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -133,7 +171,8 @@ services:
       - mongo_data:/data/db
       - ./infra/docker/init-mongo-dbs.js:/docker-entrypoint-initdb.d/init-mongo-dbs.js:ro
     healthcheck:
-      test: ["CMD-SHELL", "mongosh --eval 'db.adminCommand(\"ping\")' || exit 0"]
+      test:
+        ["CMD-SHELL", 'mongosh --eval ''db.adminCommand("ping")'' || exit 0']
       interval: 30s
       timeout: 10s
       retries: 3
@@ -159,4 +198,3 @@ volumes:
   mysql_data:
   mongo_data:
   redis_data:
-
