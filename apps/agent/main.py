@@ -636,6 +636,8 @@ def poll_and_execute_tasks(
 
                     # Check plan AST specification
                     if not target_engine_type and isinstance(plan_ast, dict):
+                        raw_data = plan_ast.get("plan_data")
+                        plan_data: Dict[str, Any] = raw_data if isinstance(raw_data, dict) else {}
                         ast_type = (
                             plan_ast.get("target_db_type")
                             or plan_ast.get("target_database_type")

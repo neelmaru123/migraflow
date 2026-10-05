@@ -250,14 +250,15 @@ async def google_oauth_callback(
 
         google_sub = id_info.get("sub")
         email = id_info.get("email")
-        name = id_info.get("name") or email.split("@")[0]
-        email_verified = id_info.get("email_verified", True)
 
         if not google_sub or not email:
             return RedirectResponse(
                 url=f"{settings.FRONTEND_URL}/login?error={urllib.parse.quote('Google token missing sub or email claims.')}",
                 status_code=status.HTTP_302_FOUND
             )
+
+        name = id_info.get("name") or email.split("@")[0]
+        email_verified = id_info.get("email_verified", True)
 
         user = await UserService.get_or_create_google_user(
             db, google_id=google_sub, email=email, name=name, email_verified=email_verified
@@ -312,14 +313,15 @@ async def google_auth_credential(
 
         google_sub = id_info.get("sub")
         email = id_info.get("email")
-        name = id_info.get("name") or email.split("@")[0]
-        email_verified = id_info.get("email_verified", True)
 
         if not google_sub or not email:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid Google Token claims.",
             )
+
+        name = id_info.get("name") or email.split("@")[0]
+        email_verified = id_info.get("email_verified", True)
 
         user = await UserService.get_or_create_google_user(
             db, google_id=google_sub, email=email, name=name, email_verified=email_verified

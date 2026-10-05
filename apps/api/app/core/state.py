@@ -4,7 +4,9 @@ Defines explicit lifecycles for Agents, Migration Plans, Execution Jobs, and Exe
 """
 
 from enum import Enum
-from typing import Any, Dict, Optional, Set, Union
+from typing import Any, Dict, Optional, Set, Type, TypeVar, Union
+
+T = TypeVar("T", bound="NormalizedStrEnum")
 
 
 class NormalizedStrEnum(str, Enum):
@@ -14,7 +16,7 @@ class NormalizedStrEnum(str, Enum):
     """
 
     @classmethod
-    def from_str(cls, value: Union[str, "NormalizedStrEnum"]) -> "NormalizedStrEnum":
+    def from_str(cls: Type[T], value: Union[str, Any]) -> T:
         if isinstance(value, cls):
             return value
         val_str = str(value).strip().lower()

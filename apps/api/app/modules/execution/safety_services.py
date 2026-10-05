@@ -290,7 +290,7 @@ class DestructiveApprovalManager:
             .values(is_valid=False, rejection_reason=f"Invalidated: {reason}")
         )
         res = await session.execute(stmt)
-        count = res.rowcount
+        count = int(getattr(res, "rowcount", 0) or 0)
 
         if count > 0:
             event = ExecutionEvent(
