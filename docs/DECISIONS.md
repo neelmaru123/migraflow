@@ -2787,3 +2787,37 @@ Designed, provisioned, and seeded two enterprise databases—**`gaming_telemetry
 
 - **Trade-offs**: Hybrid relational-JSON schemas require careful index management (`GIN` on PostgreSQL, generated functional index columns on MySQL) to avoid unindexed table scans on deeply nested JSON keys.
 - **Future Considerations**: Add synthetic workload benchmarks or migration agent pipelines to demonstrate bi-directional schema inference and transformations between `gaming_telemetry_pg`, `gaming_economy_mysql`, and NoSQL sinks.
+
+---
+
+## [2026-10-02] - Multi-Source Dynamic Identifier Resolution, UUID Uniqueness, and Standardizing on `data-migration-agent:latest`
+
+### 1. Decision Summary
+
+Fixed primary key collision during multi-source database merges in [`apps/agent/engine/transformers/ast_transformer.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/agent/engine/transformers/ast_transformer.py) by dynamically resolving source identifiers from `source_origin` (e.g. `src_db_1` vs `src_db_2`) rather than hardcoding `source_cols[0]`. Rebuilt the migration agent Docker container and standardized the platform image naming exclusively on **`nmaru094123/data-migration-agent:latest`**, pushing the verified build directly to Docker Hub and removing redundant image tags.
+
+### 2. Why This Approach? (Rationale)
+
+- **Problem Being Solved**:
+  1. When merging multiple source databases (e.g., PostgreSQL `retail_store_pg` and MySQL `retail_online_mysql`) into a single target table, both sources possessed overlapping integer primary keys (`id=1..30`, `1..25`, `1..35`).
+  2. Because [`ASTTransformer.transform_chunk`](file:///d:/GitHub/Ai_data_migration_platform/apps/agent/engine/transformers/ast_transformer.py) hardcoded `src_ident = source_cols[0].get("identifier")`, chunks from `src_db_2` generated identical deterministic UUID v5 values (`uuid5(NAMESPACE_DNS, "src_db_1_1")`) as `src_db_1`.
+  3. Consequently, PostgreSQL target bulk insertions hit primary key uniqueness conflicts (`customers_pkey`, `products_pkey`, `orders_pkey`) and silently skipped all 90 rows from the second database under `ON CONFLICT DO NOTHING`, resulting in only 90 of 180 rows being committed.
+  4. Two conflicting image names existed across Docker Hub and local configurations (`migraflow-agent` vs `data-migration-agent`). The user requested standardizing strictly on `data-migration-agent`.
+- **Chosen Solution**:
+  1. **Dynamic Identifier Resolution**: Introduced `_resolve_src_ident()` and enhanced `_resolve_src_col()` in `ASTTransformer` to extract the active chunk's database identifier from `source_origin` (e.g., `"src_db_2.customers"` $\rightarrow$ `"src_db_2"`).
+  2. **Multi-Source UUID Partitioning**: Ensured deterministic UUID generation for primary keys and foreign keys prefixes the UUID namespace input with the resolved source identifier (`f"{src_ident}_{v}"`), ensuring zero UUID collisions across distinct sources.
+  3. **Standardized Single Image**: Standardized the Docker image on `nmaru094123/data-migration-agent:latest`, built and tested with unit tests (`test_multi_source_merge_uuid_uniqueness`), pushed to Docker Hub, and purged redundant local `migraflow-agent` tags.
+- **Why This Library / Technology**: Using `uuid5` with namespace DNS guarantees deterministic, reproducible primary keys across chunk streaming while properly partitioning by source identifier guarantees referential integrity without cross-source collisions.
+
+### 3. Alternatives Considered & Rejected
+
+- **Alternative A: Random UUID v4 Generation (`uuid_v4_rekey`)**
+  - _Rejected_: Random UUIDs are non-deterministic, making chunk replay, checkpoint resume, and foreign key parent-child linkage across separate streaming chunks impossible without maintaining a shared in-memory ID lookup table.
+- **Alternative B: Offsetting Integer Autoincrements (`autoincrement_offset`)**
+  - _Rejected_: Requires target databases to support large 64-bit integer keys and fails when target schemas require UUID primary keys.
+
+### 4. Trade-offs & Future Considerations
+
+- **Trade-offs**: Source identifiers in the migration plan AST must cleanly match the source prefix used during chunk extraction (`src_origin_tag`).
+- **Future Considerations**: Automated integration test in CI simulating end-to-end multi-source merging with identical primary key sequences across PostgreSQL and MySQL.
+

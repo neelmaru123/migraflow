@@ -100,6 +100,8 @@ When creating an agent or configuring a migration pipeline in the web UI at `htt
 | **`complex_pg_db`** | Relational Benchmark Schema (Composite keys & deep relational links) | `pg_customers`, `pg_products`, `pg_orders`, `pg_order_items` | 200 rows | `postgresql://postgres:postgres_password@localhost:5434/complex_pg_db` | `postgresql://postgres:postgres_password@host.docker.internal:5434/complex_pg_db` | `postgresql://postgres:postgres_password@postgres:5432/complex_pg_db` |
 | **`ecommerce_production`** | Production-scale transactional benchmark dataset | `categories`, `products`, `customers`, `orders`, `order_items` | 5,000 rows | `postgresql://postgres:postgres_password@localhost:5434/ecommerce_production` | `postgresql://postgres:postgres_password@host.docker.internal:5434/ecommerce_production` | `postgresql://postgres:postgres_password@postgres:5432/ecommerce_production` |
 | **`gaming_telemetry_pg`** | Gaming Universe Telemetry (NoSQL/Document Domain in PostgreSQL with JSONB) | `players`, `player_characters`, `inventory_items`, `match_sessions`, `combat_events` | 2,500 rows (500/table) | `postgresql://postgres:postgres_password@localhost:5434/gaming_telemetry_pg` | `postgresql://postgres:postgres_password@host.docker.internal:5434/gaming_telemetry_pg` | `postgresql://postgres:postgres_password@postgres:5432/gaming_telemetry_pg` |
+| **`retail_store_pg`** | Physical POS Retail Store (Multi-source merge pair with `retail_online_mysql`, unique POS columns & deliberate NULLs) | `customers`, `products`, `orders` | 90 rows (30 cust, 25 prod, 35 ord) | `postgresql://postgres:postgres_password@localhost:5434/retail_store_pg` | `postgresql://postgres:postgres_password@host.docker.internal:5434/retail_store_pg` | `postgresql://postgres:postgres_password@postgres:5432/retail_store_pg` |
+| **`retail_merged_pg`** | Unified Target Database (Destination for multi-source merge of `retail_store_pg` + `retail_online_mysql`) | *Empty, ready for migration DDL* | Target Sink | `postgresql://postgres:postgres_password@localhost:5434/retail_merged_pg` | `postgresql://postgres:postgres_password@host.docker.internal:5434/retail_merged_pg` | `postgresql://postgres:postgres_password@postgres:5432/retail_merged_pg` |
 
 
 ---
@@ -130,6 +132,7 @@ When creating an agent or configuring a migration pipeline in the web UI at `htt
 | **`complex_mysql_db`** | Legacy ERP Enterprise System (Chart of accounts, journals) | `mysql_accounts`, `mysql_inventory`, `mysql_audit_logs` | 300+ rows | `mysql+pymysql://root:mysql_password@localhost:3307/complex_mysql_db` | `mysql+pymysql://root:mysql_password@host.docker.internal:3307/complex_mysql_db` | `mysql+pymysql://root:mysql_password@mysql_source:3306/complex_mysql_db` |
 | **`inventory_production`** | High-volume production supply chain dataset | `warehouses`, `suppliers`, `products_catalog`, `inventory_items`, `stock_transfers` | 5,000 rows | `mysql+pymysql://root:mysql_password@localhost:3307/inventory_production` | `mysql+pymysql://root:mysql_password@host.docker.internal:3307/inventory_production` | `mysql+pymysql://root:mysql_password@mysql_source:3306/inventory_production` |
 | **`gaming_economy_mysql`** | Gaming Virtual Economy & Auctions (NoSQL/Document Domain in MySQL with JSON) | `guilds`, `guild_members`, `auction_listings`, `auction_transactions`, `quest_progressions` | 2,500 rows (500/table) | `mysql+pymysql://root:mysql_password@localhost:3307/gaming_economy_mysql` | `mysql+pymysql://root:mysql_password@host.docker.internal:3307/gaming_economy_mysql` | `mysql+pymysql://root:mysql_password@mysql_source:3306/gaming_economy_mysql` |
+| **`retail_online_mysql`** | Online Web Store (Multi-source merge pair with `retail_store_pg`, unique Web columns & deliberate NULLs) | `customers`, `products`, `orders` | 90 rows (30 cust, 25 prod, 35 ord) | `mysql+pymysql://root:mysql_password@localhost:3307/retail_online_mysql` | `mysql+pymysql://root:mysql_password@host.docker.internal:3307/retail_online_mysql` | `mysql+pymysql://root:mysql_password@mysql_source:3306/retail_online_mysql` |
 
 
 ---
@@ -253,6 +256,8 @@ PG_RETAIL_COMMERCE_URL="postgresql://postgres:postgres_password@localhost:5434/r
 PG_COMPLEX_URL="postgresql://postgres:postgres_password@localhost:5434/complex_pg_db"
 PG_PRODUCTION_URL="postgresql://postgres:postgres_password@localhost:5434/ecommerce_production"
 PG_GAMING_TELEMETRY_URL="postgresql://postgres:postgres_password@localhost:5434/gaming_telemetry_pg"
+PG_RETAIL_STORE_URL="postgresql://postgres:postgres_password@localhost:5434/retail_store_pg"
+PG_RETAIL_MERGED_URL="postgresql://postgres:postgres_password@localhost:5434/retail_merged_pg"
 
 
 # ------------------------------------------------------------------------------
@@ -269,6 +274,7 @@ MYSQL_RETAIL_LOGISTICS_URL="mysql+pymysql://root:mysql_password@localhost:3307/r
 MYSQL_COMPLEX_URL="mysql+pymysql://root:mysql_password@localhost:3307/complex_mysql_db"
 MYSQL_PRODUCTION_URL="mysql+pymysql://root:mysql_password@localhost:3307/inventory_production"
 MYSQL_GAMING_ECONOMY_URL="mysql+pymysql://root:mysql_password@localhost:3307/gaming_economy_mysql"
+MYSQL_RETAIL_ONLINE_URL="mysql+pymysql://root:mysql_password@localhost:3307/retail_online_mysql"
 
 
 # ------------------------------------------------------------------------------

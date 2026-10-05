@@ -2087,3 +2087,45 @@ sequenceDiagram
 - **[MODIFIED]**: [`database_credentials.env`](file:///d:/GitHub/Ai_data_migration_platform/database_credentials.env) — Added `PG_GAMING_TELEMETRY_URL` and `MYSQL_GAMING_ECONOMY_URL`.
 - **[MODIFIED]**: [`docs/DECISIONS.md`](file:///d:/GitHub/Ai_data_migration_platform/docs/DECISIONS.md) — Recorded architectural decision log for modeling document-oriented NoSQL domains in RDBMS.
 - **[UNCHANGED]**: Existing databases (`migration_platform`, `ecommerce_db`, `crm_db`, `inventory_db`, etc.) and API service routes.
+
+---
+
+# Execution Flow - Multi-Source Dynamic Identifier Resolution & Docker Agent Image Standardization
+
+## 1. Entry Point
+
+- **File**: [`apps/agent/engine/orchestrator.py:L289`](file:///d:/GitHub/Ai_data_migration_platform/apps/agent/engine/orchestrator.py#L289)
+- **Trigger**: Invocation of `ASTTransformer.transform_chunk()` during multi-source table migration loop when streaming data chunks from distinct source engines (e.g. `retail_store_pg` and `retail_online_mysql`).
+
+## 2. Step-by-Step Execution Sequence
+
+1. **Extraction with Lineage Tagging**:
+   - `ExecutionOrchestrator` iterates through configured source tables in the migration plan.
+   - For `src_db_1.customers`, `src_origin_tag = "src_db_1.customers"`.
+   - For `src_db_2.customers`, `src_origin_tag = "src_db_2.customers"`.
+2. **Active Source Identifier Resolution**:
+   - `ASTTransformer.transform_chunk()` parses `active_src_ident` from `source_origin` (e.g., `"src_db_2.customers"` $\rightarrow$ `"src_db_2"`).
+   - In `_resolve_src_col()`, Priority 0 specifically looks up the column configuration matching `active_src_ident` before falling back to generic column name matching.
+   - In `_resolve_src_ident()`, it returns `active_src_ident` rather than blindly picking `source_cols[0]`.
+3. **Partitioned Deterministic Primary & Foreign Key Generation**:
+   - Primary key UUID v5 generation computes `uuid5(NAMESPACE_DNS, f"{src_ident}_{v}")`.
+   - `src_db_1` row 1 (`id=1`) produces `uuid5(NAMESPACE_DNS, "src_db_1_1")` $\rightarrow$ `a9144a57-834e-5781-87fb-429bd8f9d18f`.
+   - `src_db_2` row 1 (`id=1`) produces `uuid5(NAMESPACE_DNS, "src_db_2_1")` $\rightarrow$ `34f9e02b-fe96-5ec8-a705-4750fa02ade5`.
+   - Foreign key UUID v5 generation in child tables (e.g., `orders.customer_id`) applies the same matching `src_ident` partition key, preserving parent-child referential integrity.
+4. **DuckDB Staging & Target Insertion**:
+   - DuckDB stages all 180 rows across both sources.
+   - Target writer executes `INSERT INTO ... ON CONFLICT DO NOTHING;`.
+   - Because UUIDs are 100% disjoint across sources, zero collisions occur, and all 180 rows are successfully committed to the target database.
+5. **Standardized Docker Container Delivery**:
+   - Built under single canonical image: `nmaru094123/data-migration-agent:latest` (and local alias `data-migration-agent:latest`).
+   - Pushed directly to Docker Hub registry under repository `nmaru094123/data-migration-agent`.
+   - Purged obsolete image tags (`migraflow-agent`) from local Docker daemon.
+
+## 3. Impact & Delta Analysis (AI Modifications)
+
+- **[FIXED]**: [`apps/agent/engine/transformers/ast_transformer.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/agent/engine/transformers/ast_transformer.py) — Dynamic `_resolve_src_ident()` and `_resolve_src_col()` resolving active chunk source identifier from `source_origin`.
+- **[NEW TEST]**: [`apps/agent/tests/test_ast_transformer.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/agent/tests/test_ast_transformer.py) — Added `test_multi_source_merge_uuid_uniqueness()`, verified passing.
+- **[BUILD & PUSH]**: Rebuilt `nmaru094123/data-migration-agent:latest` and pushed to Docker Hub (`sha256:3e3c2117ad624dc18cc28e64b11b39d3d01584b0155590648a6d327e5b0866c3`).
+- **[CLEANUP]**: Removed local `migraflow-agent` image tags from the Docker engine.
+- **[MODIFIED]**: [`docs/DECISIONS.md`](file:///d:/GitHub/Ai_data_migration_platform/docs/DECISIONS.md) & [`docs/EXECUTION_FLOW.md`](file:///d:/GitHub/Ai_data_migration_platform/docs/EXECUTION_FLOW.md) — Documented decision and execution flow.
+

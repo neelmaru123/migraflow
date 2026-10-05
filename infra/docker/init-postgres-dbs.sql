@@ -27,3 +27,11 @@ WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'ecommerce_production'
 SELECT 'CREATE DATABASE gaming_telemetry_pg'
 WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'gaming_telemetry_pg')\gexec
 
+-- 7. Retail Store POS Database (Multi-Source Merge Test Source)
+SELECT 'CREATE DATABASE retail_store_pg'
+WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'retail_store_pg')\gexec
+
+-- 8. Retail Merged Target Database (Unified Destination for Multi-Source Merges)
+SELECT 'CREATE DATABASE retail_merged_pg'
+WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'retail_merged_pg')\gexec
+
