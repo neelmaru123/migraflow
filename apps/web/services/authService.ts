@@ -102,7 +102,7 @@ export const authService = {
   },
 
   /**
-   * Export all user data (UK GDPR Art. 20 Right to Data Portability) (GET /users/me/export)
+   * Export all user data as JSON (GET /users/me/export)
    */
   async exportUserData(): Promise<any> {
     const response = await apiClient.get('/users/me/export');

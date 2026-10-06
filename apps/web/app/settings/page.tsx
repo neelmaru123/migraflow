@@ -2,8 +2,8 @@ import React from 'react';
 import { AccountSettingsView } from '@/components/settings/AccountSettingsView';
 
 export const metadata = {
-  title: 'Account Settings & Privacy — Migraflow',
-  description: 'Manage account credentials, data portability export, and privacy preferences.',
+  title: 'Account Settings — Migraflow',
+  description: 'Manage account profile, credentials, and data export.',
 };
 
 export default function SettingsPage() {
