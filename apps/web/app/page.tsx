@@ -5,7 +5,6 @@ import DatabaseFlowDiagram from '../components/landing/DatabaseFlowDiagram';
 import FeaturesGrid from '../components/landing/FeaturesGrid';
 import WorkflowSteps from '../components/landing/WorkflowSteps';
 import Footer from '../components/landing/Footer';
-import ScrollLightLine from '../components/landing/ScrollLightLine';
 
 export const metadata = {
   title: 'Migraflow | High-Performance Database Schema & ETL Migration Platform',
@@ -19,15 +18,14 @@ export default function LandingPage() {
       <Navbar />
       <Hero />
 
-      {/* Content Sections below Hero with Animated Scroll Light Line */}
+      {/* Content Sections below Hero */}
       <div className="relative">
-        <ScrollLightLine />
         <DatabaseFlowDiagram />
         <FeaturesGrid />
         <WorkflowSteps />
       </div>
 
-      {/* Footer rendered outside the scroll light line container */}
+      {/* Footer rendered outside the content sections container */}
       <Footer />
     </main>
   );

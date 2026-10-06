@@ -57,11 +57,14 @@ class CredentialSanitizer:
         r'-----BEGIN [A-Z ]+PRIVATE KEY-----[\s\S]+?-----END [A-Z ]+PRIVATE KEY-----',
         re.MULTILINE,
     )
+    # UK GDPR Art. 5(1)(c) Data Minimization Patterns
+    PG_KEY_VAL_PATTERN = re.compile(r'Key\s*\(([^)]+)\)\s*=\s*\(([^)]+)\)', re.IGNORECASE)
+    EMAIL_PATTERN = re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,7}\b')
 
     @classmethod
     def mask_credentials(cls, text: Optional[str]) -> str:
         """
-        Redacts credentials, connection URIs, and bearer tokens from a string.
+        Redacts credentials, connection URIs, bearer tokens, and PII from a string.
         """
         if not text:
             return ""
@@ -79,6 +82,12 @@ class CredentialSanitizer:
 
         # 4. Mask PEM Private Keys
         masked = cls.PRIVATE_KEY_PATTERN.sub('***REDACTED PRIVATE KEY***', masked)
+
+        # 5. Mask SQL constraint values that may contain sensitive row PII: Key (col)=(val)
+        masked = cls.PG_KEY_VAL_PATTERN.sub(r'Key (\1)=(***REDACTED_VALUE***)', masked)
+
+        # 6. Mask raw emails
+        masked = cls.EMAIL_PATTERN.sub('***REDACTED_EMAIL***', masked)
 
         return masked
 

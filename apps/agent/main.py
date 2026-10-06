@@ -31,6 +31,7 @@ def sync_metadata_snapshots(backend_url: str, agent_token: str):
     }
 
     seen_identifiers = set()
+    seen_urls = set()
     db_env_keys = sorted(
         [
             k for k in os.environ.keys()
@@ -38,16 +39,20 @@ def sync_metadata_snapshots(backend_url: str, agent_token: str):
         ],
         key=lambda k: (
             1 if any(tag in k for tag in ("DEST_", "DEST_DB", "DST_")) else 0,
+            1 if k in ("SOURCE_DB_URL", "DEST_DB_URL") else 0,
             int(re.findall(r'\d+', k)[-1]) if re.findall(r'\d+', k) else 0,
             k,
         ),
     )
     for k in db_env_keys:
-        v = os.environ[k]
+        v = _sanitize_db_url(os.environ[k])
+        if not v or v in seen_urls:
+            continue
         ident = extract_identifier_from_env_key(k)
         if ident in seen_identifiers:
             continue
         seen_identifiers.add(ident)
+        seen_urls.add(v)
 
         logger.info(f"Executing metadata schema introspection for database '{ident}'...")
         snapshot_data = AgentMetadataEngine.introspect_database(ident, v)

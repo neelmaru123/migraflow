@@ -3,6 +3,7 @@ FastAPI Application Entry Point
 """
 
 import asyncio
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -95,22 +96,33 @@ app.include_router(evaluation_router, prefix=settings.API_V1_STR)
 
 
 # CORS Middleware Setup
-if "*" in settings.CORS_ORIGINS:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origin_regex=r"^https?://.*$",
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-else:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=settings.CORS_ORIGINS,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+# In compliance with UK GDPR / PECR (GDPR-SEC-001): Never use allow_origin_regex="^https?://.*$" with allow_credentials=True.
+cors_origins = [origin.rstrip("/") for origin in settings.CORS_ORIGINS if origin != "*"]
+clean_frontend = settings.FRONTEND_URL.rstrip("/")
+if clean_frontend and clean_frontend not in cors_origins:
+    cors_origins.append(clean_frontend)
+
+host_ip = os.getenv("HOST_IP") or os.getenv("PUBLIC_IP")
+if host_ip:
+    clean_ip = host_ip.strip()
+    for proto in ("http", "https"):
+        ip_origin = f"{proto}://{clean_ip}:3000"
+        if ip_origin not in cors_origins:
+            cors_origins.append(ip_origin)
+        ip_root = f"{proto}://{clean_ip}"
+        if ip_root not in cors_origins:
+            cors_origins.append(ip_root)
+
+if not cors_origins:
+    cors_origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 from fastapi import Request, status

@@ -34,6 +34,7 @@ from app.modules.users.users_schemas import (
     MessageResponse,
     ResetPasswordRequest,
     TokenResponse,
+    UserDataExport,
     UserLogin,
     UserRegister,
     UserResponse,
@@ -430,27 +431,16 @@ async def forgot_password(
     """
     Generate a 5-minute password reset link and dispatch it via Google Gmail SMTP.
     Rate-limited via Redis: Users must wait 60 seconds before requesting another reset email.
+    UK GDPR / OWASP compliance: Prevents user enumeration by returning a generic response.
     """
+    GENERIC_RESPONSE = MessageResponse(
+        message="If an account matches that email address, a password reset link has been dispatched."
+    )
+
     # 1. Check if user exists
     user = await UserService.get_user_by_email(db, payload.email)
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="No account found with this email address. Please check your email or register.",
-        )
-
-    # Check if user registered via Google only without password
-    if user.google_id and not user.password_hash:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="This account was registered using Google Sign-In. Please sign in with Google.",
-        )
-
-    if not user.is_active:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="This user account is deactivated.",
-        )
+    if not user or not user.is_active or (user.google_id and not user.password_hash):
+        return GENERIC_RESPONSE
 
     # 2. Check 1-minute rate limiting cooldown
     remaining_seconds = await PasswordResetCache.check_rate_limit(payload.email)
@@ -483,9 +473,7 @@ async def forgot_password(
         user_name=user.name,
     )
 
-    return MessageResponse(
-        message=f"Password reset link has been dispatched to {user.email}."
-    )
+    return GENERIC_RESPONSE
 
 
 @router.post(
@@ -543,6 +531,24 @@ async def get_my_profile(current_user: User = Depends(get_current_active_user)):
     return UserResponse.model_validate(current_user)
 
 
+@router.get(
+    "/users/me/export",
+    response_model=UserDataExport,
+    summary="Export all account data (UK GDPR Art. 20 Right to Data Portability)",
+)
+async def export_my_data(
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    UK GDPR Article 20 Right to Data Portability:
+    Export all user profile details, registered agents, created migration plans,
+    migration jobs, and configured data sources in machine-readable JSON format.
+    """
+    data = await UserService.export_user_data(db, current_user)
+    return UserDataExport.model_validate(data)
+
+
 @router.put(
     "/users/me",
     response_model=UserResponse,
@@ -584,7 +590,12 @@ async def get_user_by_id(
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Fetch user profile by UUID (Requires authentication)."""
+    """Fetch user profile by UUID (Requires authorization - GDPR-SEC-002)."""
+    if current_user.id != user_id and not getattr(current_user, "is_superuser", False):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access forbidden: You cannot view other users' profiles.",
+        )
     user = await UserService.get_user_by_id(db, user_id)
     if not user:
         raise HTTPException(
@@ -597,7 +608,7 @@ async def get_user_by_id(
 @router.get(
     "/users",
     response_model=List[UserResponse],
-    summary="List all users (Paginated)",
+    summary="List users (Admin only or self)",
 )
 async def list_users(
     skip: int = 0,
@@ -605,6 +616,8 @@ async def list_users(
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """List registered users with pagination (Requires authentication)."""
-    users = await UserService.list_users(db, skip=skip, limit=limit)
-    return [UserResponse.model_validate(u) for u in users]
+    """List registered users with pagination (Restricted to superusers or self - GDPR-SEC-002)."""
+    if getattr(current_user, "is_superuser", False):
+        users = await UserService.list_users(db, skip=skip, limit=limit)
+        return [UserResponse.model_validate(u) for u in users]
+    return [UserResponse.model_validate(current_user)]
