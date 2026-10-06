@@ -51,7 +51,12 @@ jobs:
             docker stop migration_platform_postgres migration_platform_redis migration_platform_api migration_platform_web 2>/dev/null || true
             docker rm -f migration_platform_postgres migration_platform_redis migration_platform_api migration_platform_web 2>/dev/null || true
             docker rm -f $(docker ps -aq --filter "name=migration_platform") 2>/dev/null || true
-            docker compose up -d --force-recreate --remove-orphans
+            if ! docker compose up -d --force-recreate --remove-orphans; then
+              echo "=== Deployment failed! Printing API container logs ==="
+              docker logs migration_platform_api || true
+              docker compose logs --tail=50 || true
+              exit 1
+            fi
 
             echo "=== Pruning dangling Docker build cache and images ==="
             docker image prune -f
