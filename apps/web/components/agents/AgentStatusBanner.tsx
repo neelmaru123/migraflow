@@ -41,44 +41,42 @@ export const AgentStatusBanner: React.FC<AgentStatusBannerProps> = ({
 
   // Subscribe to real-time WebSocket for live heartbeat ping & METADATA_PROFILED events
   useEffect(() => {
-    const token = agent.api_token || (typeof window !== 'undefined' ? localStorage.getItem('access_token') : null);
+    const token = agent.api_token || '';
     if (!agent.id) return;
 
     let ws: WebSocket | null = null;
     try {
-      if (token) {
-        ws = agentService.connectAgentWebSocket(
-          agent.id,
-          token,
-          (eventData) => {
-            if (eventData.status) {
-              setStatus(eventData.status);
-              if (onStatusChange) onStatusChange(eventData.status);
-            }
-            if (eventData.last_seen_at) {
-              setLastSeen(eventData.last_seen_at);
-            }
-            if (eventData.data_sources && Array.isArray(eventData.data_sources)) {
-              setDataSources(sortDataSources(eventData.data_sources));
-            }
-            if (eventData.last_error !== undefined) {
-              setLastError(eventData.last_error);
-            }
-            if (eventData.error_category !== undefined) {
-              setErrorCategory(eventData.error_category);
-            }
-            if (eventData.last_error_at !== undefined) {
-              setLastErrorAt(eventData.last_error_at);
-            }
-            const isMetadataProfiled =
-              eventData.event === 'METADATA_PROFILED' ||
-              eventData.event_type === 'METADATA_PROFILED';
-            if (isMetadataProfiled && onMetadataProfiled) {
-              onMetadataProfiled();
-            }
+      ws = agentService.connectAgentWebSocket(
+        agent.id,
+        token,
+        (eventData) => {
+          if (eventData.status) {
+            setStatus(eventData.status);
+            if (onStatusChange) onStatusChange(eventData.status);
           }
-        );
-      }
+          if (eventData.last_seen_at) {
+            setLastSeen(eventData.last_seen_at);
+          }
+          if (eventData.data_sources && Array.isArray(eventData.data_sources)) {
+            setDataSources(sortDataSources(eventData.data_sources));
+          }
+          if (eventData.last_error !== undefined) {
+            setLastError(eventData.last_error);
+          }
+          if (eventData.error_category !== undefined) {
+            setErrorCategory(eventData.error_category);
+          }
+          if (eventData.last_error_at !== undefined) {
+            setLastErrorAt(eventData.last_error_at);
+          }
+          const isMetadataProfiled =
+            eventData.event === 'METADATA_PROFILED' ||
+            eventData.event_type === 'METADATA_PROFILED';
+          if (isMetadataProfiled && onMetadataProfiled) {
+            onMetadataProfiled();
+          }
+        }
+      );
     } catch {
       // WS Fallback
     }

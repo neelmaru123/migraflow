@@ -282,7 +282,7 @@ class AgentService:
         if agent.last_seen_at and heartbeat.status == agent.status and not heartbeat.data_sources:
             last_seen = agent.last_seen_at if agent.last_seen_at.tzinfo else agent.last_seen_at.replace(tzinfo=timezone.utc)
             if (now - last_seen).total_seconds() < 0.1:
-                return agent
+                return AgentResponse.model_validate(agent)
 
         previous_status = agent.status
         agent.status = heartbeat.status.strip()
@@ -367,7 +367,7 @@ class AgentService:
                         "role": ds.role,
                         "status": ds.status,
                         "last_error": ds.last_error,
-                        "last_checked_at": ds.last_checked_at.isoformat(),
+                        "last_checked_at": ds.last_checked_at.isoformat() if ds.last_checked_at else None,
                     })
                 else:
                     logger.debug(
@@ -593,7 +593,7 @@ class AgentService:
                 "status": "error",
                 "last_error": agent.last_error,
                 "error_category": agent.error_category,
-                "last_error_at": agent.last_error_at.isoformat(),
+                "last_error_at": agent.last_error_at.isoformat() if agent.last_error_at else None,
             },
         )
 
@@ -663,7 +663,7 @@ class AgentService:
                             "event": "AGENT_CONNECTED",
                             "agent_id": str(agent.id),
                             "status": "online",
-                            "last_seen_at": agent.last_seen_at.isoformat(),
+                            "last_seen_at": agent.last_seen_at.isoformat() if agent.last_seen_at else None,
                         },
                     )
 
@@ -712,13 +712,17 @@ class AgentService:
 
         for agent, effective_threshold in stale_agents:
             # Keep agent online if job is actively reporting progress AND agent was seen recently
-            stmt_active_job = select(MigrationJob).where(
-                MigrationJob.agent_id == agent.id,
-                MigrationJob.status.in_(["running", "preparing"]),
-                MigrationJob.updated_at >= active_cutoff,
+            stmt_active_job = (
+                select(MigrationJob)
+                .where(
+                    MigrationJob.agent_id == agent.id,
+                    MigrationJob.status.in_(["running", "preparing", "verifying", "recovering", "claimed"]),
+                    MigrationJob.updated_at >= active_cutoff,
+                )
+                .limit(1)
             )
             res_active_job = await session.execute(stmt_active_job)
-            active_job = res_active_job.scalar_one_or_none()
+            active_job = res_active_job.scalars().first()
             if active_job and agent.last_seen_at and agent.last_seen_at >= active_cutoff:
                 continue
 
@@ -743,7 +747,7 @@ class AgentService:
                     "reason": "heartbeat_timeout",
                     "last_error": agent.last_error,
                     "error_category": agent.error_category,
-                    "last_error_at": agent.last_error_at.isoformat(),
+                    "last_error_at": agent.last_error_at.isoformat() if agent.last_error_at else None,
                     "last_seen_at": agent.last_seen_at.isoformat() if agent.last_seen_at else None,
                 },
             )
@@ -751,7 +755,10 @@ class AgentService:
             # 2. Check for active/running/queued migration jobs linked to this dead agent
             stmt_jobs = select(MigrationJob).where(
                 MigrationJob.agent_id == agent.id,
-                MigrationJob.status.in_(["queued", "running", "preparing"]),
+                MigrationJob.status.in_([
+                    "queued", "claimed", "preparing", "running",
+                    "recovering", "verifying", "ask_user",
+                ]),
             )
             res_jobs = await session.execute(stmt_jobs)
             running_jobs = list(res_jobs.scalars().all())
@@ -764,6 +771,40 @@ class AgentService:
                 logger.error(
                     f"MigrationJob '{job.id}' failed due to agent '{agent.id}' timeout."
                 )
+
+                # Cascade failure to attached execution plan and running steps
+                from app.modules.execution.execution_models import (
+                    MigrationExecutionPlan,
+                    MigrationExecutionStep,
+                )
+                from app.core.state import ExecutionPlanLifecycle, ExecutionStepLifecycle
+                stmt_plan = (
+                    select(MigrationExecutionPlan)
+                    .where(MigrationExecutionPlan.migration_job_id == job.id)
+                    .options(selectinload(MigrationExecutionPlan.steps))
+                )
+                res_plan = await session.execute(stmt_plan)
+                exec_plan = res_plan.scalar_one_or_none()
+                if exec_plan and exec_plan.status not in (
+                    ExecutionPlanLifecycle.COMPLETED.value,
+                    ExecutionPlanLifecycle.FAILED.value,
+                    ExecutionPlanLifecycle.CANCELLED.value,
+                ):
+                    exec_plan.status = ExecutionPlanLifecycle.FAILED.value
+                    exec_plan.finalized_at = datetime.now(timezone.utc)
+                    for s in exec_plan.steps:
+                        if s.status in (
+                            ExecutionStepLifecycle.PENDING.value,
+                            ExecutionStepLifecycle.RUNNING.value,
+                            ExecutionStepLifecycle.RETRYING.value,
+                            ExecutionStepLifecycle.ASK_USER.value,
+                        ):
+                            s.status = ExecutionStepLifecycle.FAILED.value
+                            s.failure_category = "AGENT_DISCONNECTED"
+                            s.failure_code = "ERR_AGENT_TIMEOUT"
+                            s.error_message = "Agent disconnected or timed out during migration execution."
+                            s.finished_at = datetime.now(timezone.utc)
+                            s.updated_at = datetime.now(timezone.utc)
 
                 # Broadcast job failure event
                 await manager.broadcast_to_agent(

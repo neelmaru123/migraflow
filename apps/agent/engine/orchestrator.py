@@ -414,3 +414,16 @@ class ExecutionOrchestrator:
                 dispose_all_engines()
             except Exception:
                 pass
+
+            # UK GDPR Art. 5(1)(e) Storage Limitation: Purge all local staging files for this job
+            try:
+                if os.path.exists(tmp_dir):
+                    for fname in os.listdir(tmp_dir):
+                        if fname.startswith(f"staging_{job_id}_") and fname.endswith(".duckdb"):
+                            try:
+                                os.remove(os.path.join(tmp_dir, fname))
+                                logger.info(f"Cleaned up staging file upon job termination: {fname}")
+                            except Exception:
+                                pass
+            except Exception:
+                pass

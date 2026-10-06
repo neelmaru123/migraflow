@@ -237,3 +237,114 @@ class UserService:
         await db.refresh(user)
         return user
 
+    @staticmethod
+    async def export_user_data(db: AsyncSession, user: User) -> dict:
+        """
+        Aggregate all user data across agents, migration plans, jobs, and sources
+        for UK GDPR Article 20 Right to Data Portability.
+        """
+        from datetime import datetime, timezone
+        from app.modules.agents.agents_models import Agent
+        from app.modules.migration_plans.migration_plans_models import MigrationPlan
+        from app.modules.execution.execution_models import MigrationJob
+        from app.modules.sources.sources_models import DataSource
+
+        # Fetch Agents
+        agents_stmt = select(Agent).where(Agent.user_id == user.id)
+        agents_res = await db.execute(agents_stmt)
+        agents = agents_res.scalars().all()
+        agent_ids = [a.id for a in agents]
+
+        # Fetch Data Sources
+        sources_list = []
+        if agent_ids:
+            sources_stmt = select(DataSource).where(DataSource.agent_id.in_(agent_ids))
+            sources_res = await db.execute(sources_stmt)
+            sources = sources_res.scalars().all()
+            for s in sources:
+                sources_list.append({
+                    "id": str(s.id),
+                    "agent_id": str(s.agent_id),
+                    "name": getattr(s, "name", ""),
+                    "type": getattr(s, "type", ""),
+                    "role": getattr(s, "role", "source"),
+                    "identifier": getattr(s, "identifier", ""),
+                    "status": getattr(s, "status", "untested"),
+                    "created_at": s.created_at.isoformat() if getattr(s, "created_at", None) else None,
+                })
+
+        # Fetch Plans
+        plans_stmt = select(MigrationPlan).where(MigrationPlan.user_id == user.id)
+        plans_res = await db.execute(plans_stmt)
+        plans = plans_res.scalars().all()
+        plan_ids = [p.id for p in plans]
+
+        # Fetch Jobs
+        jobs_list = []
+        if plan_ids:
+            jobs_stmt = select(MigrationJob).where(MigrationJob.migration_plan_id.in_(plan_ids))
+            jobs_res = await db.execute(jobs_stmt)
+            jobs = jobs_res.scalars().all()
+            for j in jobs:
+                jobs_list.append({
+                    "id": str(j.id),
+                    "migration_plan_id": str(j.migration_plan_id),
+                    "agent_id": str(j.agent_id) if getattr(j, "agent_id", None) else None,
+                    "status": getattr(j, "status", "unknown"),
+                    "is_dry_run": getattr(j, "is_dry_run", False),
+                    "progress": getattr(j, "progress", 0.0),
+                    "total_rows": getattr(j, "total_rows", 0),
+                    "processed_rows": getattr(j, "processed_rows", 0),
+                    "successful_rows": getattr(j, "successful_rows", 0),
+                    "failed_rows": getattr(j, "failed_rows", 0),
+                    "started_at": j.started_at.isoformat() if getattr(j, "started_at", None) else None,
+                    "completed_at": j.completed_at.isoformat() if getattr(j, "completed_at", None) else None,
+                    "created_at": j.created_at.isoformat() if getattr(j, "created_at", None) else None,
+                })
+
+        agents_data = [
+            {
+                "id": str(a.id),
+                "name": getattr(a, "name", ""),
+                "agent_identifier": getattr(a, "agent_identifier", ""),
+                "status": getattr(a, "status", "offline"),
+                "version": getattr(a, "version", None),
+                "last_seen_at": a.last_seen_at.isoformat() if getattr(a, "last_seen_at", None) else None,
+                "idle_since": a.idle_since.isoformat() if getattr(a, "idle_since", None) else None,
+                "created_at": a.created_at.isoformat() if getattr(a, "created_at", None) else None,
+                "updated_at": a.updated_at.isoformat() if getattr(a, "updated_at", None) else None,
+            }
+            for a in agents
+        ]
+
+        plans_data = [
+            {
+                "id": str(p.id),
+                "status": getattr(p, "status", "draft"),
+                "agent_id": str(p.agent_id) if getattr(p, "agent_id", None) else None,
+                "ai_model": getattr(p, "ai_model", None),
+                "confidence_score": getattr(p, "confidence_score", 1.0),
+                "approved_version_number": getattr(p, "approved_version_number", None),
+                "created_at": p.created_at.isoformat() if getattr(p, "created_at", None) else None,
+                "updated_at": p.updated_at.isoformat() if getattr(p, "updated_at", None) else None,
+            }
+            for p in plans
+        ]
+
+        return {
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "user": {
+                "id": str(user.id),
+                "email": user.email,
+                "name": user.name,
+                "is_active": user.is_active,
+                "is_superuser": getattr(user, "is_superuser", False),
+                "created_at": user.created_at.isoformat() if user.created_at else None,
+                "updated_at": user.updated_at.isoformat() if user.updated_at else None,
+            },
+            "agents": agents_data,
+            "migration_plans": plans_data,
+            "migration_jobs": jobs_list,
+            "data_sources": sources_list,
+        }
+

@@ -100,6 +100,30 @@ export const authService = {
     const response = await apiClient.delete<MessageResponse>('/users/me');
     return response.data;
   },
+
+  /**
+   * Export all user data (UK GDPR Art. 20 Right to Data Portability) (GET /users/me/export)
+   */
+  async exportUserData(): Promise<any> {
+    const response = await apiClient.get('/users/me/export');
+    return response.data;
+  },
+
+  /**
+   * Trigger browser file download of user data export JSON
+   */
+  async downloadUserDataExport(): Promise<void> {
+    const data = await this.exportUserData();
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = window.URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.setAttribute('download', `migraflow_data_export_${new Date().toISOString().split('T')[0]}.json`);
+    document.body.appendChild(link);
+    link.click();
+    link.parentNode?.removeChild(link);
+    window.URL.revokeObjectURL(url);
+  },
 };
 
 export default authService;

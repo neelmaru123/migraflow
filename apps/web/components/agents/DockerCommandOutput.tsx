@@ -77,21 +77,19 @@ export const DockerCommandOutput: React.FC<DockerCommandOutputProps> = ({
 
   // Subscribe to real-time WebSocket for live heartbeat ping
   useEffect(() => {
-    const token = agent.api_token || localStorage.getItem('access_token');
+    const token = agent.api_token || '';
     if (!agent.id) return;
 
     let ws: WebSocket | null = null;
     try {
-      if (token) {
-        ws = agentService.connectAgentWebSocket(agent.id, token, (eventData) => {
-          if (eventData.status) {
-            setAgentStatus(eventData.status);
-            if (eventData.status === 'online') {
-              toast.success('🎉 Agent container connected and online!');
-            }
+      ws = agentService.connectAgentWebSocket(agent.id, token, (eventData) => {
+        if (eventData.status) {
+          setAgentStatus(eventData.status);
+          if (eventData.status === 'online') {
+            toast.success('🎉 Agent container connected and online!');
           }
-        });
-      }
+        }
+      });
     } catch {
       // WebSocket fallback
     }

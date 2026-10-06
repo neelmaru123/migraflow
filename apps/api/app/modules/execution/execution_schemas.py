@@ -3,7 +3,7 @@ Execution Domain Pydantic Schemas
 """
 
 from datetime import datetime
-from typing import Optional
+from typing import Any, Dict, List, Optional
 from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -13,6 +13,7 @@ class ExecutionStartRequest(BaseModel):
     chunk_size: Optional[int] = Field(default=50000, ge=1000, le=500000, description="Rows per ETL chunk batch")
     is_dry_run: bool = Field(default=False, description="Simulate migration without executing DDL or writing to target DB")
     truncate_target: bool = Field(default=False, description="Clean wipe/drop all existing tables in target database before executing DDL and migration")
+    idempotency_key: Optional[str] = Field(default=None, max_length=255, description="Client idempotency key to prevent duplicate job submissions")
 
 
 class ExecutionCancelRequest(BaseModel):
@@ -23,6 +24,7 @@ class ExecutionCancelRequest(BaseModel):
 class ExecutionProgressUpdate(BaseModel):
     """Progress metrics payload sent periodically by Docker Agent."""
     status: str = Field(..., examples=["running", "completed", "failed", "ddl_executing", "dry_run_completed"])
+    agent_run_id: Optional[UUID] = Field(default=None, description="Current agent run identity")
     progress: float = Field(default=0.0, ge=0.0, le=100.0)
     total_rows: int = Field(default=0, ge=0)
     processed_rows: int = Field(default=0, ge=0)
@@ -34,6 +36,156 @@ class ExecutionProgressUpdate(BaseModel):
     error_message: Optional[str] = Field(default=None)
 
 
+class AgentRunResponse(BaseModel):
+    """Response model for an AgentRun execution attempt."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    migration_job_id: UUID
+    agent_id: Optional[UUID] = None
+    status: str
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    failure_reason: Optional[str] = None
+    agent_version: Optional[str] = None
+    execution_engine_version: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ExecutionEventResponse(BaseModel):
+    """Response model for an append-only ExecutionEvent."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    event_id: UUID
+    agent_run_id: Optional[UUID] = None
+    migration_job_id: Optional[UUID] = None
+    migration_plan_id: Optional[UUID] = None
+    event_type: str
+    actor_type: str
+    actor_id: Optional[str] = None
+    timestamp: datetime
+    payload: Dict[str, Any]
+    schema_version: int = 1
+
+
+class ExecutionCheckpointCreate(BaseModel):
+    """Payload to save an authoritative checkpoint for a step."""
+    source_identifier: str = Field(default="default", max_length=100)
+    source_table: str = Field(..., max_length=255)
+    target_table: str = Field(..., max_length=255)
+    cursor_offset: int = Field(default=0, ge=0)
+    rows_processed: int = Field(default=0, ge=0)
+    source_position: Optional[Dict[str, Any]] = None
+
+
+class ExecutionCheckpointResponse(BaseModel):
+    """Response model for an ExecutionCheckpoint."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    execution_step_id: UUID
+    source_identifier: str
+    source_table: str
+    target_table: str
+    cursor_offset: int
+    rows_processed: int
+    source_position: Optional[Dict[str, Any]] = None
+    checkpoint_version: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class ExecutionStepResponse(BaseModel):
+    """Response model for a granular MigrationExecutionStep."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    execution_plan_id: UUID
+    step_key: str
+    step_type: str
+    sequence: int
+    dependencies: List[str] = Field(default_factory=list)
+    status: str
+    attempt_count: int
+    max_attempts: int
+    replan_count: int = 0
+    recovery_count: int = 0
+    failure_category: Optional[str] = None
+    failure_code: Optional[str] = None
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    agent_run_id: Optional[UUID] = None
+    input_definition: Dict[str, Any] = Field(default_factory=dict)
+    output_summary: Dict[str, Any] = Field(default_factory=dict)
+    error_type: Optional[str] = None
+    error_message: Optional[str] = None
+    checkpoints: List[ExecutionCheckpointResponse] = Field(default_factory=list)
+    created_at: datetime
+    updated_at: datetime
+
+
+class ExecutionPlanResponse(BaseModel):
+    """Response model for a derived MigrationExecutionPlan."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    migration_job_id: UUID
+    migration_plan_id: UUID
+    migration_plan_version_id: Optional[UUID] = None
+    status: str
+    concurrency_limit: int
+    replan_count: int = 0
+    recovery_count: int = 0
+    steps: List[ExecutionStepResponse] = Field(default_factory=list)
+    created_at: datetime
+    finalized_at: Optional[datetime] = None
+
+
+class UserInterventionResponse(BaseModel):
+    """Response model for an explicit ASK_USER intervention request."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    migration_job_id: UUID
+    step_id: Optional[UUID] = None
+    failure_category: str
+    failure_code: str
+    question: str
+    suggested_action: Optional[str] = None
+    options: List[Dict[str, Any]] = Field(default_factory=list)
+    context_data: Optional[Dict[str, Any]] = None
+    status: str
+    user_response: Optional[Dict[str, Any]] = None
+    resolved_by_user_id: Optional[UUID] = None
+    resolved_at: Optional[datetime] = None
+    created_at: datetime
+
+
+class UserInterventionRespondRequest(BaseModel):
+    """Payload submitted by user when answering an ASK_USER intervention."""
+    action: str  # retry, recover, replan, fail, truncate_and_proceed, manual_edit
+    response_data: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ExecutionStepClaimRequest(BaseModel):
+    """Request payload when an agent claims execution steps."""
+    agent_id: UUID
+    agent_run_id: UUID
+
+
+class ExecutionStepCompleteRequest(BaseModel):
+    """Request payload when completing a step."""
+    output_summary: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ExecutionStepFailRequest(BaseModel):
+    """Request payload when reporting failure on a step."""
+    error_type: Optional[str] = None
+    error_message: str
+
+
 class ExecutionJobResponse(BaseModel):
     """Response model for a MigrationJob execution entity."""
     model_config = ConfigDict(from_attributes=True)
@@ -41,6 +193,8 @@ class ExecutionJobResponse(BaseModel):
     id: UUID
     migration_plan_id: UUID
     agent_id: Optional[UUID] = None
+    current_run_id: Optional[UUID] = None
+    idempotency_key: Optional[str] = None
     status: str
     is_dry_run: bool = False
     truncate_target: bool = False
@@ -64,7 +218,63 @@ class AgentTaskItemResponse(BaseModel):
     """Task item payload returned to Agent when polling GET /api/v1/agents/tasks."""
     job_id: UUID
     migration_plan_id: UUID
+    agent_run_id: Optional[UUID] = None
+    execution_plan_id: Optional[UUID] = None
     status: str
     is_dry_run: bool = False
     truncate_target: bool = False
     created_at: datetime
+
+
+class VerificationResultResponse(BaseModel):
+    """Response DTO for durable post-migration verification result."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    migration_job_id: UUID
+    execution_plan_id: UUID
+    execution_step_id: Optional[UUID] = None
+    check_type: str
+    status: str
+    target_table: Optional[str] = None
+    expected: Optional[Any] = None
+    actual: Optional[Any] = None
+    tolerance: float = 0.0
+    details: Dict[str, Any] = Field(default_factory=dict)
+    error_message: Optional[str] = None
+    created_at: datetime
+
+
+class VerificationRunRequest(BaseModel):
+    """Request payload to manually run or re-evaluate verification suite."""
+    allow_warnings: bool = True
+    row_count_tolerance_pct: float = 0.0
+    max_failed_rows_allowed: int = 0
+    verification_data: Optional[Dict[str, Any]] = None
+
+
+class DestructiveApprovalResponse(BaseModel):
+    """Response DTO for a destructive operation approval record."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    migration_plan_id: UUID
+    plan_version_number: int
+    target_table: str
+    operation_type: str
+    risk_level: str
+    approved_by_user_id: Optional[UUID] = None
+    is_approved: bool
+    is_valid: bool
+    approved_at: Optional[datetime] = None
+    expires_at: Optional[datetime] = None
+    rejection_reason: Optional[str] = None
+    metadata_snapshot: Optional[Dict[str, Any]] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class DestructiveApprovalRejectRequest(BaseModel):
+    """Request payload to reject a destructive operation approval."""
+    reason: str = Field(..., min_length=3, description="Reason for rejection")
+

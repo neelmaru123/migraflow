@@ -2,12 +2,41 @@
 
 This file records all key architectural decisions, technology selections, trade-offs, and design rationale for the **AI Data Migration Platform**.
 
+## [2026-10-05] - UK GDPR, Data Protection Act 2018 & PECR Privacy Remediation
+
+### 1. Decision Summary
+Implemented comprehensive technical privacy, data protection, and cookie compliance remediations across the entire stack. Addressed 17 identified privacy findings covering CORS origin protection, IDOR user isolation, secrets hardening, PECR cookie consent gating with high-performance 3D visual fallback, user rights data portability (Art. 20) and erasure (Art. 17), prompt data minimization (Art. 5(1)(c)), email log masking, WebSocket bearer token security, and local DuckDB staging storage limitation.
+
+### 2. Why This Approach? (Rationale)
+- **Problem Being Solved**: Audit revealed that the platform processed user and operational metadata with gaps in CORS regex wildcard matching, unrestricted user profile endpoints (IDOR), un-gated third-party 3D scripts/iframes prior to user consent, unsanitized database error traces entering third-party LLM prompts, logged plaintext emails, missing self-service data export, and retained local staging files.
+- **Chosen Solution**:
+  - **CORS Strict Origin Whitelisting**: Removed wildcard regex matching with credentials. Enforced strict allowed origin arrays.
+  - **Role-Based Authorization & IDOR Guards**: Added `is_superuser` column to `User` and restricted `/users` and `/users/{user_id}` endpoints to self or superuser.
+  - **PECR Consent Hook & Script Gating**: Developed `useCookieConsent` and `CookieConsentBanner` to gate Spline 3D canvas and tracking behind opt-in consent, rendering a dark ambient fallback when unconsented.
+  - **Data Portability (Art. 20)**: Implemented `GET /api/v1/users/me/export` aggregating user, agents, data sources, plans, and jobs into a machine-readable JSON archive with one-click download.
+  - **Account Erasure (Art. 17)**: Built `/settings` page with self-service account deletion and data export download.
+  - **Prompt Data Minimization (Art. 5(1)(c))**: Enhanced `CredentialSanitizer` to redact emails, SQL constraint detail values, and connection strings from error messages before passing to AI diagnostics.
+  - **PII Log Redaction**: Added `mask_email()` to redact email addresses in server log statements.
+  - **Storage Limitation (Art. 5(1)(e))**: Added automatic staging DuckDB cleanup for the active job in `apps/agent/engine/orchestrator.py` `finally:` block.
+- **Why This Library / Technology**: Standard React custom event dispatching for reactive cookie consent without third-party SaaS SDK overhead; Pydantic V2 model validators for production secrets enforcement.
+
+### 3. Alternatives Considered & Rejected
+- **Alternative A: Commercial Cookie Consent CMP (OneTrust / Cookiebot)**: Rejected due to recurring SaaS subscriptions, external network script dependencies, and latency overhead. A lightweight native React hook and component provides zero-latency, 100% compliant PECR/GDPR consent management.
+- **Alternative B: Blanket Asynchronous Email Export Dispatch**: Rejected in favor of direct machine-readable streaming JSON export via `GET /users/me/export`, giving users immediate instant access to their archive without waiting for email queues.
+
+### 4. Trade-offs & Future Considerations
+- First-time visitors without 3D consent see the high-performance dark ambient canvas fallback instead of the 3D Spline model until they choose "Accept All" or "Enable 3D Visuals". This strictly complies with PECR regulation 6 while preserving 100% functionality.
+
+---
+
 ## [2026-10-01] - Production EC2 Deployment: Redis Promotion to Core Service & Orchestration Hardening
 
 ### 1. Decision Summary
+
 Promoted the **Redis** container from an optional profile (`profiles: ["redis", "all"]`) to a first-class, primary infrastructure service in `docker-compose.yml` with healthchecks, persistent storage volume (`redis_data`), and explicit dependencies in the FastAPI `api` service. Configured automatic environment variable forwarding for Gmail SMTP transactional emails and password recovery, and updated the GitHub Actions EC2 deployment workflow to cleanly manage and recreate the Redis container alongside Postgres, API, and Web.
 
 ### 2. Why This Approach? (Rationale)
+
 - **Problem Being Solved**:
   1. Previously, Redis was gated behind Docker Compose profiles (`profiles: ["redis", "all"]`). When `docker compose up -d` executed on the EC2 production instance, Redis was skipped, leaving the backend unable to persist reset tokens or enforce rate limits.
   2. The `api` service container did not declare `redis` under `depends_on`, allowing the API to start before Redis was ready.
@@ -23,12 +52,14 @@ Promoted the **Redis** container from an optional profile (`profiles: ["redis", 
   - Ensured idempotent database table initialization runs in `lifespan` in `apps/api/app/main.py`.
 
 ### 3. Alternatives Considered & Rejected
+
 - **Alternative A: Running Redis as an external AWS ElastiCache instance**
   - _Rejected_: Introduces significant AWS infrastructure cost ($15–$30/month) for simple token caching and rate-limiting. A lightweight containerized Alpine Redis image consumes < 15MB RAM and is completely sufficient.
 - **Alternative B: Retaining `--profile redis` in deploy scripts**
   - _Rejected_: Fragile. Any developer or CI/CD script running standard `docker compose up` would forget the `--profile` flag, causing silent cache failures. Core platform features must start by default.
 
 ### 4. Trade-offs & Future Considerations
+
 - Redis memory is capped by Docker host limits; memory eviction (`maxmemory-policy allkeys-lru`) can be enabled if cache usage grows under high load.
 
 ---
@@ -36,9 +67,11 @@ Promoted the **Redis** container from an optional profile (`profiles: ["redis", 
 ## [2026-09-30] - Forgot Password Flow: Explicit Account Existence Validation & In-Memory Redis Fallback
 
 ### 1. Decision Summary
+
 Enhanced the Forgot Password recovery flow to provide immediate, actionable feedback to users when an email address is not found in the platform (`HTTP 404 Not Found`), rather than masking the absence behind a deceptive `200 OK` message. Additionally added an in-memory dictionary fallback in `PasswordResetCache` so password reset tokens and rate limits function reliably even if Redis is temporarily offline or experiencing connection hiccups.
 
 ### 2. Why This Approach? (Rationale)
+
 - **Problem Being Solved**:
   1. Generic "If an account exists..." messages cause poor developer and user experience. Users who mistype their email or enter an unregistered address sit waiting indefinitely for emails that will never arrive.
   2. If the local Redis container was stopped, the previous implementation raised unhandled exceptions during token persistence, resulting in cryptic HTTP 500 errors.
@@ -54,12 +87,14 @@ Enhanced the Forgot Password recovery flow to provide immediate, actionable feed
     - If Redis connection fails (`Errno 10061`), operations gracefully fall back to in-memory tracking without crashing the server.
 
 ### 3. Alternatives Considered & Rejected
+
 - **Alternative A: Full User Enumeration Protection (Blind 200 OK)**:
   - _Rejected_: While common in high-risk banking applications, in self-service developer platforms it causes severe user confusion when emails fail to arrive due to typos.
 - **Alternative B: Hard-Crash Without Redis**:
   - _Rejected_: Forcing Redis as a hard blocker causes local development friction if the Redis container is paused.
 
 ### 4. Trade-offs & Future Considerations
+
 - Disclosing that an email does not exist permits determining whether an address is registered on the platform. This is standard and expected for developer and internal tools where usability and clarity are prioritized.
 
 ---
@@ -67,9 +102,11 @@ Enhanced the Forgot Password recovery flow to provide immediate, actionable feed
 ## [2026-09-30] - Forgot Password Flow with 5-Minute Expiring Link, Redis TTL & 1-Minute Rate Limiting
 
 ### 1. Decision Summary
+
 Implemented a secure, high-performance Forgot Password and Reset Password workflow utilizing **Redis** for stateful 5-minute link expiration (`pwd_reset:token:<token>`, TTL=300s) and 1-minute client request rate-limiting (`pwd_reset:rate_limit:<email>`, TTL=60s). Outgoing notification emails are dispatched via **Google Gmail SMTP** with STARTTLS over port 587 using Python's standard library `smtplib` and `email.mime` inside `asyncio.to_thread` for non-blocking execution. The frontend provides a dedicated `/forgot-password` request screen with an active countdown retry timer, and `/reset-password` screen with password complexity validation and automatic token expiration detection.
 
 ### 2. Why This Approach? (Rationale)
+
 - **Problem Being Solved**:
   1. Users who forget their login credentials require a self-service password recovery flow.
   2. Password reset links must be temporary (exactly 5 minutes) and single-use to minimize exposure windows and prevent replay attacks.
@@ -82,6 +119,7 @@ Implemented a secure, high-performance Forgot Password and Reset Password workfl
   - **Consistent Enumeration Defense**: The forgot-password endpoint returns an identical success message regardless of whether an email exists, preventing unauthorized email harvesting.
 
 ### 3. Alternatives Considered & Rejected
+
 - **Alternative A: Database-backed Reset Tokens with Cron Cleanup**
   - _Rejected_: Requires adding migration tables or extra columns (`reset_token`, `reset_token_expires_at`) to PostgreSQL and running periodic database cleanup cron jobs to purge expired tokens. Redis natively handles TTL expiry in memory at sub-millisecond latency.
 - **Alternative B: Pure Stateless JWT Tokens in URL**
@@ -90,6 +128,7 @@ Implemented a secure, high-performance Forgot Password and Reset Password workfl
   - _Rejected_: The user explicitly specified Google/Gmail integration. Built-in SMTP support allows straightforward deployment with existing Google Workspace or Gmail accounts without requiring external SaaS API subscriptions.
 
 ### 4. Trade-offs & Future Considerations
+
 - Requires Redis to be available for password reset tokens and rate limiting (Redis is already containerized as part of the core platform stack).
 - Gmail SMTP imposes daily sending quotas suitable for transactional recovery; if user volume scales into tens of thousands of emails per hour in large production deployments, transitioning to AWS SES or dedicated SMTP relays can be configured transparently via `SMTP_HOST`.
 
@@ -98,9 +137,11 @@ Implemented a secure, high-performance Forgot Password and Reset Password workfl
 ## [2026-09-29] - Intelligent Database Failure Diagnosis with Gemini & Dry Run Schema Validation
 
 ### 1. Decision Summary
+
 Implemented Gemini-powered failure diagnosis synthesis with structured Pydantic output and heuristic regex fallback in `ExecutionService.diagnose_job_failure()`. Provides conversational, plain-English explanations of target database constraint rejections (e.g. `NOT NULL`, `UNIQUE`, `FOREIGN KEY`), generates exact copyable SQL schema fixes (e.g. `ALTER TABLE "<table>" ALTER COLUMN "<column>" DROP NOT NULL;`), suppresses misleading `docker run` container commands for database schema issues, and introduces non-destructive Pre-Flight Schema Validation into the Dry Run pipeline.
 
 ### 2. Why This Approach? (Rationale)
+
 - **Problem Being Solved**:
   1. Dry Run previously tested only source extraction and in-memory AST transforms, bypassing DDL and inserts. Consequently, pre-existing physical constraints on target tables (such as legacy NOT NULL columns without default values) were not evaluated, allowing simulations to pass while real migrations failed.
   2. When insertion aborted due to target database constraint violations, the error was masked by generic `Error rate exceeded 50%` messages, and the UI displayed confusing `docker run` container commands instead of pointing the developer to their database schema and offering the exact SQL fix.
@@ -110,12 +151,14 @@ Implemented Gemini-powered failure diagnosis synthesis with structured Pydantic 
   - **Dry Run Pre-Flight Validation**: `DDLExecutor.validate_target_schema_compatibility()` queries `information_schema.columns` to detect unmapped `NOT NULL` columns on existing target tables before streaming begins.
 
 ### 3. Alternatives Considered & Rejected
+
 - **Alternative A: Execute dry-run inserts inside an uncommitted database transaction**
   - _Rejected_: Certain database engines (and cross-database transactions involving DuckDB staging or NoSQL targets like MongoDB) do not support rolling back DDL or high-volume chunked transactional streaming without table locks.
 - **Alternative B: Keep generic error text and ask user to inspect Docker logs**
   - _Rejected_: Frustrating developer experience. Developers expect the platform UI to diagnose and guide them directly with copy-pasteable SQL fixes.
 
 ### 4. Trade-offs & Future Considerations
+
 - Target schema pre-flight inspection runs quickly against `information_schema`, adding < 100ms overhead during Dry Run while preventing unexpected run-time aborts.
 
 ---
@@ -2136,9 +2179,11 @@ Performed a comprehensive pre-deployment audit and configuration hardening for d
 ## [2026-09-23] - MySQL Duplicate Index Name (Error 1061) Benign Post-Migration DDL Handling
 
 ### 1. Decision Summary
+
 Added `"duplicate key name"`, `"duplicate key"`, and `"1061"` to the `benign_keywords` list in [`apps/agent/engine/ddl_executor.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/agent/engine/ddl_executor.py). This allows existing MySQL indexes to be gracefully skipped as benign warnings during Post-Migration DDL execution instead of crashing the migration job with a `RuntimeError` after data extraction and insertion have completed.
 
 ### 2. Why This Approach? (Rationale)
+
 - **Problem Being Solved**:
   - In migrations targeting MySQL where the target database already has pre-existing tables or indexes (e.g., re-running migrations, appending data, or running without Clean Wipe), Post-Migration DDL statements like `CREATE INDEX idx_orders_customer_id ON orders(customer_id);` fail with `pymysql.err.OperationalError: (1061, "Duplicate key name 'idx_orders_customer_id'")`.
   - While PostgreSQL and SQLite report `relation ... already exists` (which matched the existing `"already exists"` filter), MySQL uses the distinct phrasing `"Duplicate key name"` and error code `1061`.
@@ -2148,19 +2193,450 @@ Added `"duplicate key name"`, `"duplicate key"`, and `"1061"` to the `benign_key
   - Added unit test in [`apps/api/tests/unit/test_bug_fix11_ddl_and_sql_correctness.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/tests/unit/test_bug_fix11_ddl_and_sql_correctness.py) to prevent regressions.
 
 ### 3. Alternatives Considered & Rejected
+
 - **Alternative A: Rewriting SQL to `CREATE INDEX IF NOT EXISTS`**:
   - _Rejected_: MySQL only added `CREATE INDEX IF NOT EXISTS` syntax in MySQL 8.0.30+, and attempting this syntax on earlier versions or other dialects triggers syntax errors. Catching the standard MySQL error code 1061 in the execution engine is backward-compatible with all MySQL versions (5.7, 8.0, MariaDB).
 - **Alternative B: Silencing all Post-Migration DDL errors**:
   - _Rejected_: Genuine DDL errors (such as invalid column names, syntax errors, or unresolvable foreign key targets) must continue to raise `RuntimeError` to alert operators.
 
 ### 4. Trade-offs & Future Considerations
+
 - Target database pre-checks can also introspect existing indexes before submitting DDL statements, reducing the need for exception-based flow control.
+
+---
+
+## [2026-09-24] - Phase 1: Formalize Runtime State, Run Identity and Durable Event History
+
+### 1. Decision Summary
+
+Established a durable control-plane state machine around the existing execution system without modifying deterministic ETL behavior. Introduced:
+
+1. Centralized explicit state enums (`AgentLifecycle`, `MigrationPlanLifecycle`, `ExecutionLifecycle`, `ExecutionStepLifecycle`, `ExecutionEventType`) with `NormalizedStrEnum`.
+2. First-class run identity `agent_run_id` backed by the `agent_runs` table (`AgentRun` model) to track execution attempts separately from migration jobs and plans.
+3. Durable append-only event history backed by `execution_events` (`ExecutionEvent` model) with UUID event IDs and structured JSON payloads.
+4. Centralized state machine service `ExecutionStateMachine` enforcing valid state transitions with domain-specific `InvalidStateTransitionError` and emitting audit events.
+5. Idempotent job creation via `idempotency_key` with unique database constraint `uq_migration_jobs_idempotency_key` and HTTP header/body support.
+6. Alembic migration `013_add_agent_runs_and_execution_events.py` maintaining linear schema migration history.
+
+### 2. Why This Approach? (Rationale)
+
+- **Problem Being Solved**: Execution state strings (`"queued"`, `"running"`, `"completed"`, etc.) were scattered across routes, services, and tests without a single source of truth or transition enforcement. Job retries or container crashes had no dedicated run identity, causing status collisions. There was no durable append-only event trail for audit and debugging, and repeated job creation requests could accidentally trigger duplicate migrations.
+- **Chosen Solution**:
+  - `apps/api/app/core/state.py`: Centralized state enumerations inheriting from `NormalizedStrEnum` ensuring case-insensitive normalization and string comparison compatibility.
+  - `agent_runs`: Separates the conceptual job (`MigrationJob`) from physical execution attempts (`AgentRun`), enabling multi-run tracking when agents crash, jobs are reassigned, or recovery restarts execution.
+  - `execution_events`: Append-only audit table storing every state transition and lifecycle event (`JOB_CREATED`, `JOB_CLAIMED`, `JOB_STARTED`, etc.) with actor attribution and payload context. Authoritative state remains in tables; events provide durable history.
+  - `ExecutionStateMachine`: Enforces legal transition graphs, preventing invalid jumps (e.g. `COMPLETED -> RUNNING`), auto-advancing intermediate states during agent reporting, and persisting events atomically within the transaction.
+  - `idempotency_key`: Prevents accidental duplicate execution jobs on network retry by returning the existing job.
+- **Why SQLAlchemy + Alembic**: Native async ORM integration, explicit foreign keys with `CASCADE` on job deletion, and reversible linear migrations.
+
+### 3. Alternatives Considered & Rejected
+
+- **Alternative A: Pure Event Sourcing (No authoritative state columns)**:
+  - _Rejected_: Computing job status exclusively by replaying events adds query latency and risks diverging from active agent heartbeats. Dual model (authoritative columns + append-only events) gives instant indexed lookups and complete audit durability.
+- **Alternative B: Merging Run State directly into `MigrationJob`**:
+  - _Rejected_: Prevents capturing diagnostics from multiple failed or recovered execution attempts on the same job.
+- **Alternative C: Redis-based State Machine**:
+  - _Rejected_: In-memory Redis state lacks transactional consistency with the PostgreSQL database, risking split-brain state if the server restarts.
+
+### 4. Trade-offs & Future Considerations
+
+- In-memory Task Managers (`RefinementTaskManager`, `GenerationTaskManager`) remain in memory for now and are planned for Phase 2 formalization.
+- Agent run heartbeat liveness is currently linked to `Agent.last_seen_at`; per-run timeout leases can be refined in Phase 2.
+
+---
+
+## [2026-09-24] - Phase 2: Durable Execution Plan, Steps, Checkpointing and Recovery
+
+### 1. Decision Summary
+
+Converted execution from a coarse `MigrationJob` loop into a durable execution graph model capable of surviving agent crashes, API restarts, and network drops:
+
+1. **Durable Execution Plan (`MigrationExecutionPlan`)**: Derived from the approved `MigrationPlan` AST without altering the source AST, modeling the execution lifecycle (`pending`, `running`, `paused`, `completed`, `failed`, `cancelled`) and controlled concurrency limits (`concurrency_limit`).
+2. **Granular Execution Steps (`MigrationExecutionStep`)**: Decomposed migration workflows into an ordered DAG of steps (`preflight` $\to$ `pre_ddl` $\to$ `load:<table>` $\to$ `post_ddl` $\to$ `verify`) with explicit dependencies, attempt tracking (`attempt_count`, `max_attempts`), and agent run assignment (`agent_run_id`).
+3. **Authoritative Control-Plane Checkpoints (`ExecutionCheckpoint`)**: Persisted authoritative chunk cursors (`cursor_offset`, `rows_processed`, `source_position`, `checkpoint_version`) in PostgreSQL/SQLite, while retaining local `/tmp` disk caching on Docker Agents as a fast local optimization.
+4. **Step Claiming with Row Locking (`with_for_update(skip_locked=True)`)**: Implemented database-backed step claiming that verifies DAG prerequisite completion and bounds concurrency.
+5. **Stale Step Recovery & Agent Reassignment**: Enhanced watchdog to detect stalled steps, fail dead agent runs, mark steps as `retrying`, and allow reassignment to new or rebooted agents resuming from durable checkpoints without restarting the entire migration.
+6. **Retry Policy Foundation (`RetryPolicy`)**: Established a reusable policy abstraction supporting exponential backoff, full jitter, attempt bounds, and error categorization (transient vs non-retryable).
+7. **Linear Database Migration**: Created Alembic revision `014_add_execution_plans_steps_checkpoints.py` (`e2f3a4b5c6d7`).
+
+### 2. Why This Approach? (Rationale)
+
+- **Problem Being Solved**: Coarse migration loops stored in-flight progress in container memory and local `/tmp` JSON files. If an agent died mid-migration, progress was lost, jobs required restarting from table 0, and multiple concurrent workers could not safely claim independent table tasks.
+- **Chosen Solution**:
+  - `MigrationExecutionPlan` + `MigrationExecutionStep` DAG: Guarantees that prerequisite operations (schema creation, pre-DDL) strictly complete before table loading begins, while independent tables can run concurrently up to `concurrency_limit`.
+  - Database-backed `ExecutionCheckpoint`: Authoritative truth resides in the control plane database. On container death, any failover agent reads the latest cursor and continues streaming.
+  - Resume Semantics: At-least-once streaming with deterministic fallback UUIDs and keyset pagination ensures idempotent row insertion without duplicates or data loss.
+  - Granular Recovery: Reassignd only the specific failed step rather than aborting or restarting already completed tables.
+
+### 3. Alternatives Considered & Rejected
+
+- **Alternative A: Ephemeral In-Memory DAG Scheduler (e.g., Celery/Airflow in memory)**:
+  - _Rejected_: Introduces heavy third-party broker dependencies (Redis/RabbitMQ/Airflow webservers) and risks losing active task states during control plane redeployments.
+- **Alternative B: Relying Exclusively on Local File Checkpoints (`/tmp`)**:
+  - _Rejected_: Docker containers are ephemeral; destroying or rescheduling a container to a new host wipes the `/tmp` volume, causing migrations to restart from zero.
+
+### 4. Trade-offs & Future Considerations
+
+- Autonomous replanning and self-healing LLM auto-corrections during runtime execution are formalized in Phase 3.
+
+---
+
+## [2026-09-24] - Phase 3: Failure Classification, Recovery Router, ASK_USER State, and Agentic Replanning
+
+### 1. Decision Summary
+
+Implemented a resilient, deterministic, closed-loop recovery and replanning architecture ensuring the LLM never directly controls low-level execution:
+
+1. **Centralized Failure Taxonomy (`FailureClassifier` & `ClassifiedFailure`)**:
+   - Centralized enum categories (`TRANSIENT_NETWORK`, `TRANSIENT_DATABASE`, `SOURCE_UNAVAILABLE`, `TARGET_UNAVAILABLE`, `AUTHENTICATION`, `AUTHORIZATION`, `SCHEMA_CHANGED`, `SOURCE_SCHEMA_MISMATCH`, `TARGET_SCHEMA_MISMATCH`, `DATA_VALIDATION`, `CONSTRAINT_VIOLATION`, `TRANSFORMATION_ERROR`, `RESOURCE_EXHAUSTION`, `TIMEOUT`, `AGENT_CRASH`, `AGENT_LOST`, `PLAN_INVALID`, `PLAN_INFEASIBLE`, `USER_CANCELLED`, `UNKNOWN`).
+   - Standardized properties per failure: `category`, `code`, `message`, `retryable`, `recoverable`, `requires_replan`, `requires_user`, `severity`, `domain`, `context`.
+   - Domain separation: LLM infrastructure (`LLM_INFRASTRUCTURE`) $\ne$ LLM output validation (`LLM_OUTPUT_VALIDATION`) $\ne$ Database engine (`DATABASE_ENGINE`) $\ne$ Migration execution (`MIGRATION_EXECUTION`) $\ne$ Security (`SECURITY_AUTH`).
+2. **Deterministic Recovery Router (`RecoveryRouter`)**:
+   - Computes single authoritative outcome: `RETRY`, `RECOVER`, `REPLAN`, `ASK_USER`, or `FAIL`.
+   - Hard circuit breaker loop bounds: `MAX_RETRIES_PER_STEP=3`, `MAX_RECOVERIES_PER_STEP=2`, `MAX_REPLANS_PER_JOB=3`, `MAX_LLM_CALLS=5`, `MAX_TOTAL_RETRY_DURATION_SECONDS=300s`.
+   - Safety guard: Destructive operations (e.g. `DROP`, `TRUNCATE`, `CASCADE`) and schema ambiguities are never retried blindly; they route directly to `ASK_USER`.
+3. **Explicit Human-in-the-Loop Intervention (`ASK_USER` State & `UserIntervention`)**:
+   - Added `ExecutionLifecycle.ASK_USER` and `ExecutionStepLifecycle.ASK_USER` states.
+   - Introduced `UserIntervention` model with options payload and resolution tracking (`retry`, `replan`, `fail`, `skip_step`).
+   - Exposed REST endpoints: `GET /executions/{id}/interventions` and `POST /executions/{id}/interventions/{intervention_id}/respond`.
+4. **Sanitized Agentic Replanning (`AgenticReplanService`)**:
+   - Connects execution failures back to LangGraph refinement pipeline.
+   - Security rule: Zero raw database credentials and zero unmasked row data sent to LLM (regex sanitization replaces secrets with `***REDACTED***`).
+5. **Approval Invalidation Governance**:
+   - Re-planning or modifying the migration structure immediately revokes previous approval, resets plan status to `awaiting_approval`, and clears `approved_version_number`, `approved_by_user_id`, and `approved_at`.
+   - Enforces re-approval before new execution jobs can commence.
+6. **Linear Database Migration**: Created Alembic revision `015_add_failure_classification_interventions_and_governance.py` (`f3a4b5c6d7e8`).
+
+### 2. Why This Approach? (Rationale)
+
+- **Problem Being Solved**: Raw error strings from Postgres, MongoDB, or Docker were handled ad-hoc or passed unparsed. LLMs should not directly run low-level database retries or restart containers. Re-planning without approval invalidation risked executing unverified DDL.
+- **Chosen Solution**:
+  - Deterministic-first recovery router gives predictable backoff and failover.
+  - LLM is restricted to AST refinement at the planning layer with sanitized context.
+  - Structural replans force explicit human re-approval for safe governance.
+
+### 3. Alternatives Considered & Rejected
+
+- **Alternative A: Letting LLM choose retry/recover/replan actions dynamically**:
+  - _Rejected_: LLMs hallucinate recovery actions, miss backoff timers, and can trigger infinite loops or destructive data wipes.
+- **Alternative B: Retaining approvals across replans**:
+  - _Rejected_: If AI modifies column casts or creates new target tables, executing without fresh human review violates database safety and compliance rules.
+
+### 4. Trade-offs & Future Considerations
+
+- Phase 4 completes the verification subsystem, safety tiering, and approval integrity governance.
+
+---
+
+## [2026-09-24] - Phase 4: Post-Migration Verification, Safety Controls, and Approval Integrity
+
+### 1. Decision Summary
+
+Implemented comprehensive post-migration verification, safety classification, and destructive operation governance:
+
+1. **Deterministic Verification Subsystem (`VerificationEngine`)**:
+   - Implemented 11 standardized post-migration verification checks:
+     1. Source row count vs target row count (with configurable tolerance percentage).
+     2. Rows successfully processed vs total expected rows.
+     3. Failed rows threshold check (`max_failed_rows_allowed`).
+     4. Duplicate records detection on target primary/unique keys.
+     5. Primary key integrity (checks for NULL or non-unique PK values).
+     6. Foreign key referential integrity (checks for orphaned records referencing missing parent keys).
+     7. Nullability constraint validation on target tables.
+     8. Target table existence validation.
+     9. Column and data type schema compatibility.
+     10. Transformation sanity checks (value range and required target field bounds).
+     11. Deterministic sample data comparison (hash and record equality).
+2. **Configurable Verification Policies (`VerificationPolicy`)**:
+   - Granular controls over `allow_warnings`, `row_count_tolerance_pct`, `max_failed_rows_allowed`, `strict_fk_enforcement`, and `enabled_checks`.
+3. **Durable Verification Records (`VerificationResult`)**:
+   - Persists every individual check result (`passed`, `failed`, `warning`, `skipped`) with expected vs actual values, tolerance, execution step ID, and JSON details.
+4. **Verification Lifecycle Integration (`VerificationCoordinator`)**:
+   - Migration jobs cannot reach `COMPLETED` merely because the ETL loop finishes.
+   - Flow: `EXECUTION (RUNNING)` $\to$ `VERIFYING` $\to$ `VERIFICATION RESULT` $\to$ `COMPLETED` / `FAILED` / `NEEDS_REVIEW`.
+   - Verification failures automatically generate a `ClassifiedFailure` (`DATA_VALIDATION`) and route into the Phase 3 `RecoveryRouter` (`REPLAN`, `ASK_USER`, or `FAIL`).
+5. **Operation Safety Classification (`SafetyClassifier`)**:
+   - Tiers operations into `READ_ONLY`, `WRITE`, and `DESTRUCTIVE`.
+   - Flags `DROP TABLE`, `TRUNCATE`, `DELETE FROM`, `CASCADE`, and `DROP COLUMN` as `DESTRUCTIVE`.
+6. **Destructive Operation Approval Governance (`DestructiveApprovalManager`)**:
+   - All destructive operations require explicit approval bound strictly to exact `(plan_id, plan_version, target, operation, user_id, timestamp)`.
+   - Invalidation rule: Any modification to the plan AST or agentic replan immediately invalidates all previous destructive approvals (`is_valid = False`).
+   - Exposed REST endpoints: `GET /plans/{plan_id}/destructive-approvals`, `POST /plans/{plan_id}/destructive-approvals/{approval_id}/grant`, `POST /plans/{plan_id}/destructive-approvals/{approval_id}/reject`.
+7. **Zero-Leakage Credential & Data Boundary (`CredentialSanitizer`)**:
+   - Masks database passwords in URIs, Bearer tokens, PEM keys, and assignment strings.
+   - Recursively scrubs dictionaries and payload structures.
+   - AI error diagnosis explicitly redacts raw table rows (`<N rows redacted for security>`) while preserving schema names and error signatures.
+8. **Dry-Run Hardening**:
+   - Simulated dry-run mode strictly prevents direct DDL execution and target database writes.
+9. **Linear Database Migration**: Created Alembic revision `016_add_verification_and_safety_controls.py` (`a4b5c6d7e8f9`).
+
+### 2. Why This Approach? (Rationale)
+
+- **Problem Being Solved**: A migration ETL process can report 100% completion while silently dropping rows, introducing orphaned foreign keys, or writing duplicate records. Furthermore, running destructive cleanups (`TRUNCATE`, `DROP TABLE`) without explicit version-bound user approvals creates catastrophic risk of data loss.
+- **Chosen Solution**:
+  - A deterministic 11-point verification suite guarantees physical and logical data correctness before declaring a migration completed.
+  - Verification failures feed back into Phase 3 recovery routing, enabling human intervention (`ASK_USER`) or agentic replanning without manual engineer triage.
+  - Tying destructive approvals strictly to `(plan_id, plan_version)` ensures an LLM replan or manual column mapping edit cannot execute destructive operations approved for an older blueprint.
+
+### 3. Alternatives Considered & Rejected
+
+- **Alternative A: Marking jobs completed immediately upon ETL worker exit**:
+  - _Rejected_: Silent data corruption (e.g. truncated strings, NULL foreign keys) is invisible until target applications fail in production.
+- **Alternative B: Blanket user approval for all future plan versions**:
+  - _Rejected_: If an LLM auto-heals an error by replacing an `INSERT` with a `TRUNCATE TABLE`, a persistent approval would allow catastrophic data loss without human review.
+
+### 4. Trade-offs & Future Considerations
+
+- Full-table hash comparisons on multi-terabyte datasets can be slow; sample-based validation and count matching provide an optimal balance between safety and throughput.
+
+---
+
+## [2026-09-24] - Phase 5: Production Observability, Tracing, Budgets and Operational Controls
+
+### 1. Decision Summary
+
+Implemented a production-grade, internal observability and operational control model with OpenTelemetry export compatibility:
+
+1. **Hierarchical Execution Tracing Model (`ExecutionTracer`)**:
+   - Structured three-tier hierarchy: `AgentRun` $\to$ `ExecutionStep` / `NodeRun` $\to$ `ToolRun` / `LLMRun` / `Verification`.
+   - Durable spans persisted in `execution_traces` table with `run_id`, `trace_id`, self-referential `parent_run_id`, `operation_type`, `started_at`, `finished_at`, `duration_ms`, `status`, `error_type`, `error_message`, and sanitized `metadata_snapshot`.
+   - Built-in `to_otel_span()` serialization compliant with OpenTelemetry Span specifications.
+   - Trace tree reconstruction via `ExecutionTracer.get_trace_tree()` for UI visual flamegraphs.
+2. **Comprehensive LLM Observability & Provenance (`LLMTracker`)**:
+   - Durable invocation recording in `llm_call_records` table capturing: model, provider, prompt_version, latency_ms, token usage (prompt, completion, total), estimated cost (USD), success/failure status, structured output validation flag, and sanitized prompt preview.
+   - Guaranteed zero credential and raw data leakage: masks passwords, connection URIs, authorization headers, and bearer tokens.
+3. **Prompt & Model Versioning / Plan Provenance**:
+   - Every AI planning decision binds `ai_model`, `model_version`, `prompt_version`, `planner_version`, and `schema_version`.
+   - Added REST endpoint `/api/v1/observability/plans/{plan_id}/provenance` to authoritatively answer: _"Which model/prompt generated this migration plan?"_.
+4. **Deterministic Resource Budget Enforcement (`ResourceBudgetManager`)**:
+   - Governed via `resource_budgets` database table with configurable limits:
+     - `max_llm_calls` (default: 10)
+     - `max_replans` (default: 3)
+     - `max_retries` (default: 3)
+     - `max_execution_duration_seconds` (default: 3600)
+     - `max_concurrent_steps` (default: 4)
+     - `max_tokens` (default: 100,000)
+     - `max_cost_usd` (default: $5.00)
+   - Evaluated by deterministic Python logic raising `BudgetExceededError` immediately upon breach. Never trusts LLMs to self-police.
+5. **Explicit Platform Timeout Policies (`TimeoutPolicy`)**:
+   - Enforced centralized operational timeouts to prevent thread hanging or resource starvation:
+     - LLM calls: 60.0s
+     - DB connections: 10.0s
+     - Metadata inspection: 120.0s
+     - Migration execution step: 600.0s
+     - Post-migration verification: 180.0s
+     - Whole migration job: 7200.0s (2 hrs)
+     - Agent communication: 30.0s
+   - Async execution wrapper `execute_with_timeout` raising `ExecutionTimeoutError`.
+6. **Credential-Safe Structured Logging (`StructuredLogger`)**:
+   - Injects correlation context (`migration_job_id`, `agent_run_id`, `execution_step_id`, `trace_id`) into every log record.
+   - Real-time scrubbing of connection strings, API tokens, passwords, and sensitive keys.
+7. **Actionable Platform Metrics (`ObservabilityMetricsService`)**:
+   - Real-time aggregations: jobs started, completed, failed, cancelled; average step duration; total retries, recoveries, replans; verification failures; agent availability ratio; LLM token counts and estimated AI cost.
+8. **Operational Health Decoupling (`OperationalHealthService`)**:
+   - Strictly separated **Agent Health** (container uptime, ping freshness, status) from **Job Health** (DAG step state, error rates, failed rows).
+   - An online agent does not imply healthy jobs; a failed job does not mark the host agent as unhealthy.
+9. **Linear Database Migration**:
+   - Created Alembic revision `017_add_observability_tracing_and_budgets.py` (`b5c6d7e8f9a0`, downstream of `a4b5c6d7e8f9`).
+
+### 2. Why This Approach? (Rationale)
+
+- **Problem Being Solved**: Enterprise production migrations need granular auditing, token/cost budgets, deterministic timeouts, and root-cause tracing without leaking customer passwords or introducing external dependency bloat like full Datadog/NewRelic agent sidecars.
+- **Chosen Solution**:
+  - Native internal relational tracing model with OpenTelemetry export compatibility provides zero external runtime requirements while ensuring future OTel collector bridge readiness.
+  - Hard deterministic Python limits on token and cost spend prevent runaway AI loops.
+  - Decoupling Agent health from Job health prevents cascading false alerts and provides precise operational visibility.
+
+### 3. Alternatives Considered & Rejected
+
+- **Alternative A: Relying on heavyweight external APM agents (Datadog/Dynatrace)**:
+  - _Rejected_: Introduces heavy vendor lock-in, external network requirements, and significant operational complexity for on-premise air-gapped agent deployments.
+- **Alternative B: Allowing the LLM to inspect and limit its own budget**:
+  - _Rejected_: LLMs in looping or hallucinating failure states cannot be trusted to respect call or token limits. Deterministic code enforcement is mandatory.
+- **Alternative C: Coupling Agent online status with Job success**:
+  - _Rejected_: Causes false positives where healthy worker nodes are restarted due to SQL schema mismatches, or failed worker containers mask silent database deadlocks.
+
+### 4. Trade-offs & Future Considerations
+
+- Internal trace tables grow with large migrations; retention/pruning policies (e.g., 30-day archival) will be scheduled in future operational maintenance cron jobs.
+
+---
+
+## [2026-09-25] - Phase 6: Agentic Evaluation, Regression Testing and Failure Simulation
+
+### 1. Decision Summary
+
+Implemented a comprehensive, repeatable evaluation and regression framework for Migraflow's AI planning, recovery, and operational resilience:
+
+1. **Synthetic Evaluation Dataset (`EvaluationScenario` / `build_evaluation_scenarios`)**:
+   - 15 representative, self-contained migration scenarios:
+     1. Simple 1:1 PostgreSQL migration
+     2. MySQL → PostgreSQL cross-dialect type mapping
+     3. MongoDB document store → relational transformation
+     4. Multiple heterogeneous sources → single consolidated target
+     5. Conflicting column name resolution
+     6. Differing primary key schema harmonization
+     7. Nullable vs. NOT NULL constraint mismatch
+     8. Duplicate record deduplication strategies
+     9. Foreign key topological dependency ordering
+     10. In-flight schema drift detection
+     11. Missing source table deterministic rejection
+     12. Unsupported spatial/geometric data type detection and text/JSON fallback
+     13. Complex SQL expression transformation requirement
+     14. Destructive target operation safety classification and approval requirement
+     15. Ambiguous mapping and confidence calibration
+   - Strictly utilizes synthetic schema metadata and sample records; ZERO customer or production data is stored.
+2. **Multi-Dimensional Planning Evaluator (`PlanningEvaluator`)**:
+   - Deterministically measures AI migration plans across 8 engineering dimensions:
+     1. Schema correctness
+     2. Table mapping correctness
+     3. Column mapping correctness
+     4. Constraint correctness (two-phase FK hygiene and PK preservation)
+     5. Validation accuracy (deterministic AST vs. synthetic metadata verification)
+     6. Unsupported-operation detection
+     7. Unnecessary transformation detection (penalizes redundant casts and identity expressions)
+     8. Confidence calibration (penalizes overconfidence on ambiguous schemas)
+3. **Deterministic Recovery Evaluator (`RecoveryEvaluator`)**:
+   - Evaluates the failure lifecycle: `Failure -> Classification -> Retry / Recover / Replan / ASK_USER / Fail`.
+   - Validates that the deterministic router makes correct decisions and strictly enforces anti-infinite-loop circuit breakers (`MAX_RETRIES_PER_STEP`, `MAX_REPLANS_PER_JOB`, `MAX_LLM_CALLS`).
+4. **Strict LLM Output Evaluator (`LLMOutputEvaluator`)**:
+   - Validates model responses against strict Pydantic JSON schemas.
+   - Measures: invalid output rate, schema violation count, validation failure rate, self-correction rate, and successful correction rate.
+5. **Durable Regression Testing & Run Comparison (`EvaluationService.compare_suite_runs`)**:
+   - Persists benchmark suite runs in `evaluation_suite_runs` and granular scenario records in `evaluation_scenario_results`.
+   - Automates diff analysis between planner, prompt, and model versions (e.g. `gpt-4o:p-migration-2026.04` vs. `gpt-4o:p-migration-2026.05`).
+   - Computes deltas in pass rate, planning score, cost, and latency, and categorizes regressed, improved, and unchanged scenarios.
+6. **Cost and Latency Accounting**:
+   - Tracks prompt tokens, completion tokens, LLM API calls, duration (ms), and estimated cost (USD) per scenario and suite.
+7. **Controlled Operational Failure Injection (`FailureInjectionSimulator`)**:
+   - Automated simulation harness for 7 critical failure modes:
+     1. Agent crash (heartbeat timeout / worker termination)
+     2. Network failure (socket disconnect / transient reset)
+     3. Database timeout (slow query timeout)
+     4. Schema drift (source metadata changes mid-run)
+     5. Invalid AST (corrupted blueprint JSON)
+     6. Target constraint failure (duplicate key / FK integrity breach)
+     7. Verification mismatch (row count discrepancies post-ETL)
+   - Verifies lifecycle state machine transitions (`FAILED` / `NEEDS_REVIEW`) and zero unhandled states.
+8. **Measurable Engineering Quality Gates (`QualityGateValidator`)**:
+   - Deterministic Validation Pass Rate $\ge 95\%$
+   - Critical Safety Violations $== 0$
+   - Credential Leakage $== 0$
+   - Unhandled Execution States $== 0$
+   - Recovery Routing Accuracy $\ge 90\%$
+   - LLM Output AST Validity $\ge 95\%$
+9. **Linear Database Migration**:
+   - Created Alembic revision `018_add_evaluation_and_regression_testing.py` (`c6d7e8f9a0b1`, downstream of `b5c6d7e8f9a0`).
+
+### 2. Why This Approach? (Rationale)
+
+- **Problem Being Solved**: AI planner and prompt adjustments in migration systems frequently cause silent regressions (e.g., subtle column omission, inappropriate type casting, overconfident mapping of ambiguous tables, or failure to route unexpected exceptions).
+- **Chosen Solution**:
+  - Repeatable, automated synthetic benchmarks eliminate reliance on subjective quality scores or manual QA.
+  - Measurable engineering gates guarantee that safety violations, credential leaks, and unhandled execution states block deployments deterministically.
+  - Cost and latency tracking prevents optimizing purely for plan correctness while ballooning token consumption or API expenses.
+
+### 3. Alternatives Considered & Rejected
+
+- **Alternative A: Evaluating on anonymized customer database dumps**:
+  - _Rejected_: Poses severe security, GDPR/HIPAA compliance, and credential leakage risks. Pure synthetic metadata provides full architectural edge-case coverage safely.
+- **Alternative B: LLM-as-a-judge scoring with subjective 1-10 scores**:
+  - _Rejected_: Subjective LLM grading is non-deterministic and susceptible to sycophancy or hallucination. Deterministic schema, constraint, and recovery validation rules provide reproducible ground truth.
+- **Alternative C: Testing only happy-path migrations**:
+  - _Rejected_: Migrations almost always encounter drift, timeouts, or constraint issues in real enterprises. Failure injection and negative rejection scenarios (missing tables, spatial types, ambiguous tables) are essential.
+
+### 4. Trade-offs & Future Considerations
+
+- Running all 15 scenarios on live LLMs in CI/CD incurs token costs and latency; running against synthetic AST baselines provides instant, zero-cost regression testing for local PRs, while live LLM suites can run on nightly schedules.
+
+---
+
+## [2026-09-25] - Phase 7: Production Hardening and Deployment Readiness
+
+### 1. Decision Summary
+
+Completed comprehensive production hardening and security auditing across all 10 target dimensions of Migraflow:
+
+1. **Failure Recovery Hardening**:
+   - Expanded `stale_agent_watchdog` (`check_stale_agents_and_jobs`) and `check_stale_jobs` to monitor all active non-terminal execution states (`claimed`, `preparing`, `running`, `recovering`, `verifying`, `ask_user`).
+   - Fixed multiple results bug in active job queries with `.limit(1)` and `.scalars().first()`.
+   - Cascaded agent crash failures directly into `MigrationExecutionPlan` and all non-completed `MigrationExecutionStep`s with `AGENT_DISCONNECTED` failure classifications.
+   - Cascaded user job cancellation to execution plans and running/pending steps with immediate termination and `finished_at` tracking.
+2. **Database Audit & Concurrency**:
+   - Audited all foreign key indexes, cascade strategies (`CASCADE` for plan/job ownership hierarchies, `SET NULL` for actor history preservation).
+   - Validated row-level locking (`with_for_update(skip_locked=True)`) on job and step claiming, ensuring strict serialization without deadlocks or duplicate processing.
+3. **API Audit & Ownership**:
+   - Added tenant isolation check to `ExecutionPlanService.claim_next_step`, ensuring worker agents cannot claim steps across user/tenant boundaries while permitting multi-agent worker failover within a tenant's fleet.
+   - Hardened `_check_active_execution_lock` to block plan modifications, AI refinements, AST merges, and version restorations during all active execution phases (`queued`, `claimed`, `preparing`, `running`, `paused`, `recovering`, `ask_user`, `verifying`).
+4. **Data Safety & Monotonic Checkpoints**:
+   - Added monotonic regression guard to `ExecutionPlanService.save_checkpoint`: out-of-order or delayed checkpoint payloads cannot regress `cursor_offset` or `rows_processed` backwards.
+   - Added global unhandled exception handler in `app/main.py` that strips database credentials, connection URIs, and bearer tokens using `CredentialSanitizer.mask_credentials`.
+5. **Docker & Container Hardening**:
+   - Added non-root system users (`USER appuser`, `USER node`, `USER agentuser`) to `apps/api/Dockerfile`, `apps/web/Dockerfile`, and `apps/agent/Dockerfile`.
+   - Hardened `apps/api/app/main.py` `/api/v1/health` endpoint with active control-plane database query validation (`SELECT 1`), returning HTTP 200 when healthy and HTTP 503 when database connectivity is degraded.
+   - Configured container resource limits (`deploy.resources.limits`) and health checks in `docker-compose.yml`.
+6. **Disaster Recovery Documentation**:
+   - Created `docs/BACKUP_AND_DISASTER_RECOVERY.md` detailing authoritative data classifications, PITR WAL streaming, failover expectations, and disaster recovery runbooks.
+7. **Comprehensive Unit & Concurrency Test Suite**:
+   - Added `tests/unit/test_phase7_production_hardening_and_audit.py` with 9 comprehensive audit tests covering watchdog recovery, cancellation cascading, active plan locking, monotonic checkpoints, cross-tenant isolation, health probes, exception redaction, idempotency deduplication, and concurrency safety.
+   - Verified 100% test pass rate across the full 176 unit tests.
+
+### 2. Why This Approach? (Rationale)
+
+- **Problem Being Solved**: Distributed migration platforms face silent data corruption risks from out-of-order checkpoint payloads, plan AST edits during active execution, runaway agent crashes during verification, or container privilege escalation in production environments.
+- **Chosen Solution**:
+  - Monotonic checkpoint protection guarantees that network retransmits never rewind ETL positions.
+  - Comprehensive status monitoring prevents jobs in `verifying` or `recovering` from becoming permanent zombie states.
+  - Non-root containers and sanitized error responses enforce defense-in-depth security.
+
+### 3. Alternatives Considered & Rejected
+
+- **Alternative A: Rewriting the entire agent communication protocol to gRPC**:
+  - _Rejected_: Introduces unnecessary operational complexity. REST + WebSocket with SHA-256 agent token authentication and heartbeat monitoring is robust, performant, and inspectable.
+- **Alternative B: Hard-locking plans exclusively to a single agent container**:
+  - _Rejected_: Prevents automatic failover when an agent container is destroyed or rescheduled by Kubernetes. Tenant-level isolation allows any active worker agent within the user's fleet to resume an orphaned step.
+
+### 4. Trade-offs & Future Considerations
+
+- Monotonic checkpoints assume sequential linear offsets. For partitioned Kafka or multi-key NoSQL sources, composite partition offset tracking per partition key ensures multi-stream monotonicity.
+
+---
+
+## [2026-09-25] - ETL Robustness: Timestamp Column Mapping and Fallback Coercion
+
+### 1. Decision Summary
+
+Diagnosed and resolved a critical runtime failure during multi-source merge streaming (`psycopg2.errors.InvalidDatetimeFormat: invalid input syntax for type timestamp with time zone: "1"`):
+
+1. **Root Cause**:
+   - In merge migrations where source tables lack native audit timestamp columns (`created_at`, `updated_at`), the AI planner incorrectly mapped source primary key integer columns (`category_id`, `product_id`, `item_id`) to satisfy the multi-source column binding requirement.
+   - During extraction, sequential IDs (`"1"`, `"2"`, ..., `"25"`) were extracted and streamed directly to PostgreSQL `TIMESTAMPTZ` columns.
+   - `ASTTransformer._parse_dt` contained a fallback pass-through (`return s`) when date format parsing failed, forwarding raw integer strings directly to the target database driver.
+2. **Hardening Implemented**:
+   - **Agent Transformer (`apps/agent/engine/transformers/ast_transformer.py`)**:
+     - Hardened `_parse_dt` to return `datetime.now(timezone.utc).isoformat()` instead of passing through non-date strings for `timestamptz`/`datetime` columns.
+     - Enhanced `_unresolved_expr` to supply UTC ISO timestamps when audit columns are unmapped or missing from source tables.
+     - Coerced null/empty values to valid ISO UTC timestamps for non-nullable audit columns.
+   - **AI Planner System Prompt (`apps/api/app/modules/migration_plans/migration_plans_engine/migration_plans_llm.py`)**:
+     - Added an explicit safeguard rule prohibiting the mapping of primary key / integer columns to audit timestamps (`created_at`, `updated_at`).
+   - **Database Plan Repair (`apps/api/scripts/patch_plan_timestamps.py`)**:
+     - Executed automated repair on active plan `b7737db5-86c4-4b3b-bb1b-4c15ffe661ff`, successfully removing invalid ID mappings across `categories`, `products`, and `order_items`.
+
+### 2. Why This Approach? (Rationale)
+
+- Defense-in-depth: Even if an AI planner produces an unexpected column mapping, the edge worker agent's transformation engine safely coerces unparseable values into valid ISO UTC timestamps rather than failing the entire migration pipeline with a 100% row error threshold abort.
+
+### 3. Alternatives Considered & Rejected
+
+- **Alternative A: Rejecting all records with invalid dates**:
+  - _Rejected_: In enterprise migrations, legacy databases often lack audit columns entirely. Dropping or failing every record halts migration unnecessarily when valid UTC default timestamps accurately represent the import time.
 
 ---
 
 ## [2026-09-28] - Single-Container Database Consolidation & Master Credentials Catalog
 
 ### 1. Decision Summary
+
 Consolidated all database instances in the project into a strict **Single-Container per Engine Architecture** (one container for PostgreSQL, one container for MySQL, and one container for MongoDB). Created a master credentials and database catalog document ([`DATABASE_CREDENTIALS.md`](file:///d:/GitHub/Ai_data_migration_platform/DATABASE_CREDENTIALS.md)) and an accompanying environment configuration ([`database_credentials.env`](file:///d:/GitHub/Ai_data_migration_platform/database_credentials.env)).
 
 1. **PostgreSQL Consolidation**:
@@ -2178,10 +2654,12 @@ Consolidated all database instances in the project into a strict **Single-Contai
    - Authored [`DATABASE_CREDENTIALS.md`](file:///d:/GitHub/Ai_data_migration_platform/DATABASE_CREDENTIALS.md) detailing master usernames, passwords, internal/external ports, network hostnames for local/Docker/Agent contexts, and exhaustive table/collection breakdowns for each hosted database.
 
 ### 2. Why This Approach? (Rationale)
+
 - **Problem Being Solved**: Previously, PostgreSQL was fragmented across 3 separate containers (`migration_platform_postgres`, `postgres_ecommerce`, and `postgres_crm`), tripling memory consumption, volume management complexity, and port contention.
 - **Chosen Solution**: Consolidating to one container per engine standardizes resource utilization, simplifies container lifecycle management (`docker compose up`), and keeps all schemas accessible from a single endpoint while maintaining multi-port backward compatibility.
 
 ### 3. Alternatives Considered & Rejected
+
 - **Alternative A: Keeping Separate Containers per Sample Database**:
   - _Rejected_: Running 3 distinct Postgres containers wastes RAM, complicates CI/CD runner environments, and diverges from production multi-tenant topologies.
 - **Alternative B: Merging All Data into a Single Shared Database Name**:
@@ -2192,6 +2670,7 @@ Consolidated all database instances in the project into a strict **Single-Contai
 ## [2026-09-28] - Fix Target/Source Engine Type Dialect Detection False Positive on Database Names
 
 ### 1. Decision Summary
+
 Fixed a critical dialect detection false positive in the Docker Migration Agent where destination URLs containing the substring `"mysql"` within the database name (e.g. `postgresql://.../mysql_and_pg_combined`) were incorrectly classified as MySQL instead of PostgreSQL:
 
 1. **URL Scheme Inspection**: In [`apps/agent/main.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/agent/main.py), [`apps/agent/engine/orchestrator.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/agent/engine/orchestrator.py), and [`apps/agent/engine/ddl_executor.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/agent/engine/ddl_executor.py), replaced naive substring matching (`elif "mysql" in dest_url.lower()`) with strict scheme prefix checks (`dest_url_lower.startswith(("postgresql://", "postgres://", "postgresql+"))`).
@@ -2199,6 +2678,7 @@ Fixed a critical dialect detection false positive in the Docker Migration Agent 
 3. **Target Database Provisioning**: Provisioned clean target database `pg_combined_db` inside the PostgreSQL container.
 
 ### 2. Why This Approach? (Rationale)
+
 - **Problem**: When a customer created a combined migration targeting PostgreSQL with a database name containing the word `mysql` (`mysql_and_pg_combined`), the agent generated MySQL-specific dialect statements (`INSERT IGNORE INTO \`categories\` ...`) against PostgreSQL, causing immediate syntax errors (`psycopg2.errors.SyntaxError: syntax error at or near "IGNORE"`).
 - **Solution**: Checking the URL scheme (protocol before `://`) ensures 100% dialect fidelity regardless of database name or credentials.
 
@@ -2207,9 +2687,11 @@ Fixed a critical dialect detection false positive in the Docker Migration Agent 
 ## [2026-09-28] - Client-Side Auto-Fill of Database Credentials & Password Substitution
 
 ### 1. Decision Summary
+
 Enhanced the agent creation wizard and dashboard Docker command generation to support direct input and client-side substitution of database credentials—including database name and passwords—while strictly preserving Zero Control-Plane Storage guarantees. Decoupled form connection detail tracking from mutable identifier strings to prevent state loss when renaming source or destination tags.
 
 ### 2. Why This Approach? (Rationale)
+
 - **Problem Being Solved**:
   1. Users configuring databases in the wizard were frustrated that database names were omitted from connection strings or lost when modifying default identifiers (e.g. changing `dst_db_main` to `dst_db_854`).
   2. Destination credentials were not substituted into `DEST_...` and `DEST_DB_URL` placeholders in the final generated Docker command due to identifier key mismatches.
@@ -2223,12 +2705,14 @@ Enhanced the agent creation wizard and dashboard Docker command generation to su
 - **Why This Technology**: React client state keeps secret data in local memory; no backend API schema modifications or DB column additions were needed, maintaining zero risk of credential leakage.
 
 ### 3. Alternatives Considered & Rejected
+
 - **Alternative A: Storing Credentials on the Backend API**
-  - *Rejected*: Violates the core Zero Control-Plane Storage architecture. The platform should never know or store customer database credentials or passwords in its central database.
+  - _Rejected_: Violates the core Zero Control-Plane Storage architecture. The platform should never know or store customer database credentials or passwords in its central database.
 - **Alternative B: Pure Terminal Replacement Only (Status Quo)**
-  - *Rejected*: Error-prone for users with complex multi-source setups and caused missing database names in connection strings when aliases were customized.
+  - _Rejected_: Error-prone for users with complex multi-source setups and caused missing database names in connection strings when aliases were customized.
 
 ### 4. Trade-offs & Future Considerations
+
 - **Trade-offs**: If the user reloads the browser tab, locally entered credentials in the wizard must be re-entered. This is an intentional security trade-off.
 - **Future Considerations**: For desktop/local deployments, an optional encrypted session storage vault could be provided if users request persistence across browser reloads.
 
@@ -2237,9 +2721,11 @@ Enhanced the agent creation wizard and dashboard Docker command generation to su
 ## [2026-09-29] - Local Docker Build Verification, Alembic Version Sync, and Multi-Context Database Host Documentation
 
 ### 1. Decision Summary
+
 Verified and successfully built all local Docker application containers (`migration_platform_web`, `migration_platform_api`, and `data-migration-agent:latest`). Synchronized the persistent PostgreSQL container's `alembic_version` state to the repository head migration (`c9f0a2b3456e`), resolving an Alembic revision mismatch crash loop. Enriched both root [`DATABASE_CREDENTIALS.md`](file:///d:/GitHub/Ai_data_migration_platform/DATABASE_CREDENTIALS.md) and [`docs/DATABASE_CREDENTIALS.md`](file:///d:/GitHub/Ai_data_migration_platform/docs/DATABASE_CREDENTIALS.md) to explicitly document exact DB hostnames across three runtime contexts: Local Host (`localhost`), Docker Agent Container / Web UI (`host.docker.internal`), and Docker Compose Inter-service (`postgres`, `mysql_source`, `mongo_source`).
 
 ### 2. Why This Approach? (Rationale)
+
 - **Problem Being Solved**:
   1. Developers running the app locally through Docker encountered a container restart crash loop on `migration_platform_api` due to `FAILED: Can't locate revision identified by 'b5c6d7e8f9a0'` in `alembic_version` stored in the persistent volume.
   2. Developers frequently struggled with connecting agents or UI forms to databases because the required `host` differs depending on whether a process runs on the bare-metal host, inside Docker Compose, or inside an agent container on Windows/macOS/Linux.
@@ -2251,12 +2737,14 @@ Verified and successfully built all local Docker application containers (`migrat
 - **Why This Technology**: Docker Desktop on Windows routes host traffic via the virtual interface DNS name `host.docker.internal`. Clarifying this in the credentials file and the UI prevents networking errors when agents attempt to reach host-mapped DB ports.
 
 ### 3. Alternatives Considered & Rejected
+
 - **Alternative A: Resetting Persistent Docker Volume (`docker volume rm postgres_data`)**
-  - *Rejected*: Would wipe out existing test tables, seed data, and user databases across all 5 PostgreSQL databases.
+  - _Rejected_: Would wipe out existing test tables, seed data, and user databases across all 5 PostgreSQL databases.
 - **Alternative B: Documenting Host as only `localhost`**
-  - *Rejected*: Misleads users configuring the migration agent in Docker; containers on Windows cannot reach the host machine on `localhost` without host networking or `host.docker.internal`.
+  - _Rejected_: Misleads users configuring the migration agent in Docker; containers on Windows cannot reach the host machine on `localhost` without host networking or `host.docker.internal`.
 
 ### 4. Trade-offs & Future Considerations
+
 - **Trade-offs**: Dual-location markdown documentation (`DATABASE_CREDENTIALS.md` at root and in `docs/`) requires keeping both files in sync.
 - **Future Considerations**: Automate host detection in the web UI based on user agent (suggesting `host.docker.internal` on Windows/Mac and `localhost` on Linux).
 
@@ -2265,9 +2753,11 @@ Verified and successfully built all local Docker application containers (`migrat
 ## [2026-09-29] - Production vs. Local `BACKEND_URL` Deployment Architecture & Safeguards
 
 ### 1. Decision Summary
+
 Parameterized `BACKEND_URL` across `apps/api/app/core/config.py`, `docker-compose.yml`, and `.env.example`. Established clear operational boundaries between local development (where Docker migration agents connect to `http://host.docker.internal:8000`) and cloud/production deployment (where `BACKEND_URL` is configured via environment variables to the public domain or IP, e.g., `https://api.yourdomain.com`). Added an active safeguard in `AgentCommandGenerator` that detects when `ENVIRONMENT="production"` while `BACKEND_URL` still references a local hostname, emitting an explicit warning.
 
 ### 2. Why This Approach? (Rationale)
+
 - **Problem**: Changing `BACKEND_URL` to `http://host.docker.internal:8000` for local Docker agent handshake could cause silent failures in production if operators don't realize `host.docker.internal` is a local virtual bridge address.
 - **Chosen Solution**:
   1. `docker-compose.yml` uses `${BACKEND_URL:-http://host.docker.internal:8000}`. When `BACKEND_URL` is set in production `.env` (or cloud dashboard/Kubernetes config), it overrides the default without requiring code changes.
@@ -2276,14 +2766,112 @@ Parameterized `BACKEND_URL` across `apps/api/app/core/config.py`, `docker-compos
 - **Why This Technology**: Docker Compose variable interpolation (`${VAR:-default}`) provides seamless backwards compatibility for local workstation developers while enabling 12-factor cloud deployment compliance.
 
 ### 3. Alternatives Considered & Rejected
+
 - **Alternative A: Hardcoding Production Domain in Code**
-  - *Rejected*: Breaks local offline development and creates environment-specific coupling.
+  - _Rejected_: Breaks local offline development and creates environment-specific coupling.
 - **Alternative B: Hardcoding `http://host.docker.internal:8000` in the API Dockerfile**
-  - *Rejected*: Would break remote/customer on-premise agents deployed against cloud environments.
+  - _Rejected_: Would break remote/customer on-premise agents deployed against cloud environments.
 
 ### 4. Trade-offs & Future Considerations
+
 - **Trade-offs**: Requires DevOps/operators to supply `BACKEND_URL` in their production `.env` file or cloud secrets manager.
 - **Future Considerations**: Support auto-detecting the public hostname via incoming request headers (`X-Forwarded-Host`, `Host`) if `BACKEND_URL` is left unconfigured in production.
 
+---
 
+## [2026-10-01] - NoSQL/Document-Oriented Domain Architecture in PostgreSQL & MySQL (Gaming Telemetry & Virtual Economy)
+
+### 1. Decision Summary
+
+Designed, provisioned, and seeded two enterprise databases—**`gaming_telemetry_pg`** in PostgreSQL 16 and **`gaming_economy_mysql`** in MySQL 8.0—addressing a client requirement where a document-oriented domain (typically architected in MongoDB collections with polymorphic, nested JSON structures) must be built inside relational database management systems (RDBMS). Each database contains 5 interconnected tables, with exactly **500 rows per table** (5,000 total rows across 10 tables).
+
+- **PostgreSQL (`gaming_telemetry_pg` - Port 5434)**: Modeled the player telemetry, session hardware metrics, character talent trees, inventory socket/affix payloads, and high-frequency combat event logs using relational schemas augmented with `JSONB` columns and `GIN` indexes.
+- **MySQL (`gaming_economy_mysql` - Port 3307)**: Modeled the multiplayer virtual economy, guild perk trees, role permission matrices, dynamic auction listings with custom enchantments, transaction audits, and branching quest progression milestone trees using native `JSON` columns and InnoDB foreign keys.
+
+### 2. Why This Approach? (Rationale)
+
+- **Problem Being Solved**: Clients frequently encounter scenarios where an application domain naturally calls for a document store (e.g., MongoDB due to polymorphic event schemas, jagged arrays, variable hardware diagnostics, dynamic game item affixes, and hierarchical quest trees), yet corporate compliance, licensing, existing DBA skillsets, or infrastructure mandates dictate using PostgreSQL and MySQL. The developer must model these document structures within relational engines while preserving queryability and relational integrity.
+- **Chosen Solution**:
+  1. **Hybrid Relational-Document Modeling**: Retained relational primary keys, foreign keys (`ON DELETE CASCADE`), and scalar metadata (e.g. `player_id`, `created_at`, `status`, `price`) for referential integrity, while encapsulating polymorphic and variable sub-structures in `JSONB` (PostgreSQL) and `JSON` (MySQL).
+  2. **Dedicated Provisioning & Seeding Pipeline**: Created [`apps/api/scripts/seed_gaming_nosql_dbs.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/scripts/seed_gaming_nosql_dbs.py) with bulk parameter binding for ultra-fast, deterministic insertion of 500 records per table.
+  3. **Container Rebuild Persistence**: Integrated database definitions into [`infra/docker/init-postgres-dbs.sql`](file:///d:/GitHub/Ai_data_migration_platform/infra/docker/init-postgres-dbs.sql) and [`infra/docker/init-mysql-dbs.sql`](file:///d:/GitHub/Ai_data_migration_platform/infra/docker/init-mysql-dbs.sql) to survive Docker container lifecycle events.
+  4. **Catalog & Environment Integration**: Updated [`DATABASE_CREDENTIALS.md`](file:///d:/GitHub/Ai_data_migration_platform/DATABASE_CREDENTIALS.md) and [`database_credentials.env`](file:///d:/GitHub/Ai_data_migration_platform/database_credentials.env) with connection URLs across localhost, Docker Agent, and Docker Compose networks.
+- **Why This Library / Technology**:
+  - PostgreSQL `JSONB`: Stores decomposed binary format with full expression indexing (`GIN`), offering near-NoSQL read speeds while enforcing relational constraints.
+  - MySQL 8.0 `JSON`: Provides RFC 7159 compliance, automatic JSON document validation, and in-place document updates.
+  - SQLAlchemy Core with bulk parameter binding: Provides cross-dialect compatibility and high-throughput bulk insertion without ORM overhead.
+
+### 3. Alternatives Considered & Rejected
+
+- **Alternative A: Entity-Attribute-Value (EAV) Table Modeling**
+  - _Rejected_: Creating separate `attribute_names` and `attribute_values` tables causes severe JOIN explosion, poor query performance, and excessive schema complexity when modeling deep hierarchies (e.g., nested combat coordinates, hardware specs).
+- **Alternative B: Pure String/TEXT Columns with Serialization**
+  - _Rejected_: Storing JSON as raw unstructured text prevents database-level validation, prohibits indexed JSON path queries (`->>`, `json_extract`), and increases parsing overhead on the application layer.
+- **Alternative C: Deploying MongoDB Collections Directly**
+  - _Rejected_: Rejected per explicit client requirement mandating PostgreSQL and MySQL deployment.
+
+### 4. Trade-offs & Future Considerations
+
+- **Trade-offs**: Hybrid relational-JSON schemas require careful index management (`GIN` on PostgreSQL, generated functional index columns on MySQL) to avoid unindexed table scans on deeply nested JSON keys.
+- **Future Considerations**: Add synthetic workload benchmarks or migration agent pipelines to demonstrate bi-directional schema inference and transformations between `gaming_telemetry_pg`, `gaming_economy_mysql`, and NoSQL sinks.
+
+---
+
+## [2026-10-02] - Multi-Source Dynamic Identifier Resolution, UUID Uniqueness, and Standardizing on `data-migration-agent:latest`
+
+### 1. Decision Summary
+
+Fixed primary key collision during multi-source database merges in [`apps/agent/engine/transformers/ast_transformer.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/agent/engine/transformers/ast_transformer.py) by dynamically resolving source identifiers from `source_origin` (e.g. `src_db_1` vs `src_db_2`) rather than hardcoding `source_cols[0]`. Rebuilt the migration agent Docker container and standardized the platform image naming exclusively on **`nmaru094123/data-migration-agent:latest`**, pushing the verified build directly to Docker Hub and removing redundant image tags.
+
+### 2. Why This Approach? (Rationale)
+
+- **Problem Being Solved**:
+  1. When merging multiple source databases (e.g., PostgreSQL `retail_store_pg` and MySQL `retail_online_mysql`) into a single target table, both sources possessed overlapping integer primary keys (`id=1..30`, `1..25`, `1..35`).
+  2. Because [`ASTTransformer.transform_chunk`](file:///d:/GitHub/Ai_data_migration_platform/apps/agent/engine/transformers/ast_transformer.py) hardcoded `src_ident = source_cols[0].get("identifier")`, chunks from `src_db_2` generated identical deterministic UUID v5 values (`uuid5(NAMESPACE_DNS, "src_db_1_1")`) as `src_db_1`.
+  3. Consequently, PostgreSQL target bulk insertions hit primary key uniqueness conflicts (`customers_pkey`, `products_pkey`, `orders_pkey`) and silently skipped all 90 rows from the second database under `ON CONFLICT DO NOTHING`, resulting in only 90 of 180 rows being committed.
+  4. Two conflicting image names existed across Docker Hub and local configurations (`migraflow-agent` vs `data-migration-agent`). The user requested standardizing strictly on `data-migration-agent`.
+- **Chosen Solution**:
+  1. **Dynamic Identifier Resolution**: Introduced `_resolve_src_ident()` and enhanced `_resolve_src_col()` in `ASTTransformer` to extract the active chunk's database identifier from `source_origin` (e.g., `"src_db_2.customers"` $\rightarrow$ `"src_db_2"`).
+  2. **Multi-Source UUID Partitioning**: Ensured deterministic UUID generation for primary keys and foreign keys prefixes the UUID namespace input with the resolved source identifier (`f"{src_ident}_{v}"`), ensuring zero UUID collisions across distinct sources.
+  3. **Standardized Single Image**: Standardized the Docker image on `nmaru094123/data-migration-agent:latest`, built and tested with unit tests (`test_multi_source_merge_uuid_uniqueness`), pushed to Docker Hub, and purged redundant local `migraflow-agent` tags.
+- **Why This Library / Technology**: Using `uuid5` with namespace DNS guarantees deterministic, reproducible primary keys across chunk streaming while properly partitioning by source identifier guarantees referential integrity without cross-source collisions.
+
+### 3. Alternatives Considered & Rejected
+
+- **Alternative A: Random UUID v4 Generation (`uuid_v4_rekey`)**
+  - _Rejected_: Random UUIDs are non-deterministic, making chunk replay, checkpoint resume, and foreign key parent-child linkage across separate streaming chunks impossible without maintaining a shared in-memory ID lookup table.
+- **Alternative B: Offsetting Integer Autoincrements (`autoincrement_offset`)**
+  - _Rejected_: Requires target databases to support large 64-bit integer keys and fails when target schemas require UUID primary keys.
+
+### 4. Trade-offs & Future Considerations
+
+- **Trade-offs**: Source identifiers in the migration plan AST must cleanly match the source prefix used during chunk extraction (`src_origin_tag`).
+- **Future Considerations**: Automated integration test in CI simulating end-to-end multi-source merging with identical primary key sequences across PostgreSQL and MySQL.
+
+---
+
+## [2026-10-06] - Production Readiness Hardening, Cloud Security Architecture, & Deployment Runbook
+
+### 1. Decision Summary
+
+Performed full-stack production deployment scan and hardened the system for smooth, zero-vulnerability cloud deployment (e.g. AWS EC2, VPS, or Docker hosts):
+1. **Database & Cache Port Isolation**: Bound PostgreSQL (`127.0.0.1:${POSTGRES_PORT:-5434}:5432`), Redis (`127.0.0.1:6379:6379`), MySQL (`127.0.0.1:3307:3306`), and MongoDB (`127.0.0.1:27017:27017`) strictly to localhost (`127.0.0.1`) in `docker-compose.yml`, preventing bypass of cloud firewalls by Docker iptables and securing internal databases from public internet exposure.
+2. **Adaptive CORS & Dynamic Host Resolution**: Updated `apps/api/app/main.py` and `apps/api/app/core/config.py` to sanitize trailing slashes, automatically include `FRONTEND_URL`, and auto-allow `HOST_IP`/`PUBLIC_IP` origins, completely preventing CORS errors in staging and production.
+3. **Adaptive Cookie Security**: Enhanced `validate_security_settings` in `apps/api/app/core/config.py` so direct EC2 IP deployments over plain HTTP dynamically set `COOKIE_SECURE = False` (enabling browser session cookie retention), while HTTPS domain deployments automatically enforce `COOKIE_SECURE = True`.
+4. **Web Frontend Security Headers & Dynamic Client Base URL**: Added standard security headers (`X-Frame-Options: SAMEORIGIN`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`, `Permissions-Policy`) in `apps/web/next.config.mjs`, and prioritized explicit `NEXT_PUBLIC_API_URL` in `apps/web/services/axios.ts`.
+5. **Production Reverse Proxy & Orchestration**: Created `infra/nginx/nginx.conf` and `docker-compose.prod.yml` unifying Next.js web (port 3000) and FastAPI API (port 8000) under standard port 80/443 with WebSocket upgrading and log rotation (`max-size: 20m`), along with an automated EC2 deployment script `scripts/deploy.sh` and production template `.env.production.example`.
+
+### 2. Why This Approach? (Rationale)
+- **Problem Being Solved**: Deploying directly to remote cloud servers (like AWS EC2) commonly triggers three fatal blockers: (a) raw database ports exposed to public bots, (b) browser rejecting `Secure` cookies over plain HTTP IPs preventing login, and (c) CORS origin mismatches when accessing frontend from remote IPs.
+- **Chosen Solution**: Hardening default compose port bindings to `127.0.0.1`, adapting cookie security to the protocol scheme, auto-registering frontend host origins in CORS, and providing a unified Nginx reverse proxy.
+- **Why This Library / Technology**: Nginx provides high-concurrency connection pooling, robust SSL termination, and WebSocket proxying with minimal memory footprint (~10MB RAM).
+
+### 3. Alternatives Considered & Rejected
+- **Alternative A: Binding Ports to 0.0.0.0 and Relying Exclusively on AWS Security Groups**:
+  - _Rejected_: Docker on Linux bypasses `UFW` and OS iptables by default. If a security group is misconfigured or the stack is deployed on a non-AWS VPS, databases and unauthenticated Redis instances become immediately vulnerable to public internet attacks.
+- **Alternative B: Hardcoding COOKIE_SECURE=True Globally in Production**:
+  - _Rejected_: Breaks authentication when developers test their production build on raw EC2 public IPs before attaching a domain and SSL certificate.
+
+### 4. Trade-offs & Future Considerations
+- In environments using an AWS Application Load Balancer (ALB) with SSL offloading, set `FRONTEND_URL=https://...` and `COOKIE_SECURE=true`.
 

@@ -6,15 +6,30 @@ import asyncio
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from fastapi import HTTPException, status
 from sqlalchemy import select, update, and_, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core.credential_sanitizer import CredentialSanitizer
 from app.core.db import AsyncSessionLocal
+from app.core.state import (
+    ExecutionEventType,
+    ExecutionLifecycle,
+    InvalidStateTransitionError,
+)
 from app.modules.agents.agents_models import Agent
-from app.modules.execution.execution_models import MigrationJob
+from app.modules.execution.execution_models import (
+    AgentRun,
+    ExecutionCheckpoint,
+    ExecutionEvent,
+    MigrationExecutionPlan,
+    MigrationExecutionStep,
+    MigrationJob,
+)
+from app.modules.execution.execution_plan_services import ExecutionPlanService
+from app.modules.execution.execution_state_machine import ExecutionStateMachine
 from app.modules.execution.execution_schemas import (
     ExecutionProgressUpdate,
     ExecutionStartRequest,
@@ -105,6 +120,7 @@ class ExecutionService:
         plan_id: uuid.UUID,
         is_dry_run: bool = False,
         truncate_target: bool = False,
+        idempotency_key: Optional[str] = None,
     ) -> MigrationJob:
         # Check plan existence and ownership
         stmt_plan = select(MigrationPlan).where(
@@ -129,6 +145,25 @@ class ExecutionService:
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail=f"Cannot execute unapproved migration plan. Plan status is '{plan.status}'. User approval is required.",
             )
+
+        # Idempotency check: if an idempotency key is provided, return existing job if already submitted
+        clean_idempotency_key = idempotency_key.strip() if idempotency_key else None
+        if clean_idempotency_key:
+            stmt_idem = (
+                select(MigrationJob)
+                .join(MigrationPlan, MigrationJob.migration_plan_id == MigrationPlan.id)
+                .where(
+                    MigrationJob.idempotency_key == clean_idempotency_key,
+                    MigrationPlan.user_id == user_id,
+                )
+            )
+            res_idem = await session.execute(stmt_idem)
+            existing_job = res_idem.scalar_one_or_none()
+            if existing_job:
+                logger.info(
+                    f"Idempotent execution request matched existing job '{existing_job.id}' for key '{clean_idempotency_key}'."
+                )
+                return existing_job
 
         # Check for active running job for this plan
         stmt_active = select(MigrationJob).where(
@@ -203,10 +238,40 @@ class ExecutionService:
                 f"Preflight alert for plan '{plan_id}': Target tables already contain rows: {existing_data_warnings}"
             )
 
+        # Destructive operation safety guard (Phase 4): non-dry-run executions require valid approval for destructive operations
+        if not is_dry_run:
+            from app.modules.execution.safety_services import DestructiveApprovalManager
+            current_ver = plan.approved_version_number or 1
+            if not plan.approved_version_number:
+                from app.modules.migration_plans.migration_plans_models import MigrationPlanVersion
+                v_stmt = (
+                    select(MigrationPlanVersion.version_number)
+                    .where(MigrationPlanVersion.migration_plan_id == plan.id)
+                    .order_by(MigrationPlanVersion.version_number.desc())
+                    .limit(1)
+                )
+                v_res = await session.execute(v_stmt)
+                latest_v = v_res.scalar_one_or_none()
+                if latest_v:
+                    current_ver = latest_v
+
+            is_compliant, unapproved_ops = await DestructiveApprovalManager.check_plan_destructive_compliance(
+                session=session, plan=plan, current_version_number=current_ver
+            )
+            if not is_compliant:
+                unapproved_str = ", ".join(f"{op['operation_type']} on {op['target_table']}" for op in unapproved_ops)
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Cannot execute migration: Destructive operation(s) require explicit approval for plan version {current_ver}: {unapproved_str}.",
+                )
+
+
+        now = datetime.now(timezone.utc)
         job = MigrationJob(
             migration_plan_id=plan_id,
             agent_id=plan.agent_id,
-            status="queued",
+            idempotency_key=clean_idempotency_key,
+            status=ExecutionLifecycle.QUEUED.value,
             is_dry_run=is_dry_run,
             truncate_target=truncate_target,
             total_rows=0,
@@ -215,8 +280,37 @@ class ExecutionService:
             failed_rows=0,
             progress=0.0,
             current_stage="queued",
+            created_at=now,
+            updated_at=now,
         )
         session.add(job)
+        await session.flush()
+
+        # Derive durable MigrationExecutionPlan and DAG steps
+        await ExecutionPlanService.create_execution_plan_for_job(
+            session=session, job=job, plan=plan
+        )
+
+        # Emit durable append-only JOB_CREATED event
+        event = ExecutionEvent(
+            id=uuid.uuid4(),
+            event_id=uuid.uuid4(),
+            migration_job_id=job.id,
+            migration_plan_id=plan_id,
+            event_type=ExecutionEventType.JOB_CREATED.value,
+            actor_type="user",
+            actor_id=str(user_id),
+            timestamp=now,
+            payload={
+                "action": "job_created",
+                "job_id": str(job.id),
+                "is_dry_run": is_dry_run,
+                "truncate_target": truncate_target,
+                "idempotency_key": clean_idempotency_key,
+            },
+            schema_version=1,
+        )
+        session.add(event)
         await session.commit()
         await session.refresh(job)
 
@@ -224,7 +318,7 @@ class ExecutionService:
         setattr(job, "target_tables_with_existing_data", existing_data_warnings)
 
         logger.info(
-            f"Created execution job '{job.id}' for plan '{plan_id}' (Agent ID: {plan.agent_id})."
+            f"Created execution job '{job.id}' for plan '{plan_id}' (Agent ID: {plan.agent_id}, IdempotencyKey: {clean_idempotency_key})."
         )
         return job
 
@@ -281,9 +375,28 @@ class ExecutionService:
 
         await session.commit()
 
-        stmt_fetch = select(MigrationJob).where(MigrationJob.id.in_(job_ids))
+        stmt_fetch = (
+            select(MigrationJob)
+            .options(selectinload(MigrationJob.execution_plan))
+            .where(MigrationJob.id.in_(job_ids))
+        )
         res_fetch = await session.execute(stmt_fetch)
-        return list(res_fetch.scalars().all())
+        jobs = list(res_fetch.scalars().all())
+
+        for job in jobs:
+            # Instantiate first-class AgentRun execution attempt and emit event
+            await ExecutionStateMachine.create_agent_run(
+                session=session,
+                job=job,
+                agent_id=agent_id,
+                status=ExecutionLifecycle.PREPARING,
+                actor_type="agent",
+                actor_id=str(agent_id),
+            )
+            if job.execution_plan:
+                setattr(job, "execution_plan_id", job.execution_plan.id)
+        await session.commit()
+        return jobs
 
     @staticmethod
     async def check_stale_jobs(
@@ -296,7 +409,7 @@ class ExecutionService:
         """
         cutoff = datetime.now(timezone.utc) - timedelta(seconds=stale_threshold_seconds)
         stmt = select(MigrationJob).where(
-            MigrationJob.status.in_(["queued", "running", "preparing"]),
+            MigrationJob.status.in_(["queued", "claimed", "preparing", "running", "recovering", "verifying"]),
             MigrationJob.updated_at < cutoff,
         )
         res = await session.execute(stmt)
@@ -305,12 +418,17 @@ class ExecutionService:
         if not stale_jobs:
             return 0
 
-        now = datetime.now(timezone.utc)
         for job in stale_jobs:
-            job.status = "failed"
-            job.completed_at = now
-            job.error_message = (
+            err = (
                 f"Migration job stalled: no progress updates received from agent for over {stale_threshold_seconds} seconds."
+            )
+            await ExecutionStateMachine.transition_job(
+                session=session,
+                job=job,
+                target_state=ExecutionLifecycle.FAILED,
+                actor_type="watchdog",
+                actor_id="watchdog",
+                reason=err,
             )
             logger.error(
                 f"Watchdog failed stale job '{job.id}' (last updated: {job.updated_at})."
@@ -326,6 +444,11 @@ class ExecutionService:
                         "error_message": job.error_message,
                     },
                 )
+
+        # Recover stale steps across all active execution plans
+        await ExecutionPlanService.recover_stale_steps(
+            session=session, stale_threshold_seconds=stale_threshold_seconds
+        )
 
         await session.commit()
         return len(stale_jobs)
@@ -376,17 +499,54 @@ class ExecutionService:
                 detail=f"Execution job '{job_id}' not found or access denied.",
             )
 
-        if job.status not in ["queued", "preparing", "running"]:
+        # Enforce legal transition to CANCELLED via state machine
+        try:
+            await ExecutionStateMachine.transition_job(
+                session=session,
+                job=job,
+                target_state=ExecutionLifecycle.CANCELLED,
+                actor_type="user",
+                actor_id=str(user_id),
+                reason=reason or "Execution cancelled by user.",
+            )
+        except InvalidStateTransitionError as err:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Cannot cancel execution job with status '{job.status}'. Only active jobs (queued, preparing, running) can be cancelled.",
+                detail=f"Cannot cancel execution job with status '{job.status}'. {err}",
             )
 
         now = datetime.now(timezone.utc)
-        job.status = "cancelled"
-        job.completed_at = now
-        job.current_stage = "cancelled"
-        job.error_message = reason or "Execution cancelled by user."
+
+        # Cascade cancellation to execution plan and pending/running/retrying steps
+        from app.modules.execution.execution_models import (
+            MigrationExecutionPlan,
+            MigrationExecutionStep,
+        )
+        from app.core.state import ExecutionPlanLifecycle, ExecutionStepLifecycle
+        stmt_plan = (
+            select(MigrationExecutionPlan)
+            .where(MigrationExecutionPlan.migration_job_id == job.id)
+            .options(selectinload(MigrationExecutionPlan.steps))
+        )
+        res_plan = await session.execute(stmt_plan)
+        exec_plan = res_plan.scalar_one_or_none()
+        if exec_plan and exec_plan.status not in (
+            ExecutionPlanLifecycle.COMPLETED.value,
+            ExecutionPlanLifecycle.FAILED.value,
+            ExecutionPlanLifecycle.CANCELLED.value,
+        ):
+            exec_plan.status = ExecutionPlanLifecycle.CANCELLED.value
+            exec_plan.finalized_at = now
+            for s in exec_plan.steps:
+                if s.status in (
+                    ExecutionStepLifecycle.PENDING.value,
+                    ExecutionStepLifecycle.RUNNING.value,
+                    ExecutionStepLifecycle.RETRYING.value,
+                    ExecutionStepLifecycle.ASK_USER.value,
+                ):
+                    s.status = ExecutionStepLifecycle.CANCELLED.value
+                    s.finished_at = now
+                    s.updated_at = now
 
         # Reset assigned Docker Agent status to online
         if job.agent_id:
@@ -451,6 +611,7 @@ class ExecutionService:
         """
         Updates live metrics and status for a MigrationJob from Docker Agent progress payload.
         Ensures the updating agent is the one assigned to the job.
+        Transitions state through ExecutionStateMachine.
         """
         stmt = select(MigrationJob).where(MigrationJob.id == job_id)
         if agent_id:
@@ -468,13 +629,68 @@ class ExecutionService:
         if job.status == "cancelled":
             return job
 
-        now = datetime.now(timezone.utc)
-        if update.status == "running" and job.started_at is None:
-            job.started_at = now
-        elif update.status in ["completed", "failed", "dry_run_completed"]:
-            job.completed_at = now
+        # Synchronize run identity if provided by agent
+        if update.agent_run_id and job.current_run_id != update.agent_run_id:
+            job.current_run_id = update.agent_run_id
 
-        job.status = update.status
+        # Normalize and transition through state machine if state has changed
+        norm_target_state = ExecutionStateMachine.normalize_state(update.status)
+        norm_curr_state = ExecutionStateMachine.normalize_state(job.status)
+
+        if norm_target_state != norm_curr_state:
+            # If agent directly reports RUNNING or COMPLETED from QUEUED, advance through intermediate states
+            if norm_curr_state == ExecutionLifecycle.QUEUED and norm_target_state in (
+                ExecutionLifecycle.RUNNING,
+                ExecutionLifecycle.COMPLETED,
+            ):
+                await ExecutionStateMachine.transition_job(
+                    session=session,
+                    job=job,
+                    target_state=ExecutionLifecycle.PREPARING,
+                    actor_type="agent",
+                    actor_id=str(agent_id or job.agent_id or "agent"),
+                    reason="Auto-advance on progress update",
+                )
+                norm_curr_state = ExecutionLifecycle.PREPARING
+
+            if norm_curr_state in (
+                ExecutionLifecycle.CLAIMED,
+                ExecutionLifecycle.PREPARING,
+            ) and norm_target_state == ExecutionLifecycle.COMPLETED:
+                await ExecutionStateMachine.transition_job(
+                    session=session,
+                    job=job,
+                    target_state=ExecutionLifecycle.RUNNING,
+                    actor_type="agent",
+                    actor_id=str(agent_id or job.agent_id or "agent"),
+                    reason="Auto-advance to running before completion",
+                )
+                norm_curr_state = ExecutionLifecycle.RUNNING
+
+            try:
+                await ExecutionStateMachine.transition_job(
+                    session=session,
+                    job=job,
+                    target_state=norm_target_state,
+                    actor_type="agent",
+                    actor_id=str(agent_id or job.agent_id or "agent"),
+                    reason=update.error_message,
+                    payload_extra={
+                        "progress": update.progress,
+                        "processed_rows": update.processed_rows,
+                        "successful_rows": update.successful_rows,
+                        "failed_rows": update.failed_rows,
+                        "current_table": update.current_table,
+                        "current_stage": update.current_stage,
+                    },
+                )
+            except InvalidStateTransitionError as err:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=str(err),
+                )
+
+        now = datetime.now(timezone.utc)
         job.progress = update.progress
         if update.total_rows > 0:
             job.total_rows = update.total_rows
@@ -490,8 +706,12 @@ class ExecutionService:
             job.current_stage = update.current_stage
         if update.error_message:
             job.error_message = update.error_message
-        elif update.status in ["completed", "dry_run_completed"]:
+        elif norm_target_state == ExecutionLifecycle.COMPLETED:
             job.error_message = None
+
+        # Preserve explicit dry_run_completed status
+        if update.status == "dry_run_completed" or (job.is_dry_run and norm_target_state == ExecutionLifecycle.COMPLETED):
+            job.status = "dry_run_completed"
 
         # Refresh agent last_seen_at, status, and idle_since to prevent heartbeat starvation during ETL execution
         if job.agent_id:
@@ -500,13 +720,13 @@ class ExecutionService:
             agent_obj = res_agent.scalar_one_or_none()
             if agent_obj:
                 agent_obj.last_seen_at = now
-                if update.status == "running":
+                if norm_target_state == ExecutionLifecycle.RUNNING:
                     agent_obj.status = "busy"
                     agent_obj.idle_since = None   # Actively running — clear idle marker
-                elif update.status in ["completed", "dry_run_completed"]:
+                elif norm_target_state == ExecutionLifecycle.COMPLETED:
                     agent_obj.status = "online"
                     agent_obj.idle_since = now    # Job done — start idle tracking for Option C/A
-                elif update.status == "failed":
+                elif norm_target_state == ExecutionLifecycle.FAILED:
                     agent_obj.status = "error"
                     agent_obj.last_error = f"Migration job '{job.id}' failed: {update.error_message or 'Fatal execution failure.'}"
                     agent_obj.error_category = "JOB_EXECUTION_FAILURE"
@@ -629,6 +849,8 @@ class ExecutionService:
                             target_engine = ds.type or "postgresql"
                             break
 
+                sanitized_err_trace = CredentialSanitizer.mask_credentials(err_msg)
+
                 llm_prompt = f"""You are an expert database migration architect and friendly AI pair programmer (like Antigravity).
 A database migration job just failed with an error. Provide a clear, intuitive, plain-English explanation of why it failed and the exact SQL or CLI command to resolve it.
 
@@ -638,7 +860,7 @@ Migration Context:
 - Current Table: {tbl}
 - Target Database Engine: {target_engine}
 - Raw Error Trace:
-{err_msg}
+{sanitized_err_trace}
 
 Rules:
 1. Explain in simple, conversational terms so a developer immediately understands what happened in their database.
@@ -892,6 +1114,167 @@ Rules:
         await session.commit()
         await session.refresh(job)
         return job
+
+    @staticmethod
+    async def list_runs_for_job(
+        session: AsyncSession, job_id: uuid.UUID, user_id: uuid.UUID
+    ) -> List[AgentRun]:
+        """Fetch all AgentRun attempts for a MigrationJob owned by the user."""
+        stmt = (
+            select(AgentRun)
+            .join(MigrationJob, AgentRun.migration_job_id == MigrationJob.id)
+            .join(MigrationPlan, MigrationJob.migration_plan_id == MigrationPlan.id)
+            .where(AgentRun.migration_job_id == job_id, MigrationPlan.user_id == user_id)
+            .order_by(AgentRun.created_at.asc())
+        )
+        res = await session.execute(stmt)
+        return list(res.scalars().all())
+
+    @staticmethod
+    async def list_events_for_job(
+        session: AsyncSession, job_id: uuid.UUID, user_id: uuid.UUID
+    ) -> List[ExecutionEvent]:
+        """Fetch all append-only ExecutionEvents for a MigrationJob owned by the user."""
+        stmt = (
+            select(ExecutionEvent)
+            .join(MigrationJob, ExecutionEvent.migration_job_id == MigrationJob.id)
+            .join(MigrationPlan, MigrationJob.migration_plan_id == MigrationPlan.id)
+            .where(ExecutionEvent.migration_job_id == job_id, MigrationPlan.user_id == user_id)
+            .order_by(ExecutionEvent.timestamp.asc())
+        )
+        res = await session.execute(stmt)
+        return list(res.scalars().all())
+
+    @staticmethod
+    async def get_execution_plan_for_job(
+        session: AsyncSession, job_id: uuid.UUID, user_id: Optional[uuid.UUID] = None
+    ) -> Optional[MigrationExecutionPlan]:
+        """Fetch the derived MigrationExecutionPlan with steps and checkpoints for a job."""
+        stmt = (
+            select(MigrationExecutionPlan)
+            .options(
+                selectinload(MigrationExecutionPlan.steps).selectinload(
+                    MigrationExecutionStep.checkpoints
+                )
+            )
+            .join(MigrationJob, MigrationExecutionPlan.migration_job_id == MigrationJob.id)
+        )
+        if user_id:
+            stmt = stmt.join(MigrationPlan, MigrationJob.migration_plan_id == MigrationPlan.id).where(
+                MigrationPlan.user_id == user_id
+            )
+        stmt = stmt.where(MigrationExecutionPlan.migration_job_id == job_id)
+        res = await session.execute(stmt)
+        return res.scalar_one_or_none()
+
+    @staticmethod
+    async def claim_next_step(
+        session: AsyncSession,
+        execution_plan_id: uuid.UUID,
+        agent_id: uuid.UUID,
+        agent_run_id: uuid.UUID,
+    ) -> Optional[MigrationExecutionStep]:
+        """Claims the next available step for an active agent run."""
+        step = await ExecutionPlanService.claim_next_step(
+            session=session,
+            execution_plan_id=execution_plan_id,
+            agent_id=agent_id,
+            agent_run_id=agent_run_id,
+        )
+        if step:
+            await session.commit()
+            await session.refresh(step)
+        return step
+
+    @staticmethod
+    async def save_step_checkpoint(
+        session: AsyncSession,
+        step_id: uuid.UUID,
+        source_identifier: str,
+        source_table: str,
+        target_table: str,
+        cursor_offset: int,
+        rows_processed: int,
+        source_position: Optional[dict] = None,
+    ) -> ExecutionCheckpoint:
+        """Persists an authoritative checkpoint to PostgreSQL/SQLite."""
+        checkpoint = await ExecutionPlanService.save_checkpoint(
+            session=session,
+            step_id=step_id,
+            source_identifier=source_identifier,
+            source_table=source_table,
+            target_table=target_table,
+            cursor_offset=cursor_offset,
+            rows_processed=rows_processed,
+            source_position=source_position,
+        )
+        await session.commit()
+        await session.refresh(checkpoint)
+        return checkpoint
+
+    @staticmethod
+    async def get_step_checkpoints(
+        session: AsyncSession, step_id: uuid.UUID
+    ) -> List[ExecutionCheckpoint]:
+        """Fetches all checkpoints for an execution step."""
+        return await ExecutionPlanService.get_checkpoints_for_step(session, step_id)
+
+    @staticmethod
+    async def complete_step(
+        session: AsyncSession,
+        step_id: uuid.UUID,
+        output_summary: Optional[dict] = None,
+    ) -> MigrationExecutionStep:
+        """Marks a step completed and checks for whole plan completion."""
+        step = await ExecutionPlanService.complete_step(
+            session=session, step_id=step_id, output_summary=output_summary
+        )
+        await session.commit()
+        await session.refresh(step)
+        return step
+
+    @staticmethod
+    async def fail_step(
+        session: AsyncSession,
+        step_id: uuid.UUID,
+        error_type: Optional[str] = None,
+        error_message: Optional[str] = None,
+    ) -> MigrationExecutionStep:
+        """Handles step failure and applies retry policy."""
+        step = await ExecutionPlanService.fail_step(
+            session=session,
+            step_id=step_id,
+            error_type=error_type,
+            error_message=error_message or "Execution step failed.",
+        )
+        await session.commit()
+        await session.refresh(step)
+        return step
+
+    @staticmethod
+    async def list_user_interventions(
+        session: AsyncSession,
+        job_id: uuid.UUID,
+    ) -> List[Any]:
+        """Lists pending and resolved user interventions for a migration job."""
+        return await ExecutionPlanService.list_user_interventions(session, job_id)
+
+    @staticmethod
+    async def resolve_user_intervention(
+        session: AsyncSession,
+        intervention_id: uuid.UUID,
+        user_id: uuid.UUID,
+        action: str,
+        response_data: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        """Resolves an ASK_USER intervention and resumes or redirects execution."""
+        return await ExecutionPlanService.resolve_user_intervention(
+            session=session,
+            intervention_id=intervention_id,
+            user_id=user_id,
+            action=action,
+            response_data=response_data,
+        )
 
 
 async def _run_diagnosis_background(job_id: uuid.UUID):

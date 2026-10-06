@@ -69,6 +69,18 @@ class MetadataService:
 
             data_source = source_map.get(req_id)
 
+            # Fallback for generic destination identifiers ('dest_db', 'dest', 'target_db', 'target')
+            if not data_source and req_id in ("dest_db", "destination_db", "dest", "target_db", "target"):
+                target_sources = [ds for ds in data_sources_list if ds.role in ("target", "destination", "dest")]
+                if len(target_sources) == 1:
+                    data_source = target_sources[0]
+
+            # Fallback for generic source identifiers ('source_db', 'src_db', 'source', 'src')
+            if not data_source and req_id in ("source_db", "src_db", "source", "src"):
+                source_sources = [ds for ds in data_sources_list if ds.role in ("source", "src")]
+                if len(source_sources) == 1:
+                    data_source = source_sources[0]
+
         # Fallback to single data source if only 1 attached
         if not data_source and len(data_sources_list) == 1:
             data_source = data_sources_list[0]

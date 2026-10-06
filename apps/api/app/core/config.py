@@ -1,7 +1,8 @@
 import os
+import secrets
 from typing import Any, List, Literal
 from dotenv import find_dotenv, load_dotenv
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Automatically load .env variables into process os.environ for LangChain/LangSmith AI tracing
@@ -52,7 +53,7 @@ class Settings(BaseSettings):
     LLM_MAX_RETRIES: int = 2
     LLM_TIMEOUT_SECONDS: float = 360.0
 
-    # LangSmith AI Observability & Error Tracing
+    # LangSmith AI Observability & Error Tracing (default disabled for privacy)
     LANGCHAIN_TRACING_V2: str = "false"
     LANGCHAIN_API_KEY: str = ""
     LANGCHAIN_PROJECT: str = "migraflow-platform"
@@ -65,16 +66,48 @@ class Settings(BaseSettings):
     @field_validator("CORS_ORIGINS", mode="after")
     @classmethod
     def assemble_cors_origins(cls, v: Any) -> List[str]:
+        origins: List[str] = []
         if isinstance(v, str):
             v_strip = v.strip()
             if v_strip.startswith("["):
                 import json
                 try:
-                    return json.loads(v_strip)
+                    origins = json.loads(v_strip)
                 except Exception:
-                    pass
-            return [i.strip() for i in v.split(",") if i.strip()]
-        return v
+                    origins = [i.strip() for i in v.split(",") if i.strip()]
+            else:
+                origins = [i.strip() for i in v.split(",") if i.strip()]
+        elif isinstance(v, list):
+            origins = list(v)
+        else:
+            return v
+        # UK GDPR compliance: Exclude '*' wildcard to prevent credential leakage via CORS
+        return [o.rstrip("/") for o in origins if o != "*"]
+
+    @model_validator(mode="after")
+    def validate_security_settings(self) -> "Settings":
+        insecure_defaults = {
+            "default_secret_key_change_me_in_production",
+            "default_jwt_secret_key_change_me_in_production",
+            "generate_a_random_32_character_secret_key",
+        }
+        if self.SECRET_KEY in insecure_defaults:
+            # Auto-generate a secure random 256-bit token instead of crashing the container
+            self.SECRET_KEY = secrets.token_hex(32)
+        if self.JWT_SECRET_KEY in insecure_defaults:
+            # Auto-generate a secure random 256-bit token instead of crashing the container
+            self.JWT_SECRET_KEY = secrets.token_hex(32)
+
+        if self.ENVIRONMENT.lower() == "production":
+            if "COOKIE_SECURE" not in os.environ:
+                if self.FRONTEND_URL.startswith("https://"):
+                    self.COOKIE_SECURE = True
+                elif self.FRONTEND_URL.startswith("http://"):
+                    # Direct IP or HTTP deployments require COOKIE_SECURE=False so browsers accept session cookies
+                    self.COOKIE_SECURE = False
+                else:
+                    self.COOKIE_SECURE = True
+        return self
 
     model_config = SettingsConfigDict(
         env_file=("../../.env", "../.env", ".env"),

@@ -3,6 +3,9 @@ import toast from 'react-hot-toast';
 import Cookies from 'js-cookie';
 
 const getInitialBaseUrl = (): string => {
+  if (process.env.NEXT_PUBLIC_API_URL) {
+    return process.env.NEXT_PUBLIC_API_URL;
+  }
   if (typeof window !== 'undefined') {
     const host = window.location.hostname;
     const isLocal = host === 'localhost' || host === '127.0.0.1';
@@ -12,9 +15,6 @@ const getInitialBaseUrl = (): string => {
       }
       return `${window.location.protocol}//${host}:8000/api/v1`;
     }
-  }
-  if (process.env.NEXT_PUBLIC_API_URL) {
-    return process.env.NEXT_PUBLIC_API_URL;
   }
   return 'http://localhost:8000/api/v1';
 };
@@ -27,7 +27,9 @@ export const apiClient = axios.create({
 });
 
 apiClient.interceptors.request.use((config) => {
-  if (typeof window !== 'undefined') {
+  if (process.env.NEXT_PUBLIC_API_URL) {
+    config.baseURL = process.env.NEXT_PUBLIC_API_URL;
+  } else if (typeof window !== 'undefined') {
     const host = window.location.hostname;
     const isLocal = host === 'localhost' || host === '127.0.0.1';
 
