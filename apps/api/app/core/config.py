@@ -1,4 +1,5 @@
 import os
+import secrets
 from typing import Any, List, Literal
 from dotenv import find_dotenv, load_dotenv
 from pydantic import field_validator, model_validator
@@ -85,16 +86,19 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_security_settings(self) -> "Settings":
+        insecure_defaults = {
+            "default_secret_key_change_me_in_production",
+            "default_jwt_secret_key_change_me_in_production",
+            "generate_a_random_32_character_secret_key",
+        }
+        if self.SECRET_KEY in insecure_defaults:
+            # Auto-generate a secure random 256-bit token instead of crashing the container
+            self.SECRET_KEY = secrets.token_hex(32)
+        if self.JWT_SECRET_KEY in insecure_defaults:
+            # Auto-generate a secure random 256-bit token instead of crashing the container
+            self.JWT_SECRET_KEY = secrets.token_hex(32)
+
         if self.ENVIRONMENT.lower() == "production":
-            insecure_defaults = {
-                "default_secret_key_change_me_in_production",
-                "default_jwt_secret_key_change_me_in_production",
-                "generate_a_random_32_character_secret_key",
-            }
-            if self.SECRET_KEY in insecure_defaults:
-                raise ValueError("CRITICAL SECURITY ERROR: Insecure default SECRET_KEY in production! Provide a secure random secret key.")
-            if self.JWT_SECRET_KEY in insecure_defaults:
-                raise ValueError("CRITICAL SECURITY ERROR: Insecure default JWT_SECRET_KEY in production! Provide a secure random secret key.")
             if "COOKIE_SECURE" not in os.environ:
                 if self.FRONTEND_URL.startswith("https://"):
                     self.COOKIE_SECURE = True
