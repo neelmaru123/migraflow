@@ -282,7 +282,7 @@ class AgentService:
         if agent.last_seen_at and heartbeat.status == agent.status and not heartbeat.data_sources:
             last_seen = agent.last_seen_at if agent.last_seen_at.tzinfo else agent.last_seen_at.replace(tzinfo=timezone.utc)
             if (now - last_seen).total_seconds() < 0.1:
-                return agent
+                return AgentResponse.model_validate(agent)
 
         previous_status = agent.status
         agent.status = heartbeat.status.strip()
@@ -367,7 +367,7 @@ class AgentService:
                         "role": ds.role,
                         "status": ds.status,
                         "last_error": ds.last_error,
-                        "last_checked_at": ds.last_checked_at.isoformat(),
+                        "last_checked_at": ds.last_checked_at.isoformat() if ds.last_checked_at else None,
                     })
                 else:
                     logger.debug(
@@ -593,7 +593,7 @@ class AgentService:
                 "status": "error",
                 "last_error": agent.last_error,
                 "error_category": agent.error_category,
-                "last_error_at": agent.last_error_at.isoformat(),
+                "last_error_at": agent.last_error_at.isoformat() if agent.last_error_at else None,
             },
         )
 
@@ -663,7 +663,7 @@ class AgentService:
                             "event": "AGENT_CONNECTED",
                             "agent_id": str(agent.id),
                             "status": "online",
-                            "last_seen_at": agent.last_seen_at.isoformat(),
+                            "last_seen_at": agent.last_seen_at.isoformat() if agent.last_seen_at else None,
                         },
                     )
 
@@ -747,7 +747,7 @@ class AgentService:
                     "reason": "heartbeat_timeout",
                     "last_error": agent.last_error,
                     "error_category": agent.error_category,
-                    "last_error_at": agent.last_error_at.isoformat(),
+                    "last_error_at": agent.last_error_at.isoformat() if agent.last_error_at else None,
                     "last_seen_at": agent.last_seen_at.isoformat() if agent.last_seen_at else None,
                 },
             )

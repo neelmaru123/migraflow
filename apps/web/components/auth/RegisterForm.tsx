@@ -119,7 +119,7 @@ export default function RegisterForm() {
         {/* Password Field */}
         <div>
           <label className="block text-[11px] font-semibold uppercase tracking-wider text-zinc-300 mb-1">
-            Password (8 - 12 Chars)
+            Password (Min 8 Characters)
           </label>
           <div className="relative">
             <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-sky-400">
@@ -135,8 +135,8 @@ export default function RegisterForm() {
                   message: 'Password must be at least 8 characters',
                 },
                 maxLength: {
-                  value: 12,
-                  message: 'Password must not exceed 12 characters',
+                  value: 128,
+                  message: 'Password must not exceed 128 characters',
                 },
               })}
               className={`w-full pl-9 pr-3 py-2 bg-sky-400/[0.04] backdrop-blur-md border ${
@@ -158,6 +158,19 @@ export default function RegisterForm() {
           <span>{registerMutation.isPending ? 'Creating Account...' : 'Create Account'}</span>
           <ArrowRight className="w-4 h-4" />
         </button>
+
+        {/* UK GDPR Transparency Notice */}
+        <p className="text-[11px] text-zinc-400 text-center mt-2 leading-relaxed">
+          By signing up, you acknowledge our{' '}
+          <Link href="/privacy" className="text-sky-400 hover:underline">
+            UK GDPR Privacy Notice
+          </Link>{' '}
+          and accept our{' '}
+          <Link href="/terms" className="text-sky-400 hover:underline">
+            Terms of Service
+          </Link>
+          . Fully compliant with the UK Data Protection Act 2018.
+        </p>
       </form>
 
       {/* Switch to Login */}

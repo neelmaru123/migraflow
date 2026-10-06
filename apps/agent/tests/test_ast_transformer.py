@@ -119,8 +119,67 @@ def test_datetime_fallback_for_non_date_string():
     print("[PASS] test_datetime_fallback_for_non_date_string passed successfully.")
 
 
+def test_multi_source_merge_uuid_uniqueness():
+    """Verify that identical integer IDs from two different sources produce distinct UUIDs."""
+    df_src1 = pl.DataFrame({
+        "id": [1, 2, 3],
+        "name": ["Item A", "Item B", "Item C"],
+    })
+    df_src2 = pl.DataFrame({
+        "id": [1, 2, 3],
+        "name": ["Online A", "Online B", "Online C"],
+    })
+
+    column_mappings = [
+        {
+            "target_column_name": "id",
+            "source_columns": [
+                {"identifier": "src_db_1", "column_name": "id"},
+                {"identifier": "src_db_2", "column_name": "id"},
+            ],
+            "transformation_type": "type_cast",
+            "target_data_type": "uuid",
+            "is_primary_key": True,
+        },
+        {
+            "target_column_name": "name",
+            "source_columns": [
+                {"identifier": "src_db_1", "column_name": "name"},
+                {"identifier": "src_db_2", "column_name": "name"},
+            ],
+            "transformation_type": "direct_copy",
+        },
+    ]
+
+    df_trans1, err1 = ASTTransformer.transform_chunk(
+        df_src1,
+        column_mappings,
+        source_origin="src_db_1.products",
+    )
+    df_trans2, err2 = ASTTransformer.transform_chunk(
+        df_src2,
+        column_mappings,
+        source_origin="src_db_2.products",
+    )
+
+    assert err1 == 0 and err2 == 0
+    ids_1 = set(df_trans1["id"].to_list())
+    ids_2 = set(df_trans2["id"].to_list())
+
+    # Ensure each source produced valid UUIDs
+    assert len(ids_1) == 3
+    assert len(ids_2) == 3
+
+    # Crucial check: Zero intersection between UUIDs of src_db_1 and src_db_2
+    collision = ids_1.intersection(ids_2)
+    assert len(collision) == 0, f"Expected 0 UUID collisions between sources, found: {collision}"
+    print("[PASS] test_multi_source_merge_uuid_uniqueness passed successfully.")
+
+
 if __name__ == "__main__":
     test_source_origin_auto_population()
     test_source_origin_fallback_when_none()
     test_datetime_fallback_for_non_date_string()
+    test_multi_source_merge_uuid_uniqueness()
     print("ALL TESTS PASSED!")
+

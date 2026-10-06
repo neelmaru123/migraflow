@@ -1,5 +1,60 @@
 # Execution Flow — Migraflow Platform
 
+## Execution Flow — UK GDPR & PECR Compliance Controls
+
+### 1. Entry Points
+- **API Endpoints**:
+  - `GET /api/v1/users/me/export` in [`apps/api/app/modules/users/users_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/users/users_routes.py)
+  - `DELETE /api/v1/users/me` in [`apps/api/app/modules/users/users_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/users/users_routes.py)
+  - `GET /api/v1/users/{user_id}` and `GET /api/v1/users` in [`apps/api/app/modules/users/users_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/users/users_routes.py)
+- **Web Routes & Components**:
+  - [`apps/web/app/settings/page.tsx`](file:///d:/GitHub/Ai_data_migration_platform/apps/web/app/settings/page.tsx)
+  - [`apps/web/components/common/CookieConsentBanner.tsx`](file:///d:/GitHub/Ai_data_migration_platform/apps/web/components/common/CookieConsentBanner.tsx)
+  - [`apps/web/components/landing/SplineHeroBackground.tsx`](file:///d:/GitHub/Ai_data_migration_platform/apps/web/components/landing/SplineHeroBackground.tsx)
+
+### 2. Step-by-Step Execution Sequence
+
+#### Flow A: Article 20 Right to Data Portability
+1. **User Request**: User clicks "Download Archive" on `/settings` or calls `GET /api/v1/users/me/export`.
+2. **Auth Verification**: Dependency `get_current_active_user` verifies HTTP-only JWT access cookie.
+3. **Service Aggregation**: `UserService.export_user_data(db, current_user)` executes:
+   - Queries `User` profile record.
+   - Queries all `Agent` records (`user_id == user.id`).
+   - Queries all `DataSource` records connected to user's agents.
+   - Queries all `MigrationPlan` records (`user_id == user.id`).
+   - Queries all `MigrationJob` records tied to user's plans.
+   - Omits passwords, hashed tokens, and raw credentials.
+4. **Serialization & Download**: Backend returns `UserDataExport` schema. Frontend `authService.downloadUserDataExport()` creates an in-memory Blob and triggers download of `migraflow_data_export_<date>.json`.
+
+#### Flow B: PECR Cookie Consent & Script Gating
+1. **Initial Visit**: User arrives at landing page `/`.
+2. **Hook Evaluation**: `useCookieConsent` reads `localStorage.getItem('migraflow_cookie_consent')`.
+3. **Consent Gating**:
+   - If consent missing: `hasDecided == false`.
+   - `CookieConsentBanner` renders.
+   - `SplineHeroBackground` sees `preferences.visuals_3d == false` and does NOT inject `<script src="spline-viewer.js">` or mount iframe. It renders a dark CSS ambient mesh.
+4. **Affirmative Choice**: User clicks "Accept All" or toggles 3D visuals.
+5. **Reactive Propagation**: `useCookieConsent` writes to `localStorage` and dispatches `CustomEvent("migraflow-cookie-consent-updated")`. `SplineHeroBackground` dynamically mounts the 3D viewer without page reload.
+
+### 3. Impact & Delta Analysis (AI Modifications)
+- **[NEW]**: [`apps/api/alembic/versions/019_add_is_superuser_to_users.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/alembic/versions/019_add_is_superuser_to_users.py) - Added `is_superuser` column to `users`.
+- **[NEW]**: [`apps/api/tests/unit/test_gdpr_compliance.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/tests/unit/test_gdpr_compliance.py) - Automated tests for data portability, IDOR, enumeration defense, and sanitizer.
+- **[NEW]**: [`apps/web/hooks/useCookieConsent.ts`](file:///d:/GitHub/Ai_data_migration_platform/apps/web/hooks/useCookieConsent.ts) - Reactive PECR consent hook.
+- **[NEW]**: [`apps/web/components/common/CookieConsentBanner.tsx`](file:///d:/GitHub/Ai_data_migration_platform/apps/web/components/common/CookieConsentBanner.tsx) - Accessible, granular cookie banner.
+- **[NEW]**: [`apps/web/app/privacy/page.tsx`](file:///d:/GitHub/Ai_data_migration_platform/apps/web/app/privacy/page.tsx) - UK GDPR Privacy Notice.
+- **[NEW]**: [`apps/web/app/terms/page.tsx`](file:///d:/GitHub/Ai_data_migration_platform/apps/web/app/terms/page.tsx) - Terms of Service.
+- **[NEW]**: [`apps/web/app/settings/page.tsx`](file:///d:/GitHub/Ai_data_migration_platform/apps/web/app/settings/page.tsx) & [`AccountSettingsView.tsx`](file:///d:/GitHub/Ai_data_migration_platform/apps/web/components/settings/AccountSettingsView.tsx) - Profile, data export, and erasure.
+- **[MODIFIED]**: [`apps/api/app/main.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/main.py) - Removed CORS regex wildcard.
+- **[MODIFIED]**: [`apps/api/app/core/config.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/core/config.py) - Production secret validation and CORS origin cleaning.
+- **[MODIFIED]**: [`apps/api/app/modules/users/users_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/users/users_routes.py) - IDOR fix on `/users/{id}` & `/users`, generic `forgot-password`, `GET /users/me/export`.
+- **[MODIFIED]**: [`apps/api/app/core/email.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/core/email.py) - Email masking in logs.
+- **[MODIFIED]**: [`apps/api/app/core/credential_sanitizer.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/core/credential_sanitizer.py) & [`execution_services.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_services.py) - Redacted PII from LLM prompts.
+- **[MODIFIED]**: [`apps/agent/engine/orchestrator.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/agent/engine/orchestrator.py) - Immediate deletion of DuckDB staging files upon job exit.
+- **[MODIFIED]**: [`apps/web/components/landing/SplineHeroBackground.tsx`](file:///d:/GitHub/Ai_data_migration_platform/apps/web/components/landing/SplineHeroBackground.tsx) - Gated 3D script behind consent with fallback.
+- **[MODIFIED]**: [`apps/web/components/auth/RegisterForm.tsx`](file:///d:/GitHub/Ai_data_migration_platform/apps/web/components/auth/RegisterForm.tsx) - Increased max password to 128 chars, added privacy links.
+
+---
+
 ## Execution Flow — Password Recovery & Reset Flow (Redis TTL & Google SMTP)
 
 ### 1. Entry Points
@@ -2087,3 +2142,92 @@ sequenceDiagram
 - **[MODIFIED]**: [`database_credentials.env`](file:///d:/GitHub/Ai_data_migration_platform/database_credentials.env) — Added `PG_GAMING_TELEMETRY_URL` and `MYSQL_GAMING_ECONOMY_URL`.
 - **[MODIFIED]**: [`docs/DECISIONS.md`](file:///d:/GitHub/Ai_data_migration_platform/docs/DECISIONS.md) — Recorded architectural decision log for modeling document-oriented NoSQL domains in RDBMS.
 - **[UNCHANGED]**: Existing databases (`migration_platform`, `ecommerce_db`, `crm_db`, `inventory_db`, etc.) and API service routes.
+
+---
+
+# Execution Flow - Multi-Source Dynamic Identifier Resolution & Docker Agent Image Standardization
+
+## 1. Entry Point
+
+- **File**: [`apps/agent/engine/orchestrator.py:L289`](file:///d:/GitHub/Ai_data_migration_platform/apps/agent/engine/orchestrator.py#L289)
+- **Trigger**: Invocation of `ASTTransformer.transform_chunk()` during multi-source table migration loop when streaming data chunks from distinct source engines (e.g. `retail_store_pg` and `retail_online_mysql`).
+
+## 2. Step-by-Step Execution Sequence
+
+1. **Extraction with Lineage Tagging**:
+   - `ExecutionOrchestrator` iterates through configured source tables in the migration plan.
+   - For `src_db_1.customers`, `src_origin_tag = "src_db_1.customers"`.
+   - For `src_db_2.customers`, `src_origin_tag = "src_db_2.customers"`.
+2. **Active Source Identifier Resolution**:
+   - `ASTTransformer.transform_chunk()` parses `active_src_ident` from `source_origin` (e.g., `"src_db_2.customers"` $\rightarrow$ `"src_db_2"`).
+   - In `_resolve_src_col()`, Priority 0 specifically looks up the column configuration matching `active_src_ident` before falling back to generic column name matching.
+   - In `_resolve_src_ident()`, it returns `active_src_ident` rather than blindly picking `source_cols[0]`.
+3. **Partitioned Deterministic Primary & Foreign Key Generation**:
+   - Primary key UUID v5 generation computes `uuid5(NAMESPACE_DNS, f"{src_ident}_{v}")`.
+   - `src_db_1` row 1 (`id=1`) produces `uuid5(NAMESPACE_DNS, "src_db_1_1")` $\rightarrow$ `a9144a57-834e-5781-87fb-429bd8f9d18f`.
+   - `src_db_2` row 1 (`id=1`) produces `uuid5(NAMESPACE_DNS, "src_db_2_1")` $\rightarrow$ `34f9e02b-fe96-5ec8-a705-4750fa02ade5`.
+   - Foreign key UUID v5 generation in child tables (e.g., `orders.customer_id`) applies the same matching `src_ident` partition key, preserving parent-child referential integrity.
+4. **DuckDB Staging & Target Insertion**:
+   - DuckDB stages all 180 rows across both sources.
+   - Target writer executes `INSERT INTO ... ON CONFLICT DO NOTHING;`.
+   - Because UUIDs are 100% disjoint across sources, zero collisions occur, and all 180 rows are successfully committed to the target database.
+5. **Standardized Docker Container Delivery**:
+   - Built under single canonical image: `nmaru094123/data-migration-agent:latest` (and local alias `data-migration-agent:latest`).
+   - Pushed directly to Docker Hub registry under repository `nmaru094123/data-migration-agent`.
+   - Purged obsolete image tags (`migraflow-agent`) from local Docker daemon.
+
+## 3. Impact & Delta Analysis (AI Modifications)
+
+- **[FIXED]**: [`apps/agent/engine/transformers/ast_transformer.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/agent/engine/transformers/ast_transformer.py) — Dynamic `_resolve_src_ident()` and `_resolve_src_col()` resolving active chunk source identifier from `source_origin`.
+- **[NEW TEST]**: [`apps/agent/tests/test_ast_transformer.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/agent/tests/test_ast_transformer.py) — Added `test_multi_source_merge_uuid_uniqueness()`, verified passing.
+- **[BUILD & PUSH]**: Rebuilt `nmaru094123/data-migration-agent:latest` and pushed to Docker Hub (`sha256:3e3c2117ad624dc18cc28e64b11b39d3d01584b0155590648a6d327e5b0866c3`).
+- **[CLEANUP]**: Removed local `migraflow-agent` image tags from the Docker engine.
+- **[MODIFIED]**: [`docs/DECISIONS.md`](file:///d:/GitHub/Ai_data_migration_platform/docs/DECISIONS.md) & [`docs/EXECUTION_FLOW.md`](file:///d:/GitHub/Ai_data_migration_platform/docs/EXECUTION_FLOW.md) — Documented decision and execution flow.
+
+---
+
+# Execution Flow — Production Deployment, Reverse Proxy & Security Hardening
+
+## 1. Entry Point
+
+- **Deployment Script**: [`scripts/deploy.sh`](file:///d:/GitHub/Ai_data_migration_platform/scripts/deploy.sh) executed on an EC2 or cloud Linux server.
+- **Compose Stack**: [`docker-compose.prod.yml`](file:///d:/GitHub/Ai_data_migration_platform/docker-compose.prod.yml) or standard [`docker-compose.yml`](file:///d:/GitHub/Ai_data_migration_platform/docker-compose.yml).
+- **Reverse Proxy**: [`infra/nginx/nginx.conf`](file:///d:/GitHub/Ai_data_migration_platform/infra/nginx/nginx.conf).
+
+## 2. Step-by-Step Execution Sequence
+
+1. **Host Verification & Environment Staging**:
+   - `scripts/deploy.sh` verifies Docker Engine and Docker Compose plugin prerequisites.
+   - Asserts existence of `.env` configuration (auto-copies from [`.env.production.example`](file:///d:/GitHub/Ai_data_migration_platform/.env.production.example) if uninitialized).
+2. **Container Construction & Network Provisioning**:
+   - Builds optimized standalone Next.js frontend (`migration_platform_web`) and FastAPI backend (`migration_platform_api`).
+   - Provisions isolated Docker bridge network where PostgreSQL and Redis are bound exclusively to `127.0.0.1` on the host, preventing public internet probing.
+3. **Database Migration & Lifespan Initialization**:
+   - `migration_platform_api` executes `entrypoint.sh`:
+     - Waits for PostgreSQL readiness with exponential socket retries.
+     - Runs `alembic upgrade head` applying all 19 database migrations automatically.
+     - Boots Uvicorn worker and initializes FastAPI `lifespan` watchdog.
+4. **Adaptive CORS & Cookie Policy Activation**:
+   - Backend `config.py` checks protocol:
+     - Plain HTTP (e.g. `http://54.210.12.34:3000`): Sets `COOKIE_SECURE = False` allowing browser retention of auth cookies.
+     - HTTPS (e.g. `https://app.example.com`): Enforces `COOKIE_SECURE = True`.
+   - `main.py` normalizes `CORS_ORIGINS`, dynamically appending `FRONTEND_URL` and `HOST_IP` to eliminate cross-origin request rejections.
+5. **Nginx Reverse Proxy & Client Traffic Routing**:
+   - Listens on ports 80/443.
+   - Proxies `/` $\to$ `web:3000` (Next.js server with security headers: `SAMEORIGIN`, `nosniff`, `strict-origin-when-cross-origin`).
+   - Proxies `/api/` $\to$ `api:8000` (FastAPI control plane).
+   - Upgrades `/api/v1/agents/ws/` WebSocket connections for real-time agent diagnostics.
+
+## 3. Impact & Delta Analysis (AI Modifications)
+
+- **[MODIFIED]**: [`docker-compose.yml`](file:///d:/GitHub/Ai_data_migration_platform/docker-compose.yml) — Restricted PostgreSQL, Redis, MySQL, and MongoDB ports to `127.0.0.1`, and forwarded `HOST_IP`/`COOKIE_SECURE` into the API container.
+- **[MODIFIED]**: [`apps/api/app/core/config.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/core/config.py) — Strips trailing slashes from CORS origins, and adaptively toggles `COOKIE_SECURE` based on HTTP vs HTTPS.
+- **[MODIFIED]**: [`apps/api/app/main.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/main.py) — Automatically ensures `FRONTEND_URL` and `HOST_IP` origins are included in `CORSMiddleware`.
+- **[MODIFIED]**: [`apps/web/services/axios.ts`](file:///d:/GitHub/Ai_data_migration_platform/apps/web/services/axios.ts) — Prioritizes `NEXT_PUBLIC_API_URL` when provided before dynamic origin fallback.
+- **[MODIFIED]**: [`apps/web/next.config.mjs`](file:///d:/GitHub/Ai_data_migration_platform/apps/web/next.config.mjs) — Injected production HTTP security headers (`X-Frame-Options`, `X-Content-Type-Options`, `Referrer-Policy`, `Permissions-Policy`).
+- **[NEW]**: [`infra/nginx/nginx.conf`](file:///d:/GitHub/Ai_data_migration_platform/infra/nginx/nginx.conf) — High-performance reverse proxy configuration with WebSocket routing.
+- **[NEW]**: [`docker-compose.prod.yml`](file:///d:/GitHub/Ai_data_migration_platform/docker-compose.prod.yml) — Production Docker Compose stack with Nginx, resource limits, and log rotation.
+- **[NEW]**: [`.env.production.example`](file:///d:/GitHub/Ai_data_migration_platform/.env.production.example) — Complete production environment template with secure 256-bit keys and documentation.
+- **[NEW]**: [`scripts/deploy.sh`](file:///d:/GitHub/Ai_data_migration_platform/scripts/deploy.sh) — End-to-end automated EC2 deployment and health verification script.
+- **[MODIFIED]**: [`docs/DECISIONS.md`](file:///d:/GitHub/Ai_data_migration_platform/docs/DECISIONS.md) & [`docs/EXECUTION_FLOW.md`](file:///d:/GitHub/Ai_data_migration_platform/docs/EXECUTION_FLOW.md) — Documented decision and execution sequence.
+

@@ -19,9 +19,9 @@ export default function AuthLayout({
   sceneUrl = 'https://my.spline.design/flow-vD4AAB4End71ev0QfMLT00qI/',
 }: AuthLayoutProps) {
   return (
-    <div className="h-screen max-h-screen w-full bg-black font-sans text-slate-100 grid grid-cols-1 lg:grid-cols-2 overflow-hidden rounded-none">
-      {/* Left Column (50% on lg): Full-height 3D Spline Canvas */}
-      <div className="relative hidden lg:block w-full h-full bg-black border-r border-sky-400/10 overflow-hidden">
+    <div className="h-screen max-h-screen w-full bg-black font-sans text-slate-100 grid grid-cols-1 xl:grid-cols-2 overflow-hidden rounded-none">
+      {/* Left Column (50% on xl): Full-height 3D Spline Canvas */}
+      <div className="relative hidden xl:block w-full h-full bg-black border-r border-sky-400/10 overflow-hidden">
         <SplineHeroBackground sceneUrl={sceneUrl} interactive={false} />
       </div>
 
@@ -67,7 +67,7 @@ export default function AuthLayout({
 
         {/* Bottom Footer */}
         <div className="mt-4 pt-3 border-t border-sky-400/10 text-center text-xs font-mono text-zinc-500 relative z-10 shrink-0">
-          &copy; {new Date().getFullYear()} Migraflow. Secure HTTP-Only Sessions.
+          &copy; {new Date().getFullYear()} Migraflow. UK GDPR Compliant &bull; Secure Local Sessions.
         </div>
       </div>
     </div>

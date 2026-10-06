@@ -1,6 +1,7 @@
 import './globals.css';
 import StoreProvider from '../providers/StoreProvider';
 import { Inter } from 'next/font/google';
+import { CookieConsentBanner } from '@/components/common/CookieConsentBanner';
 
 const inter = Inter({
   subsets: ['latin'],
@@ -17,7 +18,10 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html lang="en" className={inter.variable}>
       <body className="bg-slate-950 text-slate-100 font-sans min-h-screen antialiased">
-        <StoreProvider>{children}</StoreProvider>
+        <StoreProvider>
+          {children}
+          <CookieConsentBanner />
+        </StoreProvider>
       </body>
     </html>
   );

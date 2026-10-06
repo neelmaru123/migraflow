@@ -39,10 +39,21 @@ class UserResponse(BaseModel):
     email: EmailStr
     name: str
     is_active: bool
+    is_superuser: bool = False
     created_at: datetime
     updated_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class UserDataExport(BaseModel):
+    """UK GDPR Article 20 Right to Data Portability Export Schema."""
+    exported_at: datetime
+    user: UserResponse
+    agents: list[dict]
+    migration_plans: list[dict]
+    migration_jobs: list[dict]
+    data_sources: list[dict]
 
 
 class TokenResponse(BaseModel):

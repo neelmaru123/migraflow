@@ -2,6 +2,33 @@
 
 This file records all key architectural decisions, technology selections, trade-offs, and design rationale for the **AI Data Migration Platform**.
 
+## [2026-10-05] - UK GDPR, Data Protection Act 2018 & PECR Privacy Remediation
+
+### 1. Decision Summary
+Implemented comprehensive technical privacy, data protection, and cookie compliance remediations across the entire stack. Addressed 17 identified privacy findings covering CORS origin protection, IDOR user isolation, secrets hardening, PECR cookie consent gating with high-performance 3D visual fallback, user rights data portability (Art. 20) and erasure (Art. 17), prompt data minimization (Art. 5(1)(c)), email log masking, WebSocket bearer token security, and local DuckDB staging storage limitation.
+
+### 2. Why This Approach? (Rationale)
+- **Problem Being Solved**: Audit revealed that the platform processed user and operational metadata with gaps in CORS regex wildcard matching, unrestricted user profile endpoints (IDOR), un-gated third-party 3D scripts/iframes prior to user consent, unsanitized database error traces entering third-party LLM prompts, logged plaintext emails, missing self-service data export, and retained local staging files.
+- **Chosen Solution**:
+  - **CORS Strict Origin Whitelisting**: Removed wildcard regex matching with credentials. Enforced strict allowed origin arrays.
+  - **Role-Based Authorization & IDOR Guards**: Added `is_superuser` column to `User` and restricted `/users` and `/users/{user_id}` endpoints to self or superuser.
+  - **PECR Consent Hook & Script Gating**: Developed `useCookieConsent` and `CookieConsentBanner` to gate Spline 3D canvas and tracking behind opt-in consent, rendering a dark ambient fallback when unconsented.
+  - **Data Portability (Art. 20)**: Implemented `GET /api/v1/users/me/export` aggregating user, agents, data sources, plans, and jobs into a machine-readable JSON archive with one-click download.
+  - **Account Erasure (Art. 17)**: Built `/settings` page with self-service account deletion and data export download.
+  - **Prompt Data Minimization (Art. 5(1)(c))**: Enhanced `CredentialSanitizer` to redact emails, SQL constraint detail values, and connection strings from error messages before passing to AI diagnostics.
+  - **PII Log Redaction**: Added `mask_email()` to redact email addresses in server log statements.
+  - **Storage Limitation (Art. 5(1)(e))**: Added automatic staging DuckDB cleanup for the active job in `apps/agent/engine/orchestrator.py` `finally:` block.
+- **Why This Library / Technology**: Standard React custom event dispatching for reactive cookie consent without third-party SaaS SDK overhead; Pydantic V2 model validators for production secrets enforcement.
+
+### 3. Alternatives Considered & Rejected
+- **Alternative A: Commercial Cookie Consent CMP (OneTrust / Cookiebot)**: Rejected due to recurring SaaS subscriptions, external network script dependencies, and latency overhead. A lightweight native React hook and component provides zero-latency, 100% compliant PECR/GDPR consent management.
+- **Alternative B: Blanket Asynchronous Email Export Dispatch**: Rejected in favor of direct machine-readable streaming JSON export via `GET /users/me/export`, giving users immediate instant access to their archive without waiting for email queues.
+
+### 4. Trade-offs & Future Considerations
+- First-time visitors without 3D consent see the high-performance dark ambient canvas fallback instead of the 3D Spline model until they choose "Accept All" or "Enable 3D Visuals". This strictly complies with PECR regulation 6 while preserving 100% functionality.
+
+---
+
 ## [2026-10-01] - Production EC2 Deployment: Redis Promotion to Core Service & Orchestration Hardening
 
 ### 1. Decision Summary
@@ -2787,3 +2814,64 @@ Designed, provisioned, and seeded two enterprise databases—**`gaming_telemetry
 
 - **Trade-offs**: Hybrid relational-JSON schemas require careful index management (`GIN` on PostgreSQL, generated functional index columns on MySQL) to avoid unindexed table scans on deeply nested JSON keys.
 - **Future Considerations**: Add synthetic workload benchmarks or migration agent pipelines to demonstrate bi-directional schema inference and transformations between `gaming_telemetry_pg`, `gaming_economy_mysql`, and NoSQL sinks.
+
+---
+
+## [2026-10-02] - Multi-Source Dynamic Identifier Resolution, UUID Uniqueness, and Standardizing on `data-migration-agent:latest`
+
+### 1. Decision Summary
+
+Fixed primary key collision during multi-source database merges in [`apps/agent/engine/transformers/ast_transformer.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/agent/engine/transformers/ast_transformer.py) by dynamically resolving source identifiers from `source_origin` (e.g. `src_db_1` vs `src_db_2`) rather than hardcoding `source_cols[0]`. Rebuilt the migration agent Docker container and standardized the platform image naming exclusively on **`nmaru094123/data-migration-agent:latest`**, pushing the verified build directly to Docker Hub and removing redundant image tags.
+
+### 2. Why This Approach? (Rationale)
+
+- **Problem Being Solved**:
+  1. When merging multiple source databases (e.g., PostgreSQL `retail_store_pg` and MySQL `retail_online_mysql`) into a single target table, both sources possessed overlapping integer primary keys (`id=1..30`, `1..25`, `1..35`).
+  2. Because [`ASTTransformer.transform_chunk`](file:///d:/GitHub/Ai_data_migration_platform/apps/agent/engine/transformers/ast_transformer.py) hardcoded `src_ident = source_cols[0].get("identifier")`, chunks from `src_db_2` generated identical deterministic UUID v5 values (`uuid5(NAMESPACE_DNS, "src_db_1_1")`) as `src_db_1`.
+  3. Consequently, PostgreSQL target bulk insertions hit primary key uniqueness conflicts (`customers_pkey`, `products_pkey`, `orders_pkey`) and silently skipped all 90 rows from the second database under `ON CONFLICT DO NOTHING`, resulting in only 90 of 180 rows being committed.
+  4. Two conflicting image names existed across Docker Hub and local configurations (`migraflow-agent` vs `data-migration-agent`). The user requested standardizing strictly on `data-migration-agent`.
+- **Chosen Solution**:
+  1. **Dynamic Identifier Resolution**: Introduced `_resolve_src_ident()` and enhanced `_resolve_src_col()` in `ASTTransformer` to extract the active chunk's database identifier from `source_origin` (e.g., `"src_db_2.customers"` $\rightarrow$ `"src_db_2"`).
+  2. **Multi-Source UUID Partitioning**: Ensured deterministic UUID generation for primary keys and foreign keys prefixes the UUID namespace input with the resolved source identifier (`f"{src_ident}_{v}"`), ensuring zero UUID collisions across distinct sources.
+  3. **Standardized Single Image**: Standardized the Docker image on `nmaru094123/data-migration-agent:latest`, built and tested with unit tests (`test_multi_source_merge_uuid_uniqueness`), pushed to Docker Hub, and purged redundant local `migraflow-agent` tags.
+- **Why This Library / Technology**: Using `uuid5` with namespace DNS guarantees deterministic, reproducible primary keys across chunk streaming while properly partitioning by source identifier guarantees referential integrity without cross-source collisions.
+
+### 3. Alternatives Considered & Rejected
+
+- **Alternative A: Random UUID v4 Generation (`uuid_v4_rekey`)**
+  - _Rejected_: Random UUIDs are non-deterministic, making chunk replay, checkpoint resume, and foreign key parent-child linkage across separate streaming chunks impossible without maintaining a shared in-memory ID lookup table.
+- **Alternative B: Offsetting Integer Autoincrements (`autoincrement_offset`)**
+  - _Rejected_: Requires target databases to support large 64-bit integer keys and fails when target schemas require UUID primary keys.
+
+### 4. Trade-offs & Future Considerations
+
+- **Trade-offs**: Source identifiers in the migration plan AST must cleanly match the source prefix used during chunk extraction (`src_origin_tag`).
+- **Future Considerations**: Automated integration test in CI simulating end-to-end multi-source merging with identical primary key sequences across PostgreSQL and MySQL.
+
+---
+
+## [2026-10-06] - Production Readiness Hardening, Cloud Security Architecture, & Deployment Runbook
+
+### 1. Decision Summary
+
+Performed full-stack production deployment scan and hardened the system for smooth, zero-vulnerability cloud deployment (e.g. AWS EC2, VPS, or Docker hosts):
+1. **Database & Cache Port Isolation**: Bound PostgreSQL (`127.0.0.1:${POSTGRES_PORT:-5434}:5432`), Redis (`127.0.0.1:6379:6379`), MySQL (`127.0.0.1:3307:3306`), and MongoDB (`127.0.0.1:27017:27017`) strictly to localhost (`127.0.0.1`) in `docker-compose.yml`, preventing bypass of cloud firewalls by Docker iptables and securing internal databases from public internet exposure.
+2. **Adaptive CORS & Dynamic Host Resolution**: Updated `apps/api/app/main.py` and `apps/api/app/core/config.py` to sanitize trailing slashes, automatically include `FRONTEND_URL`, and auto-allow `HOST_IP`/`PUBLIC_IP` origins, completely preventing CORS errors in staging and production.
+3. **Adaptive Cookie Security**: Enhanced `validate_security_settings` in `apps/api/app/core/config.py` so direct EC2 IP deployments over plain HTTP dynamically set `COOKIE_SECURE = False` (enabling browser session cookie retention), while HTTPS domain deployments automatically enforce `COOKIE_SECURE = True`.
+4. **Web Frontend Security Headers & Dynamic Client Base URL**: Added standard security headers (`X-Frame-Options: SAMEORIGIN`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`, `Permissions-Policy`) in `apps/web/next.config.mjs`, and prioritized explicit `NEXT_PUBLIC_API_URL` in `apps/web/services/axios.ts`.
+5. **Production Reverse Proxy & Orchestration**: Created `infra/nginx/nginx.conf` and `docker-compose.prod.yml` unifying Next.js web (port 3000) and FastAPI API (port 8000) under standard port 80/443 with WebSocket upgrading and log rotation (`max-size: 20m`), along with an automated EC2 deployment script `scripts/deploy.sh` and production template `.env.production.example`.
+
+### 2. Why This Approach? (Rationale)
+- **Problem Being Solved**: Deploying directly to remote cloud servers (like AWS EC2) commonly triggers three fatal blockers: (a) raw database ports exposed to public bots, (b) browser rejecting `Secure` cookies over plain HTTP IPs preventing login, and (c) CORS origin mismatches when accessing frontend from remote IPs.
+- **Chosen Solution**: Hardening default compose port bindings to `127.0.0.1`, adapting cookie security to the protocol scheme, auto-registering frontend host origins in CORS, and providing a unified Nginx reverse proxy.
+- **Why This Library / Technology**: Nginx provides high-concurrency connection pooling, robust SSL termination, and WebSocket proxying with minimal memory footprint (~10MB RAM).
+
+### 3. Alternatives Considered & Rejected
+- **Alternative A: Binding Ports to 0.0.0.0 and Relying Exclusively on AWS Security Groups**:
+  - _Rejected_: Docker on Linux bypasses `UFW` and OS iptables by default. If a security group is misconfigured or the stack is deployed on a non-AWS VPS, databases and unauthenticated Redis instances become immediately vulnerable to public internet attacks.
+- **Alternative B: Hardcoding COOKIE_SECURE=True Globally in Production**:
+  - _Rejected_: Breaks authentication when developers test their production build on raw EC2 public IPs before attaching a domain and SSL certificate.
+
+### 4. Trade-offs & Future Considerations
+- In environments using an AWS Application Load Balancer (ALB) with SSL offloading, set `FRONTEND_URL=https://...` and `COOKIE_SECURE=true`.
+

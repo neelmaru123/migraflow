@@ -142,12 +142,36 @@ class ASTTransformer:
         #   2. Target column name itself (direct name match)
         #   3. Any AST source_columns entry after stripping table prefix
         #   4. Synonym-group fuzzy match against all actual df columns
-        # Returns the resolved column name string, or None if unresolvable.
         # ---------------------------------------------------------------
+        # Core source resolver — dynamically aligns with the active chunk's source
+        # ---------------------------------------------------------------
+        active_src_ident = None
+        if source_origin:
+            active_src_ident = source_origin.split(".")[0] if "." in source_origin else source_origin
+
+        def _resolve_src_ident(source_cols_list: List[Dict]) -> str:
+            """Resolve the database source identifier for the active chunk being transformed."""
+            if active_src_ident:
+                for sc in source_cols_list:
+                    if sc.get("identifier") == active_src_ident:
+                        return active_src_ident
+                return active_src_ident
+            if source_cols_list:
+                return source_cols_list[0].get("identifier", "source")
+            return "source"
+
         def _resolve_src_col(
             source_cols_list: List[Dict],
             target_name: str,
         ) -> Optional[str]:
+            # Priority 0: Source column specifically matching active_src_ident present in df
+            if active_src_ident:
+                for sc in source_cols_list:
+                    if sc.get("identifier") == active_src_ident:
+                        cname = sc.get("column_name")
+                        if cname and cname in df.columns:
+                            return cname
+
             # Priority 1: First configured source column actually present in df
             for sc in source_cols_list:
                 cname = sc.get("column_name")
@@ -232,7 +256,7 @@ class ASTTransformer:
             if trans_type == "direct_copy":
                 target_dtype = str(col_spec.get("target_data_type", "")).lower()
                 if "uuid" in target_dtype and src_name:
-                    src_ident = source_cols[0].get("identifier", "source") if source_cols else "source"
+                    src_ident = _resolve_src_ident(source_cols)
                     _sid = src_ident
                     uuid_expr = pl.col(src_name).cast(pl.Utf8).map_elements(
                         lambda v, s=_sid: (
@@ -275,7 +299,7 @@ class ASTTransformer:
             # 2. type_cast
             # ----------------------------------------------------------
             elif trans_type == "type_cast":
-                src_ident = source_cols[0].get("identifier", "source") if source_cols else "source"
+                src_ident = _resolve_src_ident(source_cols)
                 target_dtype = col_spec.get("target_data_type", "varchar").lower()
                 pk_strategy = primary_key_strategy or col_spec.get("primary_key_strategy", "uuid_v5")
 

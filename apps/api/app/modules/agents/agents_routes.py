@@ -167,16 +167,16 @@ async def report_agent_fatal_error(
 async def agent_websocket_endpoint(
     websocket: WebSocket,
     agent_id: uuid.UUID,
-    token: Optional[str] = Query(None),
     session: AsyncSession = Depends(get_db),
 ):
     """
     Authenticated WebSocket endpoint for Web Applications to listen for real-time status changes
     and connection events for a specific agent.
-    Supports JWT token passed as query parameter `?token=<jwt>` OR sent as first auth frame `{ "type": "auth", "token": "<jwt>" }`.
-    Verifies agent ownership.
+    Supports JWT token passed via HTTP-only cookie OR sent as first auth frame:
+    `{ "type": "auth", "token": "<jwt>" }`.
+    In compliance with UK GDPR / OWASP (GDPR-SEC-004), tokens are rejected in URL query strings.
     """
-    jwt_token = token
+    jwt_token = websocket.cookies.get("access_token")
 
     if not jwt_token:
         # Accept connection first to receive first auth frame (EC-10)
@@ -189,6 +189,8 @@ async def agent_websocket_endpoint(
         except Exception:
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Authentication token missing or auth frame timeout")
             return
+    else:
+        await websocket.accept()
 
     if not jwt_token:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Authentication token missing")

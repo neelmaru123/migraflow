@@ -126,6 +126,17 @@ export default function LoginForm() {
           <span>{loginMutation.isPending ? 'Signing In...' : 'Sign In'}</span>
           <ArrowRight className="w-4 h-4" />
         </button>
+        {/* UK GDPR Transparency Notice */}
+        <p className="text-[11px] text-zinc-400 text-center mt-2 leading-relaxed">
+          By signing in, you agree to our{' '}
+          <Link href="/terms" className="text-sky-400 hover:underline">
+            Terms
+          </Link>{' '}
+          and acknowledge our{' '}
+          <Link href="/privacy" className="text-sky-400 hover:underline">
+            Privacy Notice
+          </Link>.
+        </p>
       </form>
 
       {/* Switch to Register */}

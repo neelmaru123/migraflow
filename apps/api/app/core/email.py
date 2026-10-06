@@ -13,6 +13,19 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 
 
+def mask_email(email: str) -> str:
+    """Mask email for privacy in server logs (e.g. j***e@example.com) - UK GDPR Art. 5(1)(c)."""
+    if not email or "@" not in email:
+        return "[REDACTED_EMAIL]"
+    parts = email.split("@", 1)
+    local, domain = parts[0], parts[1]
+    if len(local) <= 2:
+        masked_local = local[0] + "*"
+    else:
+        masked_local = local[0] + "*" * (len(local) - 2) + local[-1]
+    return f"{masked_local}@{domain}"
+
+
 def _send_smtp_email_sync(
     to_email: str,
     subject: str,
@@ -20,10 +33,11 @@ def _send_smtp_email_sync(
     plain_text_content: Optional[str] = None,
 ) -> bool:
     """Synchronous SMTP email dispatcher executed in thread worker."""
+    masked_target = mask_email(to_email)
     if not settings.SMTP_USER or not settings.SMTP_PASSWORD:
         logger.warning(
             "SMTP_USER or SMTP_PASSWORD is not configured in environment. "
-            f"Password reset email to {to_email} will NOT be sent."
+            f"Password reset email to {masked_target} will NOT be sent."
         )
         return False
 
@@ -51,10 +65,10 @@ def _send_smtp_email_sync(
         server.login(settings.SMTP_USER, settings.SMTP_PASSWORD)
         server.sendmail(sender_email, [to_email], msg.as_string())
         server.quit()
-        logger.info(f"Password reset email successfully sent to {to_email}")
+        logger.info(f"Password reset email successfully sent to {masked_target}")
         return True
     except Exception as exc:
-        logger.error(f"Failed to send email to {to_email} via Google SMTP: {exc}")
+        logger.error(f"Failed to send email to {masked_target} via Google SMTP: {exc}")
         return False
 
 

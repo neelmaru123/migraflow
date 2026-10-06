@@ -40,17 +40,19 @@ services:
       - JWT_SECRET_KEY=${JWT_SECRET_KEY:-default_jwt_secret_key_change_me_in_production}
       - FRONTEND_URL=${FRONTEND_URL:-http://localhost:3000}
       - BACKEND_URL=${BACKEND_URL:-http://host.docker.internal:8000}
-      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000,*}
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+      - HOST_IP=${HOST_IP:-}
+      - COOKIE_SECURE=${COOKIE_SECURE:-}
       - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
       - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
       - GOOGLE_REDIRECT_URI=${GOOGLE_REDIRECT_URI:-http://localhost:8000/api/v1/auth/google/callback}
       - SECRET_KEY=${SECRET_KEY:-default_secret_key_change_me_in_production}
       - AGENT_DOCKER_IMAGE=${AGENT_DOCKER_IMAGE:-data-migration-agent:latest}
-      - LANGCHAIN_TRACING_V2=${LANGCHAIN_TRACING_V2:-true}
+      - LANGCHAIN_TRACING_V2=${LANGCHAIN_TRACING_V2:-false}
       - LANGCHAIN_API_KEY=${LANGCHAIN_API_KEY:-}
       - LANGCHAIN_PROJECT=${LANGCHAIN_PROJECT:-Migraflow Platform}
       - LANGCHAIN_ENDPOINT=${LANGCHAIN_ENDPOINT:-https://api.smith.langchain.com}
-      - LANGSMITH_TRACING=${LANGSMITH_TRACING:-true}
+      - LANGSMITH_TRACING=${LANGSMITH_TRACING:-false}
       - LANGSMITH_API_KEY=${LANGSMITH_API_KEY:-}
       - LANGSMITH_PROJECT=${LANGSMITH_PROJECT:-Migraflow Platform}
       - LANGSMITH_ENDPOINT=${LANGSMITH_ENDPOINT:-https://api.smith.langchain.com}
@@ -111,9 +113,7 @@ services:
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres_password}
       - POSTGRES_DB=${POSTGRES_DB:-migration_platform}
     ports:
-      - "${POSTGRES_PORT:-5434}:5432"
-      - "5435:5432"
-      - "5436:5432"
+      - "127.0.0.1:${POSTGRES_PORT:-5434}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./infra/docker/init-postgres-dbs.sql:/docker-entrypoint-initdb.d/init-postgres-dbs.sql:ro
@@ -136,7 +136,7 @@ services:
       - MYSQL_ROOT_PASSWORD=mysql_password
       - MYSQL_DATABASE=inventory_db
     ports:
-      - "3307:3306"
+      - "127.0.0.1:3307:3306"
     volumes:
       - mysql_data:/var/lib/mysql
       - ./infra/docker/init-mysql-dbs.sql:/docker-entrypoint-initdb.d/init-mysql-dbs.sql:ro
@@ -166,7 +166,7 @@ services:
       - MONGO_INITDB_ROOT_PASSWORD=mongo_password
       - MONGO_INITDB_DATABASE=analytics_db
     ports:
-      - "27017:27017"
+      - "127.0.0.1:27017:27017"
     volumes:
       - mongo_data:/data/db
       - ./infra/docker/init-mongo-dbs.js:/docker-entrypoint-initdb.d/init-mongo-dbs.js:ro
@@ -183,7 +183,7 @@ services:
     image: redis:7-alpine
     container_name: migration_platform_redis
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
     healthcheck:

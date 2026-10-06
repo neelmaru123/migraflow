@@ -7,10 +7,11 @@ from typing import Any, Dict, List, Optional
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
+from app.modules.execution.execution_models import MigrationJob
 from app.modules.migration_plans.migration_plans_models import MigrationPlan
 from app.modules.observability.budget_manager import ResourceBudgetManager
 from app.modules.observability.health_service import OperationalHealthService
@@ -40,10 +41,17 @@ async def list_traces(
     current_user: User = Depends(get_current_active_user),
     session: AsyncSession = Depends(get_db),
 ):
-    """List execution trace spans with optional job_id filter."""
+    """List execution trace spans with optional job_id filter (enforces tenant data isolation)."""
     stmt = select(ExecutionTrace).order_by(ExecutionTrace.started_at.desc()).limit(limit)
     if job_id:
         stmt = stmt.where(ExecutionTrace.migration_job_id == job_id)
+    if not getattr(current_user, "is_superuser", False):
+        user_jobs = (
+            select(MigrationJob.id)
+            .join(MigrationPlan, MigrationJob.migration_plan_id == MigrationPlan.id)
+            .where(MigrationPlan.user_id == current_user.id)
+        )
+        stmt = stmt.where(ExecutionTrace.migration_job_id.in_(user_jobs))
     res = await session.execute(stmt)
     return list(res.scalars().all())
 
@@ -72,12 +80,25 @@ async def list_llm_calls(
     current_user: User = Depends(get_current_active_user),
     session: AsyncSession = Depends(get_db),
 ):
-    """List recorded LLM invocations with model provenance, tokens, and cost estimates."""
+    """List recorded LLM invocations with model provenance, tokens, and cost estimates (enforces user isolation)."""
     stmt = select(LLMCallRecord).order_by(LLMCallRecord.request_timestamp.desc()).limit(limit)
     if job_id:
         stmt = stmt.where(LLMCallRecord.migration_job_id == job_id)
     if plan_id:
         stmt = stmt.where(LLMCallRecord.migration_plan_id == plan_id)
+    if not getattr(current_user, "is_superuser", False):
+        user_jobs = (
+            select(MigrationJob.id)
+            .join(MigrationPlan, MigrationJob.migration_plan_id == MigrationPlan.id)
+            .where(MigrationPlan.user_id == current_user.id)
+        )
+        user_plans = select(MigrationPlan.id).where(MigrationPlan.user_id == current_user.id)
+        stmt = stmt.where(
+            or_(
+                LLMCallRecord.migration_job_id.in_(user_jobs),
+                LLMCallRecord.migration_plan_id.in_(user_plans),
+            )
+        )
     res = await session.execute(stmt)
     return list(res.scalars().all())
 

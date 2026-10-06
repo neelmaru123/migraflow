@@ -160,7 +160,7 @@ def build_evaluation_scenarios() -> List[EvaluationScenario]:
                 TableMapping(
                     target_table_name="products",
                     source_tables=[SourceTableRef(identifier="src_mysql", table_name="products")],
-                    transformation_type="type_cast",
+                    transformation_type="direct_copy",
                     column_mappings=[
                         ColumnMapping(
                             target_column_name="id",
@@ -234,7 +234,7 @@ def build_evaluation_scenarios() -> List[EvaluationScenario]:
                 TableMapping(
                     target_table_name="orders",
                     source_tables=[SourceTableRef(identifier="src_mongo", table_name="orders")],
-                    transformation_type="unflatten",
+                    transformation_type="direct_copy",
                     column_mappings=[
                         ColumnMapping(
                             target_column_name="id",
@@ -509,7 +509,7 @@ def build_evaluation_scenarios() -> List[EvaluationScenario]:
                         ColumnMapping(
                             target_column_name="phone",
                             target_data_type="varchar(50)",
-                            transformation_type="expression_sql",
+                            transformation_type="expression",
                             expression_template="COALESCE({phone}, 'N/A')",
                             source_columns=[SourceColumnRef(identifier="src_null", table_name="user_profiles", column_name="phone")],
                         ),
@@ -793,10 +793,10 @@ def build_evaluation_scenarios() -> List[EvaluationScenario]:
                     column_mappings=[
                         ColumnMapping(target_column_name="id", target_data_type="int", is_primary_key=True,
                                       source_columns=[SourceColumnRef(identifier="src_expr", table_name="locations", column_name="id")]),
-                        ColumnMapping(target_column_name="street", target_data_type="varchar(255)", transformation_type="expression_sql",
+                        ColumnMapping(target_column_name="street", target_data_type="varchar(255)", transformation_type="expression",
                                       expression_template="SPLIT_PART({full_address}, ',', 1)",
                                       source_columns=[SourceColumnRef(identifier="src_expr", table_name="locations", column_name="full_address")]),
-                        ColumnMapping(target_column_name="city", target_data_type="varchar(100)", transformation_type="expression_sql",
+                        ColumnMapping(target_column_name="city", target_data_type="varchar(100)", transformation_type="expression",
                                       expression_template="TRIM(SPLIT_PART({full_address}, ',', 2))",
                                       source_columns=[SourceColumnRef(identifier="src_expr", table_name="locations", column_name="full_address")]),
                     ],

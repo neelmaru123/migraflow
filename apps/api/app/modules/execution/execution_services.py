@@ -12,6 +12,7 @@ from sqlalchemy import select, update, and_, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core.credential_sanitizer import CredentialSanitizer
 from app.core.db import AsyncSessionLocal
 from app.core.state import (
     ExecutionEventType,
@@ -848,6 +849,8 @@ class ExecutionService:
                             target_engine = ds.type or "postgresql"
                             break
 
+                sanitized_err_trace = CredentialSanitizer.mask_credentials(err_msg)
+
                 llm_prompt = f"""You are an expert database migration architect and friendly AI pair programmer (like Antigravity).
 A database migration job just failed with an error. Provide a clear, intuitive, plain-English explanation of why it failed and the exact SQL or CLI command to resolve it.
 
@@ -857,7 +860,7 @@ Migration Context:
 - Current Table: {tbl}
 - Target Database Engine: {target_engine}
 - Raw Error Trace:
-{err_msg}
+{sanitized_err_trace}
 
 Rules:
 1. Explain in simple, conversational terms so a developer immediately understands what happened in their database.
