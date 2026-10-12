@@ -2231,3 +2231,57 @@ sequenceDiagram
 - **[NEW]**: [`scripts/deploy.sh`](file:///d:/GitHub/Ai_data_migration_platform/scripts/deploy.sh) — End-to-end automated EC2 deployment and health verification script.
 - **[MODIFIED]**: [`docs/DECISIONS.md`](file:///d:/GitHub/Ai_data_migration_platform/docs/DECISIONS.md) & [`docs/EXECUTION_FLOW.md`](file:///d:/GitHub/Ai_data_migration_platform/docs/EXECUTION_FLOW.md) — Documented decision and execution sequence.
 
+---
+
+# Execution Flow — Polyglot Dual-Source Data Merge Test Environment & Seeder
+
+## 1. Entry Point
+- **CLI Invocations**:
+  - `docker compose up -d && python seed_all.py` (or `python test_environment/seed_all.py`)
+  - `python verify.py` (or `python test_environment/verify.py`)
+- **Files**:
+  - [`seed_all.py`](file:///d:/GitHub/Ai_data_migration_platform/seed_all.py) / [`test_environment/seed_all.py:L70`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/seed_all.py#L70)
+  - [`verify.py`](file:///d:/GitHub/Ai_data_migration_platform/verify.py) / [`test_environment/verify.py:L20`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/verify.py#L20)
+
+## 2. Step-by-Step Execution Sequence
+
+1. **Docker Container Discovery & Provisioning**:
+   - Docker Compose orchestrates `postgres:16-alpine` and `mongo:7.0`.
+   - Dynamic connection detection in [`seed_postgres.py`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/seed_postgres.py#L22) inspects port `5434` (existing running Migraflow container) or port `5432` (standalone compose).
+   - Dynamic connection detection in [`seed_mongo.py`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/seed_mongo.py#L20) authenticates to `localhost:27017`.
+2. **Unified Deterministic Data Generation**:
+   - `generate_dataset(seed=42)` in [`data_generator.py`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/data_generator.py#L100) initializes `random` and `Faker` (`en_US` and `en_IN`).
+   - Synthesizes 1,000 PostgreSQL customers, 1,000 MongoDB customers, 300 PostgreSQL products, 300 MongoDB products, 5,000 PostgreSQL orders, 4,000 MongoDB orders, 1,500 support tickets, 2,000 feedback documents, and 990 injected conflicts.
+3. **PostgreSQL Schema Execution & Ingestion**:
+   - `seed_postgres()` creates `legacy_oms_pg` if absent, parses and applies [`sql/schema.sql`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/sql/schema.sql).
+   - Executes batch `execute_values` insertions for `customers`, `products`, `orders`, `order_items`, `payments`, and `support_tickets`.
+   - Issues `ALTER TABLE orders ADD CONSTRAINT fk_orders_customer FOREIGN KEY (customer_id) REFERENCES customers(customer_id) NOT VALID;` to preserve intentional orphaned foreign key test cases (`customer_id = 99999`).
+4. **MongoDB Document Ingestion & Index Creation**:
+   - `seed_mongo()` switches to `customer_experience_mongo`.
+   - Drops prior collections and chunks inserts across `customers`, `products`, `orders`, and `feedback`.
+   - Creates indexes on `emailAddress`, `mobile`, `productCode`, `orderRef`, `customerEmail`.
+5. **Ground-Truth Artifact Generation**:
+   - `export_ground_truth()` writes:
+     - [`ground_truth/customer_matches.csv`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/ground_truth/customer_matches.csv) (600 match pairs: exact, fuzzy, phone_only)
+     - [`ground_truth/product_matches.csv`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/ground_truth/product_matches.csv) (180 match pairs: exact, sku_normalized)
+     - [`ground_truth/order_matches.csv`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/ground_truth/order_matches.csv) (2,000 match pairs: exact_ref)
+     - [`ground_truth/field_mapping.json`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/ground_truth/field_mapping.json) (exhaustive cross-engine field transformation schema)
+     - [`ground_truth/conflicts_report.csv`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/ground_truth/conflicts_report.csv) (990 conflict records)
+     - [`ground_truth/expected_merged_sample.json`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/ground_truth/expected_merged_sample.json) (20 golden merged records)
+6. **Cross-Engine Verification Pipeline**:
+   - `verify_all()` in [`verify.py`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/verify.py#L20) connects to both engines, verifies table/document counts, cross-audits overlaps against ground-truth CSVs, checks data quality anomalies (orphaned FKs, negative quantities, unicode strings), and formats side-by-side comparison tables.
+
+## 3. Impact & Delta Analysis (AI Modifications)
+- **[NEW]**: [`test_environment/docker-compose.yml`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/docker-compose.yml) — Standalone Docker Compose for PostgreSQL 16 & MongoDB 7.
+- **[NEW]**: [`test_environment/sql/schema.sql`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/sql/schema.sql) — Normalized relational schema with 6 tables, indexes, and constraints.
+- **[NEW]**: [`test_environment/data_generator.py`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/data_generator.py) — Reproducible multi-locale synthetic data generator.
+- **[NEW]**: [`test_environment/seed_postgres.py`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/seed_postgres.py) — PostgreSQL batch seeder with auto-port detection.
+- **[NEW]**: [`test_environment/seed_mongo.py`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/seed_mongo.py) — MongoDB document seeder with indexes.
+- **[NEW]**: [`test_environment/seed_all.py`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/seed_all.py) — Master seed orchestrator & ground-truth exporter.
+- **[NEW]**: [`test_environment/verify.py`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/verify.py) — Cross-engine verification and side-by-side audit runner.
+- **[NEW]**: [`test_environment/requirements.txt`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/requirements.txt) — Dependency specifications.
+- **[NEW]**: [`test_environment/README.md`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/README.md) — Comprehensive architecture, Mermaid ER diagram, and conflict reference.
+- **[NEW]**: [`test_environment/ground_truth/`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/ground_truth) — 6 authoritative ground truth match, mapping, and conflict files.
+- **[NEW]**: [`seed_all.py`](file:///d:/GitHub/Ai_data_migration_platform/seed_all.py) & [`verify.py`](file:///d:/GitHub/Ai_data_migration_platform/verify.py) — Root workspace convenience wrappers.
+
+

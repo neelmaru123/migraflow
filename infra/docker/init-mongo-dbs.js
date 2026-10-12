@@ -8,7 +8,8 @@ const mongoDatabases = [
   'complex_nosql_enterprise',
   'retail_experience_mongo',
   'complex_mongo_db',
-  'analytics_production'
+  'analytics_production',
+  'customer_experience_mongo'
 ];
 
 mongoDatabases.forEach(function (dbName) {

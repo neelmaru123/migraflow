@@ -2875,3 +2875,35 @@ Performed full-stack production deployment scan and hardened the system for smoo
 ### 4. Trade-offs & Future Considerations
 - In environments using an AWS Application Load Balancer (ALB) with SSL offloading, set `FRONTEND_URL=https://...` and `COOKIE_SECURE=true`.
 
+---
+
+## [2026-10-08] - Polyglot Dual-Engine Data Merge Test Environment & Reproducible Seeder
+
+### 1. Decision Summary
+Implemented a production-grade, reproducible dual-source test and benchmark environment for testing data-merging, entity resolution, and schema consolidation algorithms. Created two source databases representing the same E-Commerce and CRM domain:
+1. **Source A (PostgreSQL 16: `legacy_oms_pg`)**: Relational, 3NF normalized schema with `customers`, `products`, `orders`, `order_items`, `payments`, and `support_tickets` tables.
+2. **Source B (MongoDB 7: `customer_experience_mongo`)**: Document-based schema with nested objects, arrays, and denormalized collections (`customers`, `products`, `orders`, `feedback`).
+3. **Reproducible Generation & Ground Truth**: Deterministic seed (`seed=42`) using Faker and random, outputting full cross-database match files (`customer_matches.csv`, `product_matches.csv`, `order_matches.csv`), schema transformation dictionaries (`field_mapping.json`), conflict records (`conflicts_report.csv`), and golden merged samples (`expected_merged_sample.json`).
+
+### 2. Why This Approach? (Rationale)
+- **Problem Being Solved**: Merging data from disparate architectures requires exercising 9 classic data-integration challenges: field naming variations, structural differences (flat vs nested), data type/format divergence, overlapping entities with conflicting values, fuzzy duplicates, category taxonomy mismatches, source-unique attributes, and real-world data quality anomalies (nulls, whitespace, invalid emails, negative values, unicode characters, and orphaned foreign keys).
+- **Chosen Solution**:
+  - Implemented a unified in-memory dataset generator ([`test_environment/data_generator.py`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/data_generator.py)) ensuring exact mathematical parity and referential cross-links between relational rows and NoSQL documents.
+  - Implemented standalone compose orchestration ([`test_environment/docker-compose.yml`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/docker-compose.yml)) alongside dynamic connection discovery (auto-detecting host ports `5434` and `5432` for PostgreSQL and `27017` for MongoDB).
+  - Designed automated post-insert foreign key constraints with `NOT VALID` in PostgreSQL to safely allow intentional orphaned foreign keys (`customer_id = 99999`) without breaking DDL execution.
+- **Why This Library / Technology**:
+  - `psycopg2-binary` with `execute_values`: Enables high-throughput page-buffered batch inserts for 5,000 orders and 11,000+ line items in under 2 seconds.
+  - `pymongo`: Native BSON/ObjectId generation and batch chunked inserts ensuring rapid document indexing.
+  - `Faker` (with `en_US` and `en_IN` locales): Produces authentic multi-locale names, addresses, and localized phone numbers.
+
+### 3. Alternatives Considered & Rejected
+- **Alternative A: Independent Random Generators in Separate Seed Scripts**:
+  - _Rejected_: Running separate random loops in PostgreSQL and MongoDB scripts creates divergent primary keys and breaks ground-truth match integrity.
+- **Alternative B: Pure SQL / Shell Scripting Without Python**:
+  - _Rejected_: Lacks the fuzzy string manipulation, BSON embedding, and complex multi-locale name generation required for realistic NoSQL documents.
+
+### 4. Trade-offs & Future Considerations
+- **Trade-offs**: Storing ground truth files in CSV/JSON requires regenerating them when seed parameters change. Generating them deterministically via `seed_all.py` guarantees synchronization.
+- **Future Considerations**: Providing automated fuzzy scoring benchmark harnesses (e.g. TF-IDF / Jaro-Winkler evaluation scripts) in subsequent test phases.
+
+
