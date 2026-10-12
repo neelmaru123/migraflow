@@ -781,7 +781,9 @@ class ExecutionService:
 
     @staticmethod
     async def diagnose_job_failure(
-        session: AsyncSession, job_id: uuid.UUID
+        session: AsyncSession,
+        job_id: uuid.UUID,
+        user_id: Optional[uuid.UUID] = None,
     ) -> MigrationJob:
         """Synthesizes raw job error traceback into plain-English diagnosis & remediation actions using LLM."""
         # Atomic lock & guard: only process if ai_diagnosis is NULL (Fix #2)
@@ -799,8 +801,16 @@ class ExecutionService:
         if not job:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Execution job '{job_id}' not found.",
+                detail=f"Execution job '{job_id}' not found or access denied.",
             )
+
+        # Enforce user ownership at trusted boundary
+        if user_id is not None:
+            if not job.plan or job.plan.user_id != user_id:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Execution job '{job_id}' not found or access denied.",
+                )
 
         # Early guard: AI diagnosis only available for failed jobs (Fix #6)
         if job.status != "failed":
@@ -1196,8 +1206,9 @@ Rules:
         cursor_offset: int,
         rows_processed: int,
         source_position: Optional[dict] = None,
+        agent_id: Optional[uuid.UUID] = None,
     ) -> ExecutionCheckpoint:
-        """Persists an authoritative checkpoint to PostgreSQL/SQLite."""
+        """Persists an authoritative checkpoint to PostgreSQL/SQLite after validating agent authorization."""
         checkpoint = await ExecutionPlanService.save_checkpoint(
             session=session,
             step_id=step_id,
@@ -1207,6 +1218,7 @@ Rules:
             cursor_offset=cursor_offset,
             rows_processed=rows_processed,
             source_position=source_position,
+            agent_id=agent_id,
         )
         await session.commit()
         await session.refresh(checkpoint)
@@ -1214,20 +1226,23 @@ Rules:
 
     @staticmethod
     async def get_step_checkpoints(
-        session: AsyncSession, step_id: uuid.UUID
+        session: AsyncSession,
+        step_id: uuid.UUID,
+        agent_id: Optional[uuid.UUID] = None,
     ) -> List[ExecutionCheckpoint]:
-        """Fetches all checkpoints for an execution step."""
-        return await ExecutionPlanService.get_checkpoints_for_step(session, step_id)
+        """Fetches all checkpoints for an execution step after validating agent authorization."""
+        return await ExecutionPlanService.get_checkpoints_for_step(session, step_id, agent_id=agent_id)
 
     @staticmethod
     async def complete_step(
         session: AsyncSession,
         step_id: uuid.UUID,
         output_summary: Optional[dict] = None,
+        agent_id: Optional[uuid.UUID] = None,
     ) -> MigrationExecutionStep:
-        """Marks a step completed and checks for whole plan completion."""
+        """Marks a step completed after validating agent authorization and checks for whole plan completion."""
         step = await ExecutionPlanService.complete_step(
-            session=session, step_id=step_id, output_summary=output_summary
+            session=session, step_id=step_id, output_summary=output_summary, agent_id=agent_id
         )
         await session.commit()
         await session.refresh(step)
@@ -1239,13 +1254,15 @@ Rules:
         step_id: uuid.UUID,
         error_type: Optional[str] = None,
         error_message: Optional[str] = None,
+        agent_id: Optional[uuid.UUID] = None,
     ) -> MigrationExecutionStep:
-        """Handles step failure and applies retry policy."""
+        """Handles step failure and applies retry policy after validating agent authorization."""
         step = await ExecutionPlanService.fail_step(
             session=session,
             step_id=step_id,
             error_type=error_type,
             error_message=error_message or "Execution step failed.",
+            agent_id=agent_id,
         )
         await session.commit()
         await session.refresh(step)
@@ -1255,9 +1272,10 @@ Rules:
     async def list_user_interventions(
         session: AsyncSession,
         job_id: uuid.UUID,
+        user_id: Optional[uuid.UUID] = None,
     ) -> List[Any]:
-        """Lists pending and resolved user interventions for a migration job."""
-        return await ExecutionPlanService.list_user_interventions(session, job_id)
+        """Lists pending and resolved user interventions for a migration job after verifying user ownership."""
+        return await ExecutionPlanService.list_user_interventions(session, job_id, user_id=user_id)
 
     @staticmethod
     async def resolve_user_intervention(

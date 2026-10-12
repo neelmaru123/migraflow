@@ -14,13 +14,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.db import get_db
 from app.core.security import decode_jwt_token
 from app.core.websocket_manager import manager
-from app.modules.agents.agents_dependencies import get_current_agent
+from app.modules.agents.agents_dependencies import get_current_agent, hash_agent_token
 from app.modules.agents.agents_models import Agent
 from app.modules.agents.agents_schemas import (
     AgentCreate,
     AgentDetailResponse,
     AgentDockerCommandResponse,
     AgentFatalErrorRequest,
+    AgentFatalErrorResponse,
     AgentHeartbeat,
     AgentResponse,
     AgentUpdate,
@@ -131,18 +132,21 @@ async def agent_heartbeat_direct(
     )
 
 
-@router.post("/fatal-error", response_model=AgentResponse)
+@router.post("/fatal-error", response_model=AgentFatalErrorResponse)
 async def report_agent_fatal_error(
     payload: AgentFatalErrorRequest,
     agent_id: Optional[uuid.UUID] = Query(None),
     x_agent_id: Optional[str] = Header(None, alias="X-Agent-ID"),
+    x_agent_token: Optional[str] = Header(None, alias="X-Agent-Token"),
+    authorization: Optional[str] = Header(None),
     session: AsyncSession = Depends(get_db),
 ):
     """
     Emergency fatal error reporting endpoint used by Docker agent when stopping
     due to startup crashes, authentication rejection, or unhandled exceptions.
+    Prevents arbitrary agent-ID spoofing and omits sensitive agent metadata from responses.
     """
-    resolved_id: Optional[uuid.UUID] = agent_id
+    resolved_id: Optional[uuid.UUID] = payload.agent_id or agent_id
     if not resolved_id and x_agent_id:
         try:
             resolved_id = uuid.UUID(x_agent_id.strip())
@@ -152,14 +156,41 @@ async def report_agent_fatal_error(
     if not resolved_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="agent_id query parameter or 'X-Agent-ID' header required for fatal error reporting.",
+            detail="agent_id in body, query parameter, or 'X-Agent-ID' header required for fatal error reporting.",
         )
+
+    # Resolve optional caller credentials if provided
+    caller_agent: Optional[Agent] = None
+    caller_user_id: Optional[uuid.UUID] = None
+
+    token = x_agent_token
+    if not token and authorization and authorization.startswith("Bearer "):
+        bearer_val = authorization.split("Bearer ")[1].strip()
+        if bearer_val.startswith("ag_live_"):
+            token = bearer_val
+        else:
+            try:
+                jwt_payload = decode_jwt_token(bearer_val)
+                sub = jwt_payload.get("sub")
+                if sub:
+                    caller_user_id = uuid.UUID(sub)
+            except Exception:
+                pass
+
+    if token:
+        from sqlalchemy import select
+        token_hash = hash_agent_token(token)
+        stmt_agent = select(Agent).where(Agent.api_token_hash == token_hash)
+        res_agent = await session.execute(stmt_agent)
+        caller_agent = res_agent.scalar_one_or_none()
 
     return await AgentService.record_fatal_error(
         session=session,
         agent_id=resolved_id,
         error_message=payload.error_message,
         error_category=payload.error_category,
+        caller_agent=caller_agent,
+        caller_user_id=caller_user_id,
     )
 
 

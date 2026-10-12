@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import uuid
 
 
+from fastapi import HTTPException, status
 from sqlalchemy import and_, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -215,6 +216,53 @@ class ExecutionPlanService:
         return exec_plan
 
     @classmethod
+    async def _verify_step_agent_access(
+        cls,
+        session: AsyncSession,
+        step: MigrationExecutionStep,
+        agent_id: Optional[uuid.UUID],
+    ) -> None:
+        """
+        Server-side validation of agent-to-job, agent-to-step, and cross-tenant boundaries.
+        Raises HTTPException(404) without leaking foreign tenant data if unauthorized.
+        """
+        if not agent_id:
+            return
+
+        from app.modules.agents.agents_models import Agent
+        agent_obj = await session.get(Agent, agent_id)
+        if not agent_obj:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Execution step '{step.id}' not found or access denied.",
+            )
+
+        job = step.execution_plan.job if step.execution_plan else None
+        plan = step.execution_plan.plan if step.execution_plan else None
+
+        # Cross-tenant check: agent user_id must match plan user_id
+        if plan and agent_obj.user_id != plan.user_id:
+            logger.warning(
+                f"Cross-tenant access blocked: Agent '{agent_id}' (user '{agent_obj.user_id}') "
+                f"attempted to access step '{step.id}' (user '{plan.user_id}')."
+            )
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Execution step '{step.id}' not found or access denied.",
+            )
+
+        # Cross-agent check: step/job must be assigned to this agent
+        if job and job.agent_id and job.agent_id != agent_id:
+            logger.warning(
+                f"Cross-agent access blocked: Agent '{agent_id}' attempted to access "
+                f"step '{step.id}' assigned to agent '{job.agent_id}'."
+            )
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Execution step '{step.id}' not found or access denied for this agent.",
+            )
+
+    @classmethod
     async def claim_next_step(
         cls,
         session: AsyncSession,
@@ -226,8 +274,7 @@ class ExecutionPlanService:
         Claims the next eligible execution step whose dependencies are satisfied,
         enforcing concurrency limits and utilizing row-level locks (SKIP LOCKED).
         """
-        # Fetch execution plan
-        # Fetch execution plan with plan for tenant isolation
+        # Fetch execution plan with plan and job for tenant & agent isolation
         stmt_plan = (
             select(MigrationExecutionPlan)
             .options(
@@ -246,11 +293,14 @@ class ExecutionPlanService:
         ):
             return None
 
-        # Verify tenant isolation: agent must belong to the same user as the migration plan
+        # Verify tenant isolation: agent must belong to the same user
         if agent_id:
             from app.modules.agents.agents_models import Agent
             agent_obj = await session.get(Agent, agent_id)
-            if agent_obj and exec_plan.plan and agent_obj.user_id != exec_plan.plan.user_id:
+            if not agent_obj:
+                logger.warning(f"Agent '{agent_id}' not found.")
+                return None
+            if exec_plan.plan and agent_obj.user_id != exec_plan.plan.user_id:
                 logger.warning(
                     f"Agent '{agent_id}' (user '{agent_obj.user_id}') unauthorized to claim step "
                     f"for plan '{execution_plan_id}' (user '{exec_plan.plan.user_id}')."
@@ -298,6 +348,9 @@ class ExecutionPlanService:
                 step.updated_at = now
                 step.attempt_count += 1
 
+                if exec_plan.job and agent_id:
+                    exec_plan.job.agent_id = agent_id
+
                 if exec_plan.status == ExecutionPlanLifecycle.PENDING.value:
                     exec_plan.status = ExecutionPlanLifecycle.RUNNING.value
 
@@ -340,11 +393,32 @@ class ExecutionPlanService:
         cursor_offset: int,
         rows_processed: int,
         source_position: Optional[Dict[str, Any]] = None,
+        agent_id: Optional[uuid.UUID] = None,
     ) -> ExecutionCheckpoint:
         """
         Atomically saves or updates an authoritative execution checkpoint in the database.
         Increments checkpoint_version and emits a durable CHECKPOINT_SAVED event.
+        Validates step existence and agent execution authorization boundaries.
         """
+        # Verify step existence and agent authorization
+        stmt_step = (
+            select(MigrationExecutionStep)
+            .options(
+                selectinload(MigrationExecutionStep.execution_plan).selectinload(MigrationExecutionPlan.job),
+                selectinload(MigrationExecutionStep.execution_plan).selectinload(MigrationExecutionPlan.plan),
+            )
+            .where(MigrationExecutionStep.id == step_id)
+        )
+        res_step = await session.execute(stmt_step)
+        step = res_step.scalar_one_or_none()
+        if agent_id:
+            if not step:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Execution step '{step_id}' not found.",
+                )
+            await cls._verify_step_agent_access(session, step, agent_id)
+
         now = datetime.now(timezone.utc)
         stmt = (
             select(ExecutionCheckpoint)
@@ -397,7 +471,7 @@ class ExecutionPlanService:
             event_id=uuid.uuid4(),
             event_type=ExecutionEventType.CHECKPOINT_SAVED.value,
             actor_type="agent",
-            actor_id="checkpoint_manager",
+            actor_id=str(agent_id or "checkpoint_manager"),
             timestamp=now,
             payload={
                 "checkpoint_id": str(checkpoint.id),
@@ -424,8 +498,28 @@ class ExecutionPlanService:
         cls,
         session: AsyncSession,
         step_id: uuid.UUID,
+        agent_id: Optional[uuid.UUID] = None,
     ) -> List[ExecutionCheckpoint]:
-        """Fetches all authoritative checkpoints associated with an execution step."""
+        """Fetches all authoritative checkpoints associated with an execution step after validating agent authorization."""
+        stmt_step = (
+            select(MigrationExecutionStep)
+            .options(
+                selectinload(MigrationExecutionStep.execution_plan).selectinload(MigrationExecutionPlan.job),
+                selectinload(MigrationExecutionStep.execution_plan).selectinload(MigrationExecutionPlan.plan),
+            )
+            .where(MigrationExecutionStep.id == step_id)
+        )
+        res_step = await session.execute(stmt_step)
+        step = res_step.scalar_one_or_none()
+        if not step:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Execution step '{step_id}' not found.",
+            )
+
+        if agent_id:
+            await cls._verify_step_agent_access(session, step, agent_id)
+
         stmt = (
             select(ExecutionCheckpoint)
             .where(ExecutionCheckpoint.execution_step_id == step_id)
@@ -440,21 +534,32 @@ class ExecutionPlanService:
         session: AsyncSession,
         step_id: uuid.UUID,
         output_summary: Optional[Dict[str, Any]] = None,
+        agent_id: Optional[uuid.UUID] = None,
     ) -> MigrationExecutionStep:
         """
         Marks an execution step as COMPLETED. If all steps in the execution plan are COMPLETED,
         advances the execution plan and parent job to COMPLETED status.
+        Enforces server-side agent execution authorization.
         """
         stmt = (
             select(MigrationExecutionStep)
-            .options(selectinload(MigrationExecutionStep.execution_plan))
+            .options(
+                selectinload(MigrationExecutionStep.execution_plan).selectinload(MigrationExecutionPlan.job),
+                selectinload(MigrationExecutionStep.execution_plan).selectinload(MigrationExecutionPlan.plan),
+            )
             .where(MigrationExecutionStep.id == step_id)
             .with_for_update()
         )
         res = await session.execute(stmt)
         step = res.scalar_one_or_none()
         if not step:
-            raise ValueError(f"Execution step '{step_id}' not found.")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Execution step '{step_id}' not found.",
+            )
+
+        if agent_id:
+            await cls._verify_step_agent_access(session, step, agent_id)
 
         now = datetime.now(timezone.utc)
         step.status = ExecutionStepLifecycle.COMPLETED.value
@@ -472,7 +577,7 @@ class ExecutionPlanService:
             migration_plan_id=step.execution_plan.migration_plan_id if step.execution_plan else None,
             event_type=ExecutionEventType.STEP_COMPLETED.value,
             actor_type="agent",
-            actor_id=str(step.agent_run_id or "system"),
+            actor_id=str(step.agent_run_id or agent_id or "system"),
             timestamp=now,
             payload={
                 "step_id": str(step.id),
@@ -539,21 +644,32 @@ class ExecutionPlanService:
         error_type: Optional[str] = None,
         error_message: Optional[str] = None,
         retry_policy: Optional[RetryPolicy] = None,
+        agent_id: Optional[uuid.UUID] = None,
     ) -> MigrationExecutionStep:
         """
         Handles execution step failure via centralized FailureClassifier & RecoveryRouter.
         Determines deterministic outcome: RETRY, RECOVER, REPLAN, ASK_USER, or FAIL.
+        Enforces server-side agent execution authorization.
         """
         stmt = (
             select(MigrationExecutionStep)
-            .options(selectinload(MigrationExecutionStep.execution_plan))
+            .options(
+                selectinload(MigrationExecutionStep.execution_plan).selectinload(MigrationExecutionPlan.job),
+                selectinload(MigrationExecutionStep.execution_plan).selectinload(MigrationExecutionPlan.plan),
+            )
             .where(MigrationExecutionStep.id == step_id)
             .with_for_update()
         )
         res = await session.execute(stmt)
         step = res.scalar_one_or_none()
         if not step:
-            raise ValueError(f"Execution step '{step_id}' not found.")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Execution step '{step_id}' not found.",
+            )
+
+        if agent_id:
+            await cls._verify_step_agent_access(session, step, agent_id)
 
         now = datetime.now(timezone.utc)
         step.error_type = error_type
@@ -777,8 +893,22 @@ class ExecutionPlanService:
         cls,
         session: AsyncSession,
         job_id: uuid.UUID,
+        user_id: Optional[uuid.UUID] = None,
     ) -> List[UserIntervention]:
-        """Lists all user interventions for a migration job."""
+        """Lists all user interventions for a migration job after verifying user ownership."""
+        if user_id is not None:
+            stmt_check = (
+                select(MigrationJob)
+                .join(MigrationPlan, MigrationJob.migration_plan_id == MigrationPlan.id)
+                .where(MigrationJob.id == job_id, MigrationPlan.user_id == user_id)
+            )
+            res_check = await session.execute(stmt_check)
+            if res_check.scalar_one_or_none() is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Execution job '{job_id}' not found or access denied.",
+                )
+
         stmt = (
             select(UserIntervention)
             .where(UserIntervention.migration_job_id == job_id)
@@ -801,6 +931,7 @@ class ExecutionPlanService:
         - 'retry' / 'truncate_and_proceed': Resumes execution
         - 'replan': Invokes replanning
         - 'fail' / 'abort': Permanently fails the job
+        Enforces user ownership at trusted boundary.
         """
         stmt = (
             select(UserIntervention)
@@ -810,18 +941,15 @@ class ExecutionPlanService:
         res = await session.execute(stmt)
         intervention = res.scalar_one_or_none()
         if not intervention:
-            raise ValueError(f"User intervention '{intervention_id}' not found.")
-
-        now = datetime.now(timezone.utc)
-        intervention.status = "resolved"
-        intervention.user_response = {"action": action, "data": response_data or {}}
-        intervention.resolved_by_user_id = user_id
-        intervention.resolved_at = now
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"User intervention '{intervention_id}' not found.",
+            )
 
         job_id = intervention.migration_job_id
         step_id = intervention.step_id
 
-        # Fetch job and plan
+        # Fetch job and plan to verify user ownership
         stmt_job = (
             select(MigrationJob)
             .options(
@@ -832,6 +960,17 @@ class ExecutionPlanService:
         )
         res_job = await session.execute(stmt_job)
         job = res_job.scalar_one_or_none()
+        if not job or not job.plan or job.plan.user_id != user_id:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"User intervention '{intervention_id}' not found or access denied.",
+            )
+
+        now = datetime.now(timezone.utc)
+        intervention.status = "resolved"
+        intervention.user_response = {"action": action, "data": response_data or {}}
+        intervention.resolved_by_user_id = user_id
+        intervention.resolved_at = now
 
         action_norm = action.strip().lower()
 

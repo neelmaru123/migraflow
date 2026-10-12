@@ -1,5 +1,56 @@
 # Execution Flow — Migraflow Platform
 
+## Execution Flow — Phase 1: Security & Authorization Boundaries
+
+### 1. Entry Points
+- **Agent Step & Checkpoint Execution Operations**:
+  - `POST /api/v1/executions/plans/{plan_id}/steps/claim` in [`apps/api/app/modules/execution/execution_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_routes.py)
+  - `POST /api/v1/executions/steps/{step_id}/checkpoint` in [`apps/api/app/modules/execution/execution_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_routes.py)
+  - `GET /api/v1/executions/steps/{step_id}/checkpoints` in [`apps/api/app/modules/execution/execution_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_routes.py)
+  - `POST /api/v1/executions/steps/{step_id}/complete` in [`apps/api/app/modules/execution/execution_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_routes.py)
+  - `POST /api/v1/executions/steps/{step_id}/fail` in [`apps/api/app/modules/execution/execution_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_routes.py)
+- **Failure Diagnosis**:
+  - `POST /api/v1/executions/{id}/diagnose` in [`apps/api/app/modules/execution/execution_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_routes.py)
+- **Agent Fatal Error Reporting**:
+  - `POST /api/v1/agents/fatal-error` in [`apps/api/app/modules/agents/agents_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/agents/agents_routes.py)
+
+### 2. Step-by-Step Execution Sequence
+
+#### Flow A: Agent Step Checkpoint & Execution Mutation
+1. **Agent Request**: Edge Agent calls `POST /api/v1/executions/steps/{step_id}/checkpoint` with `X-Agent-Token` header.
+2. **Authentication**: `get_current_agent` verifies token hash and resolves authenticated `Agent`.
+3. **Route Dispatch**: Route extracts `agent.id` and forwards to `ExecutionService.save_step_checkpoint()`, then `ExecutionPlanService.save_checkpoint()`.
+4. **Service-Layer Authorization Boundary**:
+   - `ExecutionPlanService._verify_step_agent_access()` is invoked with row-level transaction locks.
+   - **Cross-Tenant Guard**: Queries `step.execution_plan.plan`. If `agent.user_id != plan.user_id`, immediately raises `HTTP 404 Not Found` without disclosing step or tenant information.
+   - **Cross-Agent Guard**: Verifies `job.agent_id == agent.id` or matches active `step.agent_run_id`. If foreign agent mutates an active step, raises `HTTP 404 Not Found`.
+5. **Durable Mutation**: Updates/saves `ExecutionCheckpoint` monotonically and records `ExecutionEvent`.
+
+#### Flow B: Failure Diagnosis Ownership Validation
+1. **User Request**: User calls `POST /api/v1/executions/{job_id}/diagnose`.
+2. **Authentication**: Route resolves `current_user: User`.
+3. **Service Validation**: `ExecutionService.diagnose_job_failure()` acquires lock and checks `job.plan.user_id == user_id`.
+   - If user does not own the plan: raises `HTTP 404 Not Found`.
+   - If called internally by system watchdog (`user_id=None`): proceeds securely.
+4. **Remediation Synthesis**: Synthesizes sanitized diagnosis and persists `ai_diagnosis` on `MigrationJob`.
+
+#### Flow C: Emergency Fatal Error Reporting
+1. **Agent Crash/Exit**: Agent container encounters fatal startup crash or shutdown and invokes `POST /api/v1/agents/fatal-error`.
+2. **Identity Verification**:
+   - Route resolves `caller_agent` if `X-Agent-Token` is provided, or `caller_user_id` if JWT Bearer is provided.
+   - If authenticated as Agent X but target `agent_id` is Agent Y: rejects with `HTTP 403 Forbidden` ("Authenticated agent credentials do not match").
+   - If unauthenticated: checks whether target agent has active/running jobs. If active jobs exist: rejects with `HTTP 403 Forbidden`. If offline/idle: permits emergency failure reporting.
+3. **Sanitized Response**: Updates agent status to `error` and returns `AgentFatalErrorResponse` containing only error diagnostics, strictly stripping `user_id` and authentication tokens.
+
+### 3. Impact & Delta Analysis
+- **[NEW]**: [`apps/api/tests/unit/test_security_authorization_gaps.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/tests/unit/test_security_authorization_gaps.py) - 5 comprehensive regression test cases covering all Phase 1 boundaries.
+- **[MODIFIED]**: [`apps/api/app/core/config.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/core/config.py) - Insecure secret key validator.
+- **[MODIFIED]**: [`apps/api/app/modules/agents/agents_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/agents/agents_routes.py), [`agents_schemas.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/agents/agents_schemas.py), [`agents_services.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/agents/agents_services.py) - Caller identity checks and sanitized responses.
+- **[MODIFIED]**: [`apps/api/app/modules/execution/execution_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_routes.py), [`execution_services.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_services.py), [`execution_plan_services.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_plan_services.py) - Server-side agent authorization, tenant isolation, and job ownership enforcement.
+- **[MODIFIED]**: [`docker-compose.prod.yml`](file:///d:/GitHub/Ai_data_migration_platform/docker-compose.prod.yml), [`.env.example`](file:///d:/GitHub/Ai_data_migration_platform/.env.example), [`.env.production.example`](file:///d:/GitHub/Ai_data_migration_platform/.env.production.example) - Production secrets configuration hardening.
+
+---
+
 ## Execution Flow — UK GDPR & PECR Compliance Controls
 
 ### 1. Entry Points

@@ -2,7 +2,40 @@
 
 This file records all key architectural decisions, technology selections, trade-offs, and design rationale for the **AI Data Migration Platform**.
 
-## [2026-10-05] - UK GDPR, Data Protection Act 2018 & PECR Privacy Remediation
+## [2026-10-12] - Phase 1: Security and Authorization Hardening (Agent Boundaries, Ownership, Secrets)
+
+### 1. Decision Summary
+Implemented server-side security authorization boundaries across agent execution, step checkpoints, failure diagnosis, emergency fatal error reporting, and production secrets configuration:
+1. **Agent Execution Authorization & Isolation**:
+   - Validated agent-to-job and agent-to-step relationships directly at the database/service layer in `ExecutionPlanService` (`_verify_step_agent_access`), rather than relying solely on route authentication.
+   - Enforced cross-tenant isolation: agents owned by User A cannot access, claim, checkpoint, complete, or fail execution steps owned by User B (raises `HTTP 404` without leaking tenant data).
+   - Enforced cross-agent boundaries while preserving standby recovery: an agent assigned to Job A cannot mutate steps of Job B; however, when an agent crashes and Watchdog marks a step as `RETRYING`, standby failover agents owned by the same tenant can claim the recovered step, updating `job.agent_id` to reassign active execution.
+2. **Failure Diagnosis Ownership Boundary**:
+   - Hardened `diagnose_job_failure()` in `ExecutionService` by requiring caller `user_id: Optional[UUID]` and validating `job.plan.user_id == user_id`.
+   - Prevented cross-tenant information disclosure of stack traces, connection metadata, and LLM diagnostics. Preserved trusted background system calls (`user_id=None`).
+3. **Emergency Fatal Error Hardening (`/agents/fatal-error`)**:
+   - Prevented arbitrary agent identity spoofing by validating caller credentials (`caller_agent` token or `caller_user` JWT) against target `agent_id`.
+   - Preserved unauthenticated startup failure reporting specifically for agents with no active running tasks or offline status, while rejecting unauthenticated reports if the agent currently has active jobs (`HTTP 403`).
+   - Replaced full `AgentResponse` with sanitized `AgentFatalErrorResponse` excluding `user_id`, API tokens, and credentials.
+4. **Production Secrets Enforcement**:
+   - Updated `config.py` (`validate_security_settings`) to strictly reject insecure default signing keys, example placeholders, short keys (< 32 chars), or keys containing "change_me" / "change_in_production".
+   - Prohibited silent key auto-generation in production; required explicit environment variables in `docker-compose.prod.yml` and `.env.production.example`.
+
+### 2. Why This Approach? (Rationale)
+- **Problem Being Solved**: Execution endpoints authenticated agent tokens but previously performed checkpoint and step mutations using untrusted caller-supplied step IDs without verifying that the agent was assigned to the step or owned by the plan's user. Furthermore, `/agents/fatal-error` allowed arbitrary unauthenticated callers to crash any agent and returned sensitive user IDs in responses. In addition, `diagnose_job_failure()` accepted untrusted job IDs without validating user ownership, leaking database configuration and tracebacks.
+- **Chosen Solution**: Service-layer authorization checks in database transactions using row locks (`with_for_update`), ensuring no time-of-check/time-of-use (TOCTOU) vulnerability. Explicit caller user ID checks on failure diagnosis. Strict Pydantic validator rejecting weak or auto-generated keys in production.
+- **Why This Library / Technology**: Native SQLAlchemy async queries and Pydantic validators; zero additional external dependencies required.
+
+### 3. Alternatives Considered & Rejected
+- **Alternative A: Route-Only Authorization**:
+  - _Rejected_: Filtering only in FastAPI route handlers creates significant risks when internal services, tasks, or background workers invoke services directly, leaving the database layer vulnerable.
+- **Alternative B: Blanket Token Enforcement on `/agents/fatal-error`**:
+  - _Rejected_: Agents crashing during entrypoint initialization (e.g. missing Docker drivers, network failure before token validation) cannot report startup crashes if token validation is mandatory. Distinguishing offline/idle agents from agents running active jobs preserves emergency diagnostics without opening spoofing attacks.
+
+### 4. Trade-offs & Future Considerations
+- An agent taking over a retried step must be owned by the same user. Multi-tenant worker pools sharing an agent across tenants remain strictly disallowed.
+
+---
 
 ### 1. Decision Summary
 Implemented comprehensive technical privacy, data protection, and cookie compliance remediations across the entire stack. Addressed 17 identified privacy findings covering CORS origin protection, IDOR user isolation, secrets hardening, PECR cookie consent gating with high-performance 3D visual fallback, user rights data portability (Art. 20) and erasure (Art. 17), prompt data minimization (Art. 5(1)(c)), email log masking, WebSocket bearer token security, and local DuckDB staging storage limitation.
