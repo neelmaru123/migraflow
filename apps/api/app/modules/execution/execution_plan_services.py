@@ -111,7 +111,7 @@ class ExecutionPlanService:
             max_attempts=3,
             input_definition={
                 "ddl_statements": pre_ddl,
-                "truncate_target": job.truncate_target,
+                "truncate_target": False if job.is_dry_run else bool(job.truncate_target),
                 "is_dry_run": job.is_dry_run,
             },
             created_at=now,

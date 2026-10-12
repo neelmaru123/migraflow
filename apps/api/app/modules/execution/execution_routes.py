@@ -176,7 +176,7 @@ async def poll_agent_tasks(
             execution_plan_id=getattr(job, "execution_plan_id", None),
             status=job.status,
             is_dry_run=job.is_dry_run,
-            truncate_target=job.truncate_target,
+            truncate_target=False if job.is_dry_run else bool(job.truncate_target),
             created_at=job.created_at,
         )
         for job in jobs

@@ -238,25 +238,31 @@ class ExecutionService:
                 f"Preflight alert for plan '{plan_id}': Target tables already contain rows: {existing_data_warnings}"
             )
 
-        # Destructive operation safety guard (Phase 4): non-dry-run executions require valid approval for destructive operations
+        effective_truncate_target = False if is_dry_run else truncate_target
+
+        current_ver = plan.approved_version_number or 1
+        if not plan.approved_version_number:
+            from app.modules.migration_plans.migration_plans_models import MigrationPlanVersion
+            v_stmt = (
+                select(MigrationPlanVersion.version_number)
+                .where(MigrationPlanVersion.migration_plan_id == plan.id)
+                .order_by(MigrationPlanVersion.version_number.desc())
+                .limit(1)
+            )
+            v_res = await session.execute(v_stmt)
+            latest_v = v_res.scalar_one_or_none()
+            if latest_v:
+                current_ver = latest_v
+
+        # Destructive operation safety guard: non-dry-run executions require valid approval for any destructive operations
         if not is_dry_run:
             from app.modules.execution.safety_services import DestructiveApprovalManager
-            current_ver = plan.approved_version_number or 1
-            if not plan.approved_version_number:
-                from app.modules.migration_plans.migration_plans_models import MigrationPlanVersion
-                v_stmt = (
-                    select(MigrationPlanVersion.version_number)
-                    .where(MigrationPlanVersion.migration_plan_id == plan.id)
-                    .order_by(MigrationPlanVersion.version_number.desc())
-                    .limit(1)
-                )
-                v_res = await session.execute(v_stmt)
-                latest_v = v_res.scalar_one_or_none()
-                if latest_v:
-                    current_ver = latest_v
 
             is_compliant, unapproved_ops = await DestructiveApprovalManager.check_plan_destructive_compliance(
-                session=session, plan=plan, current_version_number=current_ver
+                session=session,
+                plan=plan,
+                current_version_number=current_ver,
+                requested_truncate_target=effective_truncate_target,
             )
             if not is_compliant:
                 unapproved_str = ", ".join(f"{op['operation_type']} on {op['target_table']}" for op in unapproved_ops)
@@ -265,7 +271,6 @@ class ExecutionService:
                     detail=f"Cannot execute migration: Destructive operation(s) require explicit approval for plan version {current_ver}: {unapproved_str}.",
                 )
 
-
         now = datetime.now(timezone.utc)
         job = MigrationJob(
             migration_plan_id=plan_id,
@@ -273,7 +278,7 @@ class ExecutionService:
             idempotency_key=clean_idempotency_key,
             status=ExecutionLifecycle.QUEUED.value,
             is_dry_run=is_dry_run,
-            truncate_target=truncate_target,
+            truncate_target=effective_truncate_target,
             total_rows=0,
             processed_rows=0,
             successful_rows=0,
@@ -305,8 +310,10 @@ class ExecutionService:
                 "action": "job_created",
                 "job_id": str(job.id),
                 "is_dry_run": is_dry_run,
-                "truncate_target": truncate_target,
+                "truncate_target": effective_truncate_target,
                 "idempotency_key": clean_idempotency_key,
+                "plan_version": current_ver,
+                "destructive_operations_authorized": effective_truncate_target,
             },
             schema_version=1,
         )

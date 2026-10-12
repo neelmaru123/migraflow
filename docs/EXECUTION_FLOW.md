@@ -1,5 +1,67 @@
 # Execution Flow — Migraflow Platform
 
+## Execution Flow — Phase 2: Destructive Target-Operation Safety Gating & Bypass Remediation
+
+### 1. Entry Points
+- **Job Execution Creation**:
+  - `POST /api/v1/executions` in [`apps/api/app/modules/execution/execution_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_routes.py)
+- **Destructive Approval Management**:
+  - `GET /api/v1/plans/{plan_id}/destructive-approvals` in [`apps/api/app/modules/migration_plans/migration_plans_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/migration_plans/migration_plans_routes.py)
+  - `POST /api/v1/plans/{plan_id}/destructive-approvals/request` in [`apps/api/app/modules/migration_plans/migration_plans_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/migration_plans/migration_plans_routes.py)
+  - `POST /api/v1/plans/{plan_id}/destructive-approvals/{approval_id}/grant` in [`apps/api/app/modules/migration_plans/migration_plans_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/migration_plans/migration_plans_routes.py)
+  - `POST /api/v1/plans/{plan_id}/destructive-approvals/{approval_id}/reject` in [`apps/api/app/modules/migration_plans/migration_plans_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/migration_plans/migration_plans_routes.py)
+- **Agent Task Polling**:
+  - `GET /api/v1/executions/agent/tasks` in [`apps/api/app/modules/execution/execution_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_routes.py)
+
+### 2. Step-by-Step Execution Sequence
+
+#### Flow A: Job Creation with Destructive Safety Gating
+1. **API Request**: User submits `POST /api/v1/executions` with `plan_id`, `is_dry_run`, `truncate_target`, and optional `idempotency_key`.
+2. **Authentication & Ownership**: Route resolves `current_user: User` and delegates to `ExecutionService.create_execution_job()`.
+3. **Plan Validation & Ownership**: Validates plan exists, belongs to caller, `plan.is_valid == True`, and `plan.status in ("completed", "approved")`.
+4. **Idempotency Guard**: If `idempotency_key` is provided and a job exists for the plan and user, returns existing `MigrationJob` immediately.
+5. **Dry-Run Sanitization**:
+   - Computes `effective_truncate_target = False if is_dry_run else truncate_target`.
+   - Dry runs strictly bypass destructive actions without requiring destructive approvals.
+6. **Server-Side Safety Evaluation**:
+   - If not a dry run: resolves active `current_ver = plan.approved_version_number or latest_version`.
+   - Invokes `DestructiveApprovalManager.check_plan_destructive_compliance(plan=plan, current_version_number=current_ver, requested_truncate_target=effective_truncate_target)`.
+   - Evaluates:
+     - All AST destructive cleanup actions (`TRUNCATE`, `DROP TABLE`).
+     - Requested execution action: if `effective_truncate_target=True`, injects requirement for `truncate_all_targets` on `*`.
+     - Validates against active `DestructiveOperationApproval` records matching plan ID, current version, `is_valid == True`, `is_approved == True`, and `expires_at > now`.
+     - Wildcard check: approval for `*` covers all tables; approving an individual table (e.g. `dim_users`) does NOT authorize clean-wiping all tables or table `dim_orders`.
+   - **Rejection**: If any operation is unapproved, raises `HTTP 400 Bad Request` with detailed list of unapproved operations.
+7. **Durable Job & DAG Creation**:
+   - Instantiates `MigrationJob(truncate_target=effective_truncate_target, is_dry_run=is_dry_run, ...)`.
+   - Calls `ExecutionPlanService.create_execution_plan_for_job()`, configuring step `pre_ddl` with sanitized `input_definition["truncate_target"]`.
+   - Emits `JOB_CREATED` event in `ExecutionEvent` audit log with authorized parameters.
+
+#### Flow B: Destructive Operation Approval Workflow
+1. **Sync / Discovery**: When user queries `GET /plans/{plan_id}/destructive-approvals`, `DestructiveApprovalManager.sync_plan_destructive_approvals()` automatically discovers destructive operations in the AST and creates pending `DestructiveOperationApproval` records for the current version.
+2. **Explicit Request**: For clean wipe operations, caller calls `POST /plans/{plan_id}/destructive-approvals/request` specifying `target_table="*"` and `operation_type="truncate_all_targets"`.
+3. **Granting Approval**: Plan owner calls `POST /plans/{plan_id}/destructive-approvals/{approval_id}/grant`.
+   - Verifies `approval.is_valid == True` (stale approvals from previous versions cannot be granted).
+   - Sets `is_approved = True`, `approved_by_user_id = current_user.id`, and `approved_at = now`.
+   - Emits append-only `DESTRUCTIVE_APPROVAL_GRANTED` audit event.
+4. **Invalidation upon Plan Change**: If the plan is refined or modified, `DestructiveApprovalManager.invalidate_all_for_plan()` marks all prior approvals `is_valid = False` with `DESTRUCTIVE_APPROVAL_REVOKED` audit events.
+
+#### Flow C: Agent Dispatch & Execution
+1. **Task Fetching**: Agent calls `GET /api/v1/executions/agent/tasks`.
+2. **Safe Instruction Delivery**: Server returns `AgentTaskItemResponse` with sanitized `truncate_target = False if job.is_dry_run else job.truncate_target`.
+3. **Agent Orchestration**: Agent orchestrator inspects `truncate_target`. If `True`, performs preflight backup check and `DDLExecutor.clean_wipe_target_database()`. If `False`, uses append mode (`ON CONFLICT DO NOTHING`). In dry run mode, DDL and wipe are skipped completely.
+
+### 3. Impact & Delta Analysis
+- **[NEW]**: [`apps/api/tests/unit/test_destructive_approval_bypass.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/tests/unit/test_destructive_approval_bypass.py) - 9 comprehensive unit tests verifying bypass closure, target boundaries, version binding, dry runs, idempotency, and expirations.
+- **[MODIFIED]**: [`apps/api/app/modules/execution/safety_services.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/safety_services.py) - Added `requested_truncate_target` validation, expiration check, target scoping, and `sync_plan_destructive_approvals()`.
+- **[MODIFIED]**: [`apps/api/app/modules/execution/execution_services.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_services.py) - Gated job creation with `check_plan_destructive_compliance`, bound `effective_truncate_target`, and recorded audit event.
+- **[MODIFIED]**: [`apps/api/app/modules/execution/execution_plan_services.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_plan_services.py) - Sanitized `truncate_target` in `pre_ddl` step `input_definition`.
+- **[MODIFIED]**: [`apps/api/app/modules/execution/execution_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_routes.py) - Sanitized `truncate_target` in `AgentTaskItemResponse`.
+- **[MODIFIED]**: [`apps/api/app/modules/execution/execution_schemas.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_schemas.py) - Added `DestructiveApprovalRequestPayload`.
+- **[MODIFIED]**: [`apps/api/app/modules/migration_plans/migration_plans_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/migration_plans/migration_plans_routes.py) - Added approval sync and `POST /{plan_id}/destructive-approvals/request` endpoint.
+
+---
+
 ## Execution Flow — Phase 1: Security & Authorization Boundaries
 
 ### 1. Entry Points

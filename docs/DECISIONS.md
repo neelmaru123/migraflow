@@ -2,6 +2,39 @@
 
 This file records all key architectural decisions, technology selections, trade-offs, and design rationale for the **AI Data Migration Platform**.
 
+## [2026-10-12] - Phase 2: Destructive Target-Operation Approval & Clean-Wipe Bypass Remediation
+
+### 1. Decision Summary
+Eliminated the critical destructive bypass where execution job creation requests specifying `truncate_target=True` could trigger a complete destination database wipe without server-side approval:
+1. **Server-Side Safety Decision Gating**:
+   - Enhanced `DestructiveApprovalManager.check_plan_destructive_compliance()` to evaluate requested runtime job actions (`requested_truncate_target`) alongside AST plan cleanup operations.
+   - Rejected execution requests with `HTTP 400 Bad Request` if `truncate_target=True` is requested without an active, valid server-side `DestructiveOperationApproval` matching the plan ID and current plan version.
+2. **Approval Binding & Invalidation Governance**:
+   - Approvals are strictly bound to `(migration_plan_id, plan_version_number, target_table, operation_type, approved_by_user_id, approved_at)`.
+   - Approvals are version-pinned; modifying or refining a plan invalidates prior approvals via `DestructiveApprovalManager.invalidate_all_for_plan()`. Stale approvals from prior versions are rejected.
+   - Expired approvals (`expires_at < now`) are actively rejected.
+   - Target scope isolation: Approving a single table (e.g. `dim_users`) does not authorize global clean-wipe (`*`), and approval for table A does not cover table B.
+3. **Dry-Run Immutability Invariant**:
+   - Guaranteed that dry runs never perform destructive actions. If `is_dry_run=True`, `effective_truncate_target` is strictly forced to `False` in `MigrationJob`, in `MigrationExecutionStep.input_definition`, and in `AgentTaskItemResponse`.
+4. **Audit Trail Recording**:
+   - Recorded destructive action authorization and parameters into `ExecutionEvent` append-only audit log during job creation (`JOB_CREATED`), approval grant (`DESTRUCTIVE_APPROVAL_GRANTED`), rejection (`DESTRUCTIVE_APPROVAL_REJECTED`), and revocation (`DESTRUCTIVE_APPROVAL_REVOKED`).
+
+### 2. Why This Approach? (Rationale)
+- **Problem Being Solved**: The system previously inspected only `plan.plan_data` AST for cleanup actions. An execution request with `truncate_target=True` on a plan with `cleanup_action=NONE` bypassed safety compliance, generating a job with `truncate_target=True` which instructed the agent orchestrator to clean-wipe all destination tables.
+- **Chosen Solution**: Reused the existing `DestructiveApprovalManager` and `DestructiveOperationApproval` entity. Treated the requested execution action as a first-class destructive operation (`truncate_all_targets` on `*`) requiring matching server-side approval.
+- **Why This Library / Technology**: Reused the existing database schema (migration 012 and 016) without introducing any unnecessary schema modifications or breaking changes.
+
+### 3. Alternatives Considered & Rejected
+- **Alternative A: Frontend-Only Checkbox Gating**:
+  - _Rejected_: Completely insecure; any direct API call, CLI invocation, or compromised client could set `truncate_target: true` and destroy production data.
+- **Alternative B: Introducing a New Approval Architecture**:
+  - _Rejected_: The existing `DestructiveApprovalManager` already implemented version tracking, invalidation, user attribution, and audit event dispatch. Extending it preserved architectural integrity with zero schema alterations.
+
+### 4. Trade-offs & Future Considerations
+- Users requesting clean-wipe must submit a destructive approval request via `POST /plans/{plan_id}/destructive-approvals/request` (or UI prompt) and grant it prior to triggering the migration.
+
+---
+
 ## [2026-10-12] - Phase 1: Security and Authorization Hardening (Agent Boundaries, Ownership, Secrets)
 
 ### 1. Decision Summary
