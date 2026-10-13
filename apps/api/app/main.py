@@ -66,13 +66,25 @@ async def lifespan(app: FastAPI):
         logger.warning(f"Startup table verification note: {exc}")
 
     watchdog_task = asyncio.create_task(stale_agent_watchdog())
-    yield
-    watchdog_task.cancel()
     try:
-        await watchdog_task
-    except asyncio.CancelledError:
-        pass
-    logger.info(f"Shutting down {settings.PROJECT_NAME}...")
+        yield
+    finally:
+        watchdog_task.cancel()
+        try:
+            await watchdog_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            from app.core.redis_client import close_redis_client
+            await close_redis_client()
+        except Exception as exc:
+            logger.warning(f"Error during Redis shutdown: {exc}")
+        try:
+            from app.core.db import dispose_engine
+            await dispose_engine()
+        except Exception as exc:
+            logger.warning(f"Error during database engine shutdown: {exc}")
+        logger.info(f"Shutting down {settings.PROJECT_NAME} complete.")
 
 
 app = FastAPI(
@@ -157,43 +169,50 @@ async def global_exception_handler(request: Request, exc: Exception):
     )
 
 
+from app.modules.observability.health_service import SystemHealthService
+
+
 @app.get("/")
 async def root():
     return {
         "message": f"Welcome to {settings.PROJECT_NAME}",
         "docs": "/docs",
         "health": f"{settings.API_V1_STR}/health",
+        "live": f"{settings.API_V1_STR}/health/live",
+        "ready": f"{settings.API_V1_STR}/health/ready",
     }
 
 
-@app.get(f"{settings.API_V1_STR}/health")
+@app.get(f"{settings.API_V1_STR}/health", summary="System Health & Readiness Probe")
+@app.get("/health", summary="Root Health Probe Alias")
 async def health_check():
     """
-    Active liveness and readiness probe: validates control-plane database connectivity.
-    Returns HTTP 200 when healthy, or HTTP 503 Service Unavailable when the database is unreachable.
+    Active health and readiness probe: validates control-plane database connectivity (required)
+    and Redis cache connectivity (optional, with in-memory fallback).
+    Returns HTTP 200 when database is healthy, or HTTP 503 Service Unavailable when unreachable.
     """
-    db_connected = False
-    db_error = None
-    try:
-        async with AsyncSessionLocal() as session:
-            await session.execute(text("SELECT 1"))
-            db_connected = True
-    except Exception as exc:
-        db_error = CredentialSanitizer.mask_credentials(str(exc))
-        logger.warning(f"Database health check failed: {db_error}")
+    _, http_code, payload = await SystemHealthService.evaluate_readiness(session_factory=AsyncSessionLocal)
+    return JSONResponse(status_code=http_code, content=payload)
 
-    status_code = status.HTTP_200_OK if db_connected else status.HTTP_503_SERVICE_UNAVAILABLE
+
+@app.get(f"{settings.API_V1_STR}/health/live", summary="Process Liveness Probe")
+@app.get("/live", summary="Root Liveness Probe Alias")
+async def liveness_probe():
+    """
+    Zero-dependency liveness probe: verifies process event-loop responsiveness without touching external databases.
+    Prevents cascading container restarts during downstream database degradation or temporary network partitions.
+    """
     return JSONResponse(
-        status_code=status_code,
-        content={
-            "success": db_connected,
-            "message": "System operational" if db_connected else "Database connectivity degraded",
-            "data": {
-                "status": "ok" if db_connected else "degraded",
-                "version": "0.1.0",
-                "environment": settings.ENVIRONMENT,
-                "database_connected": db_connected,
-                "redis_connected": True,
-            },
-        },
+        status_code=status.HTTP_200_OK,
+        content=SystemHealthService.evaluate_liveness(),
     )
+
+
+@app.get(f"{settings.API_V1_STR}/health/ready", summary="Dependency Readiness Probe")
+@app.get("/ready", summary="Root Readiness Probe Alias")
+async def readiness_probe():
+    """
+    Readiness probe: validates that required startup dependencies (database) are operational.
+    """
+    _, http_code, payload = await SystemHealthService.evaluate_readiness(session_factory=AsyncSessionLocal)
+    return JSONResponse(status_code=http_code, content=payload)

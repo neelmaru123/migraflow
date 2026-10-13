@@ -1,5 +1,56 @@
 # Execution Flow — Migraflow Platform
 
+## Execution Flow — Phase 4: Production Health Reporting, Dependency Readiness, and Lifecycle Hardening
+
+### 1. Entry Points
+- **System Health & Readiness Probes**:
+  - `GET /api/v1/health` and `GET /health` in [`apps/api/app/main.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/main.py)
+  - `GET /api/v1/health/ready` and `GET /ready` in [`apps/api/app/main.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/main.py)
+- **Process Liveness Probe**:
+  - `GET /api/v1/health/live` and `GET /live` in [`apps/api/app/main.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/main.py)
+- **Application Lifespan & Shutdown**:
+  - `lifespan()` in [`apps/api/app/main.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/main.py)
+
+### 2. Step-by-Step Execution Sequence
+
+#### Flow A: Health & Readiness Probe Evaluation
+1. **Probe Request**: Load balancer, Docker Compose, or monitor issues `GET /api/v1/health` or `GET /ready`.
+2. **Service Evaluation**: Handler delegates to `SystemHealthService.evaluate_readiness(session_factory=AsyncSessionLocal)`.
+3. **Bounded Database Probe**:
+   - Executes `check_database(timeout_seconds=2.0)`.
+   - Opens async session and executes `SELECT 1` wrapped in `asyncio.wait_for`.
+   - If unreachable or timed out: masks credentials and sets `db_ok = False`.
+4. **Bounded Redis Probe**:
+   - Executes `check_redis(timeout_seconds=1.5)` via `check_redis_connectivity()`.
+   - Sends `client.ping()` over shared singleton pool wrapped in `asyncio.wait_for`.
+   - Never closes client and masks internal errors.
+5. **Decision Logic**:
+   - Database is **required**: if `db_ok == False`, returns `HTTP 503 Service Unavailable` with `success=False`, `status="degraded"`.
+   - Redis is **optional**: if `db_ok == True` and `redis_ok == False`, returns `HTTP 200 OK` with `success=True`, `status="ok"`, noting cache fallback.
+   - If both healthy: returns `HTTP 200 OK` with `success=True`, `status="ok"`, `database_connected=True`, `redis_connected=True`.
+
+#### Flow B: Zero-Dependency Liveness Probe
+1. **Probe Request**: Kubernetes or monitor issues `GET /api/v1/health/live` or `GET /live`.
+2. **Event Loop Verification**: Handler calls `SystemHealthService.evaluate_liveness()`.
+3. **Immediate Response**: Returns `HTTP 200 OK` with ISO timestamp, confirming process loop is unblocked without querying external databases.
+
+#### Flow C: Lifecycle Shutdown Cleanup
+1. **Termination Signal**: Process receives `SIGTERM` / `SIGINT`.
+2. **Lifespan Exit**: Context manager exits `yield` block.
+3. **Background Watchdog Cancel**: Cancels `watchdog_task` and awaits cancellation.
+4. **Connection Pool Draining**:
+   - Invokes `close_redis_client()` to drain and close the Redis connection pool.
+   - Invokes `dispose_engine()` to cleanly dispose the SQLAlchemy connection pool.
+
+### 3. Impact & Delta Analysis
+- **[NEW]**: [`apps/api/tests/unit/test_health_and_lifecycle_reporting.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/tests/unit/test_health_and_lifecycle_reporting.py) - 9 comprehensive unit tests covering all Phase 4 probe and lifecycle scenarios.
+- **[MODIFIED]**: [`apps/api/app/core/redis_client.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/core/redis_client.py) - Added socket timeouts, bounded `check_redis_connectivity()`, and `close_redis_client()`.
+- **[MODIFIED]**: [`apps/api/app/core/db.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/core/db.py) - Added `dispose_engine()` async helper for clean pool disposal.
+- **[MODIFIED]**: [`apps/api/app/modules/observability/health_service.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/observability/health_service.py) - Added `SystemHealthService` with bounded DB and Redis checks and liveness/readiness evaluation.
+- **[MODIFIED]**: [`apps/api/app/main.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/main.py) - Replaced hardcoded Redis status with real probe, added `/live` and `/ready` endpoints, and added clean connection shutdown in lifespan.
+
+---
+
 ## Execution Flow — Phase 2: Destructive Target-Operation Safety Gating & Bypass Remediation
 
 ### 1. Entry Points

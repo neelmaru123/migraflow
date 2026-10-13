@@ -4,14 +4,19 @@ Decouples Agent Health (Docker container connectivity & heartbeat status)
 from Job Health (DAG execution state, error rates, and verification outcomes).
 """
 
+import asyncio
 from datetime import datetime, timezone, timedelta
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
+from app.core.credential_sanitizer import CredentialSanitizer
+from app.core.db import AsyncSessionLocal
+from app.core.redis_client import check_redis_connectivity
 from app.core.state import AgentLifecycle, ExecutionLifecycle
 from app.modules.agents.agents_models import Agent
 from app.modules.execution.execution_models import MigrationJob
@@ -151,3 +156,97 @@ class OperationalHealthService:
             agents=agent_statuses,
             active_jobs=job_statuses,
         )
+
+
+class SystemHealthService:
+    """
+    Evaluates infrastructure health, liveness, and readiness with bounded timeouts.
+    Distinguishes mandatory dependencies (database) from optional ones (Redis).
+    """
+
+    @classmethod
+    async def check_database(cls, session_factory=None, timeout_seconds: float = 2.0) -> bool:
+        """
+        Bounded-time PostgreSQL / database connectivity probe.
+        Does not hang or leak connection errors.
+        """
+        factory = session_factory or AsyncSessionLocal
+        try:
+            async with factory() as session:
+                await asyncio.wait_for(session.execute(text("SELECT 1")), timeout=timeout_seconds)
+                return True
+        except Exception as exc:
+            masked = CredentialSanitizer.mask_credentials(str(exc))
+            logger.warning(f"Database health probe failed: {masked}")
+            return False
+
+    @classmethod
+    async def check_redis(cls, timeout_seconds: float = 1.5) -> bool:
+        """
+        Bounded-time Redis connectivity probe via shared client pool.
+        """
+        return await check_redis_connectivity(timeout_seconds=timeout_seconds)
+
+    @classmethod
+    def evaluate_liveness(cls) -> Dict[str, Any]:
+        """
+        Liveness probe: verifies process event-loop responsiveness without touching external systems.
+        Prevents cascading container restarts during external dependency degradation.
+        """
+        return {
+            "status": "alive",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "version": "0.1.0",
+        }
+
+    @classmethod
+    async def evaluate_readiness(
+        cls, session_factory=None, db_timeout: float = 2.0, redis_timeout: float = 1.5
+    ) -> Tuple[bool, int, Dict[str, Any]]:
+        """
+        Readiness probe: validates required startup prerequisites.
+        - Database: REQUIRED. If down, readiness fails (HTTP 503).
+        - Redis: OPTIONAL (memory fallback available). If down, readiness succeeds (HTTP 200) with degraded status.
+        Returns:
+            (is_ready: bool, http_status_code: int, response_dict: dict)
+        """
+        db_ok = await cls.check_database(session_factory=session_factory, timeout_seconds=db_timeout)
+        redis_ok = await cls.check_redis(timeout_seconds=redis_timeout)
+
+        is_ready = db_ok
+        http_code = 200 if is_ready else 503
+
+        if db_ok and redis_ok:
+            message = "System operational"
+            status_verdict = "ok"
+        elif db_ok and not redis_ok:
+            message = "System operational (cache offline, using memory fallback)"
+            status_verdict = "ok"
+        else:
+            message = "Database connectivity degraded"
+            status_verdict = "degraded"
+
+        payload = {
+            "success": is_ready,
+            "message": message,
+            "data": {
+                "status": status_verdict,
+                "version": "0.1.0",
+                "environment": settings.ENVIRONMENT,
+                "database_connected": db_ok,
+                "redis_connected": redis_ok,
+                "dependencies": {
+                    "database": {
+                        "connected": db_ok,
+                        "required": True,
+                        "status": "ok" if db_ok else "down",
+                    },
+                    "redis": {
+                        "connected": redis_ok,
+                        "required": False,
+                        "status": "ok" if redis_ok else "degraded",
+                    },
+                },
+            },
+        }
+        return is_ready, http_code, payload

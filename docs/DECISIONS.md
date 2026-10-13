@@ -2,6 +2,38 @@
 
 This file records all key architectural decisions, technology selections, trade-offs, and design rationale for the **AI Data Migration Platform**.
 
+## [2026-10-12] - Phase 4: Production Health Reporting, Dependency Readiness, and Lifecycle Hardening
+
+### 1. Decision Summary
+Eliminated false health reporting, hardcoded Redis status, unbounded probe timeouts, and unmanaged connection lifecycles:
+1. **Accurate Bounded Redis Health Probing**:
+   - Replaced hardcoded `redis_connected: True` with an actual bounded-time `client.ping()` probe using `check_redis_connectivity(timeout_seconds=1.5)` over the shared connection pool.
+   - Handled connection errors and timeouts without leaking credentials or raw internal exceptions.
+2. **Dependency Readiness vs. Degradation Distinction**:
+   - Defined PostgreSQL as a **mandatory** dependency: if the database is unreachable, readiness probe returns `HTTP 503 Service Unavailable`.
+   - Defined Redis as an **optional** dependency (supported by in-memory fallback in `PasswordResetCache`): if Redis is unreachable or times out, the application remains ready (`HTTP 200 OK`) with degraded cache status (`data.redis_connected: False`, `dependencies.redis.status: "degraded"`).
+3. **Decoupled Liveness and Readiness Semantics**:
+   - Implemented zero-dependency `GET /api/v1/health/live` (and `/live`) liveness probe that verifies event-loop responsiveness without pinging external dependencies, avoiding cascading container restarts during downstream database outages.
+   - Maintained `GET /api/v1/health` (and `/health`) and `GET /api/v1/health/ready` (and `/ready`) readiness probes with bounded DB and Redis checks.
+4. **Lifecycle & Connection Pool Clean Shutdown**:
+   - Added `close_redis_client()` and `dispose_engine()` hooks invoked in a guaranteed `finally:` block of the application `lifespan` context manager, preventing dangling connections and resource leaks upon shutdown.
+
+### 2. Why This Approach? (Rationale)
+- **Problem Being Solved**: `/api/v1/health` previously reported hardcoded `redis_connected: True` without checking Redis. Furthermore, DB checks lacked timeout bounding (risking hung probes during outages), and Redis/DB connection pools were never explicitly closed on application shutdown.
+- **Chosen Solution**: Created `SystemHealthService` to centralize bounded health checks, distinguish mandatory vs optional dependencies, provide clean liveness/readiness routes, and tie connection pool closure to `lifespan`.
+- **Why This Library / Technology**: Reused native `asyncio.wait_for`, `redis.asyncio` ping, and SQLAlchemy async sessions; zero new external dependencies.
+
+### 3. Alternatives Considered & Rejected
+- **Alternative A: Failing Readiness on Redis Outage**:
+  - _Rejected_: Unnecessarily takes down the entire migration platform API when Redis is temporarily offline, even though password reset and rate limiting feature resilient in-memory fallbacks.
+- **Alternative B: Checking Database in Liveness Probe**:
+  - _Rejected_: If the database undergoes maintenance or connection spikes, Kubernetes/Docker would restart the healthy API container in a cascading crash loop. Liveness must test process responsiveness only.
+
+### 4. Trade-offs & Future Considerations
+- Probes use short bounded timeouts (2.0s for DB, 1.5s for Redis) to ensure Docker Compose and load balancer healthcheck intervals are never blocked.
+
+---
+
 ## [2026-10-12] - Phase 2: Destructive Target-Operation Approval & Clean-Wipe Bypass Remediation
 
 ### 1. Decision Summary
