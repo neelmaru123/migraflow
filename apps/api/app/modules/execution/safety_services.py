@@ -8,7 +8,7 @@ and handles approval invalidation upon plan version changes.
 from datetime import datetime, timezone
 import logging
 import re
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 import uuid
 
 from sqlalchemy import select, update

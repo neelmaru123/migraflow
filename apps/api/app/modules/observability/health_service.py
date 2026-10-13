@@ -7,8 +7,7 @@ from Job Health (DAG execution state, error rates, and verification outcomes).
 import asyncio
 from datetime import datetime, timezone, timedelta
 import logging
-from typing import Any, Dict, List, Optional, Tuple
-import uuid
+from typing import Any, Dict, List, Tuple
 
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession

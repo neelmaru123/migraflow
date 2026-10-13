@@ -6,10 +6,12 @@ import asyncio
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from app.core.config import settings
+from app.core.credential_sanitizer import CredentialSanitizer
 from app.core.db import AsyncSessionLocal
 from app.core.logging import logger
 from app.modules.agents.agents_routes import router as agents_router
@@ -18,6 +20,7 @@ from app.modules.evaluation.evaluation_routes import router as evaluation_router
 from app.modules.execution.execution_routes import execution_router
 from app.modules.metadata.metadata_routes import router as metadata_router
 from app.modules.migration_plans.migration_plans_routes import router as migration_plans_router
+from app.modules.observability.health_service import SystemHealthService
 from app.modules.observability.observability_routes import router as observability_router
 from app.modules.sources.sources_routes import router as sources_router
 from app.modules.users.users_routes import router as users_router
@@ -137,11 +140,6 @@ app.add_middleware(
 )
 
 
-from fastapi import Request, status
-from fastapi.responses import JSONResponse
-from sqlalchemy import text
-from app.core.credential_sanitizer import CredentialSanitizer
-
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
@@ -168,8 +166,6 @@ async def global_exception_handler(request: Request, exc: Exception):
         },
     )
 
-
-from app.modules.observability.health_service import SystemHealthService
 
 
 @app.get("/")
