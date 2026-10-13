@@ -70,12 +70,13 @@ class ExecutionService:
         target_config = plan.target_config if isinstance(plan.target_config, dict) else {}
         target_identifier = target_config.get("identifier")
 
+        ds_conditions = [DataSource.role.in_(["target", "both"])]
+        if target_identifier:
+            ds_conditions.append(DataSource.identifier == target_identifier)
+
         stmt_ds = select(DataSource).where(
             DataSource.agent_id == plan.agent_id,
-            or_(
-                DataSource.role.in_(["target", "both"]),
-                DataSource.identifier == target_identifier if target_identifier else False,
-            ),
+            or_(*ds_conditions),
         )
         res_ds = await session.execute(stmt_ds)
         target_data_sources = list(res_ds.scalars().all())
@@ -375,7 +376,8 @@ class ExecutionService:
             .values(status="preparing", updated_at=now)
         )
         res_update = await session.execute(stmt_update)
-        if res_update.rowcount == 0:
+        updated_rows = int(getattr(res_update, "rowcount", 0) or 0)
+        if updated_rows == 0:
             await session.rollback()
             return []
 
@@ -840,6 +842,7 @@ class ExecutionService:
         user_env_issue = False
         fix_steps: List[str] = []
         copyable_cmd: Optional[str] = None
+        copyable_cmd_label: Optional[str] = None
 
         # 1. Attempt Intelligent LLM-Powered Diagnosis (Gemini / OpenAI)
         llm_success = False
@@ -856,7 +859,13 @@ class ExecutionService:
                     copyable_fix_command: Optional[str] = Field(None, description="Exact copyable SQL command (e.g. ALTER TABLE ... or TRUNCATE ...) to fix or inspect the database.")
                     copyable_fix_label: Optional[str] = Field(None, description="Label for the command, e.g., 'SQL Schema Fix (Run in Destination DB)'")
 
-                plan_title = job.plan.title if job.plan else "Migration Plan"
+                plan_title = "Migration Plan"
+                if job.plan:
+                    plan_title = getattr(job.plan, "title", None) or (
+                        job.plan.plan_data.get("title") or job.plan.plan_data.get("name")
+                        if isinstance(getattr(job.plan, "plan_data", None), dict)
+                        else None
+                    ) or "Migration Plan"
                 target_engine = "postgresql"
                 if job.agent and job.agent.data_sources:
                     for ds in job.agent.data_sources:
@@ -904,7 +913,16 @@ Rules:
 
                 if llm:
                     structured_llm = llm.with_structured_output(LLMDiagnosisResponse)
-                    diag_obj: LLMDiagnosisResponse = await structured_llm.ainvoke([HumanMessage(content=llm_prompt)])
+                    raw_diag: Any = await structured_llm.ainvoke([HumanMessage(content=llm_prompt)])
+                    diag_obj: Optional[LLMDiagnosisResponse] = (
+                        raw_diag
+                        if isinstance(raw_diag, LLMDiagnosisResponse)
+                        else (
+                            LLMDiagnosisResponse.model_validate(raw_diag)
+                            if isinstance(raw_diag, dict)
+                            else None
+                        )
+                    )
                     if diag_obj and diag_obj.summary:
                         diag_summary = diag_obj.summary
                         category = diag_obj.root_cause_category
@@ -936,149 +954,147 @@ Rules:
             port_re = re.compile(r':(5\d{3}|27017|3306|5432|3307)\b')
             is_network_err = any(p in err_lower for p in network_patterns) or bool(port_re.search(err_msg))
 
-        # Check NOT NULL constraint violations (extract column and relation)
-        not_null_match = re.search(r'null value in column "([^"]+)" of relation "([^"]+)"', err_msg, re.IGNORECASE)
-        if not not_null_match:
-            not_null_match = re.search(r'null value in column "([^"]+)"', err_msg, re.IGNORECASE)
-        if not not_null_match:
-            not_null_match = re.search(r"column ['\"]([^'\"]+)['\"] cannot be null", err_msg, re.IGNORECASE)
+            # Check NOT NULL constraint violations (extract column and relation)
+            not_null_match = re.search(r'null value in column "([^"]+)" of relation "([^"]+)"', err_msg, re.IGNORECASE)
+            if not not_null_match:
+                not_null_match = re.search(r'null value in column "([^"]+)"', err_msg, re.IGNORECASE)
+            if not not_null_match:
+                not_null_match = re.search(r"column ['\"]([^'\"]+)['\"] cannot be null", err_msg, re.IGNORECASE)
 
-        # Check unique constraint violations
-        unique_match = re.search(r'duplicate key value violates unique constraint "([^"]+)"', err_msg, re.IGNORECASE)
-        if not unique_match:
-            unique_match = re.search(r"duplicate entry '([^']+)' for key '([^']+)'", err_msg, re.IGNORECASE)
+            # Check unique constraint violations
+            unique_match = re.search(r'duplicate key value violates unique constraint "([^"]+)"', err_msg, re.IGNORECASE)
+            if not unique_match:
+                unique_match = re.search(r"duplicate entry '([^']+)' for key '([^']+)'", err_msg, re.IGNORECASE)
 
-        # Check foreign key constraint violations
-        fk_match = re.search(r'violates foreign key constraint "([^"]+)"', err_msg, re.IGNORECASE)
+            # Check foreign key constraint violations
+            fk_match = re.search(r'violates foreign key constraint "([^"]+)"', err_msg, re.IGNORECASE)
 
-        copyable_cmd_label: Optional[str] = None
-
-        if is_network_err:
-            category = "NETWORK_CONNECTION_FAILED"
-            user_env_issue = True
-            diag_summary = f"The agent could not connect to database on host/port specified during stage '{stage}'."
-            fix_steps = [
-                "Verify database host and port mapping (e.g. use host.docker.internal:5435 instead of localhost:5432).",
-                "Ensure database container is running and accepting incoming connections.",
-                "Verify --add-host=host.docker.internal:host-gateway flag is included in docker run."
-            ]
-        elif not_null_match or "notnullviolation" in err_lower or "null value in column" in err_lower or "cannot be null" in err_lower:
-            category = "NOT_NULL_CONSTRAINT_VIOLATION"
-            user_env_issue = False
-            col_name = not_null_match.group(1) if not_null_match else None
-            rel_name = not_null_match.group(2) if (not_null_match and len(not_null_match.groups()) > 1) else tbl
-            if col_name:
+            if is_network_err:
+                category = "NETWORK_CONNECTION_FAILED"
+                user_env_issue = True
+                diag_summary = f"The agent could not connect to database on host/port specified during stage '{stage}'."
+                fix_steps = [
+                    "Verify database host and port mapping (e.g. use host.docker.internal:5435 instead of localhost:5432).",
+                    "Ensure database container is running and accepting incoming connections.",
+                    "Verify --add-host=host.docker.internal:host-gateway flag is included in docker run."
+                ]
+            elif not_null_match or "notnullviolation" in err_lower or "null value in column" in err_lower or "cannot be null" in err_lower:
+                category = "NOT_NULL_CONSTRAINT_VIOLATION"
+                user_env_issue = False
+                col_name = not_null_match.group(1) if not_null_match else None
+                rel_name = not_null_match.group(2) if (not_null_match and len(not_null_match.groups()) > 1) else tbl
+                if col_name:
+                    diag_summary = (
+                        f"Destination database table '{rel_name}' rejected row insertions because column '{col_name}' "
+                        f"has a strict NOT NULL constraint with no default value in your database, but this column is not "
+                        f"mapped in your migration plan."
+                    )
+                    fix_steps = [
+                        f"Run the SQL fix command below directly on your destination database to allow NULL values or set a default value: ALTER TABLE \"{rel_name}\" ALTER COLUMN \"{col_name}\" DROP NOT NULL;",
+                        "Or enable 'Clean Wipe' in migration execution options if you want the pipeline to drop old legacy tables and recreate them cleanly according to the plan.",
+                        f"Or edit your migration plan in the UI to map a source column or constant value to '{col_name}'."
+                    ]
+                    copyable_cmd = f'ALTER TABLE "{rel_name}" ALTER COLUMN "{col_name}" DROP NOT NULL;'
+                    copyable_cmd_label = "SQL Schema Fix (Run in Destination DB)"
+                else:
+                    diag_summary = f"Target table '{rel_name}' rejected insertion due to a NOT NULL column constraint in your destination database."
+                    fix_steps = [
+                        "Enable 'Clean Wipe' in migration execution options to recreate all target tables cleanly according to the plan.",
+                        "Or edit the transformation blueprint in the UI to map all NOT NULL target columns."
+                    ]
+            elif unique_match or "duplicate key" in err_lower or "unique constraint" in err_lower:
+                category = "UNIQUE_CONSTRAINT_VIOLATION"
+                user_env_issue = False
                 diag_summary = (
-                    f"Destination database table '{rel_name}' rejected row insertions because column '{col_name}' "
-                    f"has a strict NOT NULL constraint with no default value in your database, but this column is not "
-                    f"mapped in your migration plan."
+                    f"Destination database table '{tbl}' rejected insertion because a record already exists with the same "
+                    f"primary key or unique index."
                 )
                 fix_steps = [
-                    f"Run the SQL fix command below directly on your destination database to allow NULL values or set a default value: ALTER TABLE \"{rel_name}\" ALTER COLUMN \"{col_name}\" DROP NOT NULL;",
-                    "Or enable 'Clean Wipe' in migration execution options if you want the pipeline to drop old legacy tables and recreate them cleanly according to the plan.",
-                    f"Or edit your migration plan in the UI to map a source column or constant value to '{col_name}'."
+                    "Enable 'Clean Wipe' in migration execution options to clear previous conflicting test data before migrating.",
+                    "Or adjust Conflict Resolution in your transformation plan to 'Skip on Conflict' (ON CONFLICT DO NOTHING) or 'Update on Conflict'."
                 ]
-                copyable_cmd = f'ALTER TABLE "{rel_name}" ALTER COLUMN "{col_name}" DROP NOT NULL;'
-                copyable_cmd_label = "SQL Schema Fix (Run in Destination DB)"
-            else:
-                diag_summary = f"Target table '{rel_name}' rejected insertion due to a NOT NULL column constraint in your destination database."
+                copyable_cmd = f'-- Run in destination database to clear previous conflicting records:\nTRUNCATE TABLE "{tbl}" CASCADE;'
+                copyable_cmd_label = "SQL Cleanup Command (Run in Destination DB)"
+            elif fk_match or "foreign key" in err_lower:
+                category = "FOREIGN_KEY_CONSTRAINT_VIOLATION"
+                user_env_issue = False
+                fk_name = fk_match.group(1) if fk_match else "foreign key"
+                diag_summary = (
+                    f"Destination database table '{tbl}' rejected insertion because a foreign key references a parent record "
+                    f"that does not exist in the referenced parent table (violates constraint '{fk_name}')."
+                )
                 fix_steps = [
-                    "Enable 'Clean Wipe' in migration execution options to recreate all target tables cleanly according to the plan.",
-                    "Or edit the transformation blueprint in the UI to map all NOT NULL target columns."
+                    "Ensure parent tables are migrated before child tables in the execution order.",
+                    "Check source database for orphan records that reference non-existent parent IDs."
                 ]
-        elif unique_match or "duplicate key" in err_lower or "unique constraint" in err_lower:
-            category = "UNIQUE_CONSTRAINT_VIOLATION"
-            user_env_issue = False
-            diag_summary = (
-                f"Destination database table '{tbl}' rejected insertion because a record already exists with the same "
-                f"primary key or unique index."
-            )
-            fix_steps = [
-                "Enable 'Clean Wipe' in migration execution options to clear previous conflicting test data before migrating.",
-                "Or adjust Conflict Resolution in your transformation plan to 'Skip on Conflict' (ON CONFLICT DO NOTHING) or 'Update on Conflict'."
-            ]
-            copyable_cmd = f'-- Run in destination database to clear previous conflicting records:\nTRUNCATE TABLE "{tbl}" CASCADE;'
-            copyable_cmd_label = "SQL Cleanup Command (Run in Destination DB)"
-        elif fk_match or "foreign key" in err_lower:
-            category = "FOREIGN_KEY_CONSTRAINT_VIOLATION"
-            user_env_issue = False
-            fk_name = fk_match.group(1) if fk_match else "foreign key"
-            diag_summary = (
-                f"Destination database table '{tbl}' rejected insertion because a foreign key references a parent record "
-                f"that does not exist in the referenced parent table (violates constraint '{fk_name}')."
-            )
-            fix_steps = [
-                "Ensure parent tables are migrated before child tables in the execution order.",
-                "Check source database for orphan records that reference non-existent parent IDs."
-            ]
-        elif "nosuchmoduleerror" in err_lower or "sqlalchemy.dialects:mongodb" in err_lower:
-            category = "NOSQL_DIALECT_MISMATCH"
-            user_env_issue = False
-            diag_summary = "Relational DDL statement execution was attempted on a MongoDB document database."
-            fix_steps = [
-                "Re-run the updated agent container image (data-migration-agent:latest) which skips relational DDL for MongoDB.",
-                "MongoDB target collections are created automatically upon document streaming."
-            ]
-        elif "access denied" in err_lower or "authentication failed" in err_lower or "password" in err_lower:
-            category = "DATABASE_AUTHENTICATION_FAILED"
-            user_env_issue = True
-            diag_summary = "Database rejected authentication credentials provided in agent environment variables."
-            fix_steps = [
-                "Verify database usernames and passwords in container environment variables.",
-                "Ensure password placeholders like <SRC_SRC_DB_1_PASSWORD> are replaced with valid credentials."
-            ]
-        elif "undefinedtable" in err_lower or ("relation" in err_lower and "does not exist" in err_lower):
-            category = "TARGET_TABLE_MISSING"
-            user_env_issue = False
-            diag_summary = f"Target table '{tbl}' does not exist in target database because pre-migration DDL table creation failed or was skipped."
-            fix_steps = [
-                "Enable 'Clean Wipe' before executing to automatically create all missing target tables.",
-                "Verify target DDL statements use valid SQL syntax for the target database engine (e.g. gen_random_uuid() on PostgreSQL).",
-                "Ensure pre-migration DDL statements execute without errors before starting data streaming."
-            ]
-        elif "undefinedfunction" in err_lower or "function uuid_v4() does not exist" in err_lower or "function does not exist" in err_lower:
-            category = "SQL_DIALECT_FUNCTION_ERROR"
-            user_env_issue = False
-            diag_summary = "Pre-migration DDL referenced an unsupported SQL function (e.g. uuid_v4() on PostgreSQL)."
-            fix_steps = [
-                "Use native PostgreSQL gen_random_uuid() or uuid_generate_v4() instead of uuid_v4().",
-                "Update agent container to auto-heal dialect functions and re-run the execution job."
-            ]
-        elif "error rate exceeded" in err_lower:
-            category = "HIGH_ROW_ERROR_RATE"
-            user_env_issue = False
-            diag_summary = (
-                f"ETL pipeline aborted for table '{tbl}' because over 50% of records failed insertion into your destination database. "
-                f"This typically indicates an unmapped NOT NULL column, a data type mismatch, or a missing table in your destination."
-            )
-            fix_steps = [
-                f"Inspect table '{tbl}' in your destination database for columns with strict NOT NULL constraints or unique indexes.",
-                "Enable 'Clean Wipe' in execution options to recreate all destination tables cleanly according to the plan.",
-                "Review the agent container terminal output above for specific database error lines."
-            ]
-            copyable_cmd = (
-                f"-- Option 1: Drop legacy destination table so the migration creates it cleanly according to your plan:\n"
-                f"DROP TABLE IF EXISTS \"{tbl}\" CASCADE;\n\n"
-                f"-- Option 2: Inspect columns in destination DB to find unmapped NOT NULL constraints or mismatched types:\n"
-                f"SELECT column_name, data_type, is_nullable, column_default\n"
-                f"FROM information_schema.columns\n"
-                f"WHERE table_name = '{tbl}';"
-            )
-            copyable_cmd_label = "SQL Schema Fix & Inspection (Run in Destination DB)"
-        elif "cannot cast 'object' type" in err_lower or "computerror: cannot cast" in err_lower:
-            category = "SCHEMA_POLARS_TYPE_ERROR"
-            user_env_issue = False
-            diag_summary = f"Polars columnar transformation encountered unconverted Python Object/UUID columns in table '{tbl}'."
-            fix_steps = [
-                "Ensure source database driver columns (UUID/JSON) are sanitized to string before Polars cast operations.",
-                "Re-run migration using updated Docker Agent image (data-migration-agent:latest)."
-            ]
-        else:
-            diag_summary = f"ETL pipeline encountered an unexpected error during stage '{stage}': {err_msg[:200]}"
-            fix_steps = [
-                "Review target database constraints and column mapping specifications.",
-                "Verify source data quality and re-run execution job."
-            ]
+            elif "nosuchmoduleerror" in err_lower or "sqlalchemy.dialects:mongodb" in err_lower:
+                category = "NOSQL_DIALECT_MISMATCH"
+                user_env_issue = False
+                diag_summary = "Relational DDL statement execution was attempted on a MongoDB document database."
+                fix_steps = [
+                    "Re-run the updated agent container image (data-migration-agent:latest) which skips relational DDL for MongoDB.",
+                    "MongoDB target collections are created automatically upon document streaming."
+                ]
+            elif "access denied" in err_lower or "authentication failed" in err_lower or "password" in err_lower:
+                category = "DATABASE_AUTHENTICATION_FAILED"
+                user_env_issue = True
+                diag_summary = "Database rejected authentication credentials provided in agent environment variables."
+                fix_steps = [
+                    "Verify database usernames and passwords in container environment variables.",
+                    "Ensure password placeholders like <SRC_SRC_DB_1_PASSWORD> are replaced with valid credentials."
+                ]
+            elif "undefinedtable" in err_lower or ("relation" in err_lower and "does not exist" in err_lower):
+                category = "TARGET_TABLE_MISSING"
+                user_env_issue = False
+                diag_summary = f"Target table '{tbl}' does not exist in target database because pre-migration DDL table creation failed or was skipped."
+                fix_steps = [
+                    "Enable 'Clean Wipe' before executing to automatically create all missing target tables.",
+                    "Verify target DDL statements use valid SQL syntax for the target database engine (e.g. gen_random_uuid() on PostgreSQL).",
+                    "Ensure pre-migration DDL statements execute without errors before starting data streaming."
+                ]
+            elif "undefinedfunction" in err_lower or "function uuid_v4() does not exist" in err_lower or "function does not exist" in err_lower:
+                category = "SQL_DIALECT_FUNCTION_ERROR"
+                user_env_issue = False
+                diag_summary = "Pre-migration DDL referenced an unsupported SQL function (e.g. uuid_v4() on PostgreSQL)."
+                fix_steps = [
+                    "Use native PostgreSQL gen_random_uuid() or uuid_generate_v4() instead of uuid_v4().",
+                    "Update agent container to auto-heal dialect functions and re-run the execution job."
+                ]
+            elif "error rate exceeded" in err_lower:
+                category = "HIGH_ROW_ERROR_RATE"
+                user_env_issue = False
+                diag_summary = (
+                    f"ETL pipeline aborted for table '{tbl}' because over 50% of records failed insertion into your destination database. "
+                    f"This typically indicates an unmapped NOT NULL column, a data type mismatch, or a missing table in your destination."
+                )
+                fix_steps = [
+                    f"Inspect table '{tbl}' in your destination database for columns with strict NOT NULL constraints or unique indexes.",
+                    "Enable 'Clean Wipe' in execution options to recreate all destination tables cleanly according to the plan.",
+                    "Review the agent container terminal output above for specific database error lines."
+                ]
+                copyable_cmd = (
+                    f"-- Option 1: Drop legacy destination table so the migration creates it cleanly according to your plan:\n"
+                    f"DROP TABLE IF EXISTS \"{tbl}\" CASCADE;\n\n"
+                    f"-- Option 2: Inspect columns in destination DB to find unmapped NOT NULL constraints or mismatched types:\n"
+                    f"SELECT column_name, data_type, is_nullable, column_default\n"
+                    f"FROM information_schema.columns\n"
+                    f"WHERE table_name = '{tbl}';"
+                )
+                copyable_cmd_label = "SQL Schema Fix & Inspection (Run in Destination DB)"
+            elif "cannot cast 'object' type" in err_lower or "computerror: cannot cast" in err_lower:
+                category = "SCHEMA_POLARS_TYPE_ERROR"
+                user_env_issue = False
+                diag_summary = f"Polars columnar transformation encountered unconverted Python Object/UUID columns in table '{tbl}'."
+                fix_steps = [
+                    "Ensure source database driver columns (UUID/JSON) are sanitized to string before Polars cast operations.",
+                    "Re-run migration using updated Docker Agent image (data-migration-agent:latest)."
+                ]
+            else:
+                diag_summary = f"ETL pipeline encountered an unexpected error during stage '{stage}': {err_msg[:200]}"
+                fix_steps = [
+                    "Review target database constraints and column mapping specifications.",
+                    "Verify source data quality and re-run execution job."
+                ]
 
         # Build copyable container run command ONLY if it is an environment/connectivity/auth issue (Fix #3)
         if user_env_issue and copyable_cmd is None and job.agent:
