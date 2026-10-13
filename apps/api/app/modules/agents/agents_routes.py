@@ -249,15 +249,12 @@ async def agent_websocket_endpoint(
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Forbidden agent access")
         return
 
-    if token:
-        await manager.connect(str(agent_id), websocket)
-    else:
-        # Connection was accepted, register with WebSocket manager
-        if str(agent_id) not in manager.active_connections:
-            manager.active_connections[str(agent_id)] = []
-        if websocket not in manager.active_connections[str(agent_id)]:
-            manager.active_connections[str(agent_id)].append(websocket)
-        await websocket.send_text(json.dumps({"event": "AUTH_SUCCESS", "agent_id": str(agent_id)}))
+    # Connection was accepted, register with WebSocket manager
+    if str(agent_id) not in manager.active_connections:
+        manager.active_connections[str(agent_id)] = []
+    if websocket not in manager.active_connections[str(agent_id)]:
+        manager.active_connections[str(agent_id)].append(websocket)
+    await websocket.send_text(json.dumps({"event": "AUTH_SUCCESS", "agent_id": str(agent_id)}))
 
     try:
         while True:

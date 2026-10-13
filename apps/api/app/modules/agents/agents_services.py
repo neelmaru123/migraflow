@@ -9,7 +9,7 @@ from typing import List, Optional
 import uuid
 
 from fastapi import HTTPException, status
-from sqlalchemy import or_, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -28,7 +28,6 @@ from app.modules.agents.agents_schemas import (
     AgentUpdate,
 )
 from app.modules.execution.execution_models import MigrationJob
-from sqlalchemy import and_
 from app.modules.sources.sources_models import DataSource
 from app.modules.sources.sources_schemas import DataSourceResponse
 
@@ -805,7 +804,6 @@ class AgentService:
                 # Cascade failure to attached execution plan and running steps
                 from app.modules.execution.execution_models import (
                     MigrationExecutionPlan,
-                    MigrationExecutionStep,
                 )
                 from app.core.state import ExecutionPlanLifecycle, ExecutionStepLifecycle
                 stmt_plan = (

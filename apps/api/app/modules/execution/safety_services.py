@@ -154,7 +154,7 @@ class DestructiveApprovalManager:
                 DestructiveOperationApproval.plan_version_number == plan_version_number,
                 DestructiveOperationApproval.target_table == target_table,
                 DestructiveOperationApproval.operation_type == operation_type,
-                DestructiveOperationApproval.is_valid == True,
+                DestructiveOperationApproval.is_valid.is_(True),
             )
         )
         res = await session.execute(stmt)
@@ -285,7 +285,7 @@ class DestructiveApprovalManager:
             update(DestructiveOperationApproval)
             .where(
                 DestructiveOperationApproval.migration_plan_id == plan_id,
-                DestructiveOperationApproval.is_valid == True,
+                DestructiveOperationApproval.is_valid.is_(True),
             )
             .values(is_valid=False, rejection_reason=f"Invalidated: {reason}")
         )
@@ -376,8 +376,8 @@ class DestructiveApprovalManager:
             .where(
                 DestructiveOperationApproval.migration_plan_id == plan.id,
                 DestructiveOperationApproval.plan_version_number == current_version_number,
-                DestructiveOperationApproval.is_valid == True,
-                DestructiveOperationApproval.is_approved == True,
+                DestructiveOperationApproval.is_valid.is_(True),
+                DestructiveOperationApproval.is_approved.is_(True),
             )
         )
         res = await session.execute(stmt)
@@ -449,7 +449,7 @@ class DestructiveApprovalManager:
             .order_by(DestructiveOperationApproval.created_at.desc())
         )
         if not include_invalid:
-            stmt = stmt.where(DestructiveOperationApproval.is_valid == True)
+            stmt = stmt.where(DestructiveOperationApproval.is_valid.is_(True))
         res = await session.execute(stmt)
         return list(res.scalars().all())
 

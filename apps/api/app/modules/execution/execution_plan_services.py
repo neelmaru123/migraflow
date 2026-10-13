@@ -10,7 +10,7 @@ import uuid
 
 
 from fastapi import HTTPException, status
-from sqlalchemy import and_, or_, select, update
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -21,8 +21,6 @@ from app.core.state import (
     ExecutionPlanLifecycle,
     ExecutionStepLifecycle,
     ExecutionStepType,
-    FailureCategory,
-    InvalidStateTransitionError,
     RecoveryDecisionType,
 )
 from app.modules.execution.execution_models import (
@@ -34,9 +32,9 @@ from app.modules.execution.execution_models import (
     MigrationJob,
     UserIntervention,
 )
-from app.modules.execution.failure_taxonomy import ClassifiedFailure, FailureClassifier
+from app.modules.execution.failure_taxonomy import FailureClassifier
 from app.modules.execution.recovery_router import recovery_router
-from app.modules.execution.retry_policy import DEFAULT_RETRY_POLICY, RetryPolicy
+from app.modules.execution.retry_policy import RetryPolicy
 from app.modules.migration_plans.migration_plans_models import MigrationPlan
 
 

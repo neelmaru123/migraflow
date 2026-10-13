@@ -32,7 +32,6 @@ from app.modules.execution.execution_plan_services import ExecutionPlanService
 from app.modules.execution.execution_state_machine import ExecutionStateMachine
 from app.modules.execution.execution_schemas import (
     ExecutionProgressUpdate,
-    ExecutionStartRequest,
 )
 from app.modules.migration_plans.migration_plans_models import MigrationPlan
 from app.modules.sources.sources_models import DataSource
@@ -527,7 +526,6 @@ class ExecutionService:
         # Cascade cancellation to execution plan and pending/running/retrying steps
         from app.modules.execution.execution_models import (
             MigrationExecutionPlan,
-            MigrationExecutionStep,
         )
         from app.core.state import ExecutionPlanLifecycle, ExecutionStepLifecycle
         stmt_plan = (
@@ -1041,7 +1039,7 @@ Rules:
         elif "undefinedfunction" in err_lower or "function uuid_v4() does not exist" in err_lower or "function does not exist" in err_lower:
             category = "SQL_DIALECT_FUNCTION_ERROR"
             user_env_issue = False
-            diag_summary = f"Pre-migration DDL referenced an unsupported SQL function (e.g. uuid_v4() on PostgreSQL)."
+            diag_summary = "Pre-migration DDL referenced an unsupported SQL function (e.g. uuid_v4() on PostgreSQL)."
             fix_steps = [
                 "Use native PostgreSQL gen_random_uuid() or uuid_generate_v4() instead of uuid_v4().",
                 "Update agent container to auto-heal dialect functions and re-run the execution job."
@@ -1091,7 +1089,7 @@ Rules:
                 "  --restart unless-stopped \\",
                 "  --add-host=host.docker.internal:host-gateway \\",
                 '  -e BACKEND_URL="http://host.docker.internal:8000" \\',
-                f'  -e AGENT_TOKEN="AG_TOKEN_PLACEHOLDER" \\',
+                '  -e AGENT_TOKEN="AG_TOKEN_PLACEHOLDER" \\',
                 f'  -e AGENT_ID="{ag.id}" \\',
                 f'  -e AGENT_IDENTIFIER="{ag.agent_identifier}" \\',
             ]
