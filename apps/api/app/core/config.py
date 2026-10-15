@@ -90,15 +90,53 @@ class Settings(BaseSettings):
             "default_secret_key_change_me_in_production",
             "default_jwt_secret_key_change_me_in_production",
             "generate_a_random_32_character_secret_key",
+            "099b4b4cd041aac731d6f92587f2ecba8a63943386e52d5ecc0cb75c7654d493",
+            "07e7dbe717bb29263fb626af239df7a10a554c5eb1efd459cdb268d08b54b45c",
+            "secret",
+            "changeme",
+            "password",
+            "<GENERATE_SECRET_KEY_MIN_32_CHARS>",
+            "<GENERATE_JWT_SECRET_KEY_MIN_32_CHARS>",
+            "migraflow-super-secret-key-change-in-production",
+            "migraflow-jwt-super-secret-key-change-in-production",
         }
-        if self.SECRET_KEY in insecure_defaults:
-            # Auto-generate a secure random 256-bit token instead of crashing the container
-            self.SECRET_KEY = secrets.token_hex(32)
-        if self.JWT_SECRET_KEY in insecure_defaults:
-            # Auto-generate a secure random 256-bit token instead of crashing the container
-            self.JWT_SECRET_KEY = secrets.token_hex(32)
 
-        if self.ENVIRONMENT.lower() == "production":
+        is_production = self.ENVIRONMENT.lower() == "production"
+
+        if is_production:
+            sec_lower = (self.SECRET_KEY or "").lower()
+            jwt_lower = (self.JWT_SECRET_KEY or "").lower()
+            is_insecure_sec = (
+                not self.SECRET_KEY
+                or self.SECRET_KEY.strip() in insecure_defaults
+                or len(self.SECRET_KEY.strip()) < 32
+                or any(b in sec_lower for b in ["change_me", "change-me", "change_in_production", "change-in-production"])
+            )
+            if is_insecure_sec:
+                raise ValueError(
+                    "Production configuration error: Insecure default SECRET_KEY is not permitted. "
+                    "SECRET_KEY must be explicitly configured with at least 32 characters of high-entropy secret material. "
+                    "Using default/placeholder secrets or silently auto-generating keys at startup is prohibited."
+                )
+
+            is_insecure_jwt = (
+                not self.JWT_SECRET_KEY
+                or self.JWT_SECRET_KEY.strip() in insecure_defaults
+                or len(self.JWT_SECRET_KEY.strip()) < 32
+                or any(b in jwt_lower for b in ["change_me", "change-me", "change_in_production", "change-in-production"])
+            )
+            if is_insecure_jwt:
+                raise ValueError(
+                    "Production configuration error: Insecure default JWT_SECRET_KEY is not permitted. "
+                    "JWT_SECRET_KEY must be explicitly configured with at least 32 characters of high-entropy secret material. "
+                    "Using default/placeholder secrets or silently auto-generating keys at startup is prohibited."
+                )
+            if self.SECRET_KEY.strip() == self.JWT_SECRET_KEY.strip():
+                raise ValueError(
+                    "Production configuration error: SECRET_KEY and JWT_SECRET_KEY must not share "
+                    "the same value to ensure cryptographic domain separation."
+                )
+
             if "COOKIE_SECURE" not in os.environ:
                 if self.FRONTEND_URL.startswith("https://"):
                     self.COOKIE_SECURE = True
@@ -107,6 +145,13 @@ class Settings(BaseSettings):
                     self.COOKIE_SECURE = False
                 else:
                     self.COOKIE_SECURE = True
+        else:
+            # Development / testing: keep setup practical without weakening production
+            if not self.SECRET_KEY or self.SECRET_KEY in insecure_defaults:
+                self.SECRET_KEY = "dev_secret_key_only_for_testing_and_local_development_32chars"
+            if not self.JWT_SECRET_KEY or self.JWT_SECRET_KEY in insecure_defaults:
+                self.JWT_SECRET_KEY = "dev_jwt_key_only_for_testing_and_local_development_32chars"
+
         return self
 
     model_config = SettingsConfigDict(

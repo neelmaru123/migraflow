@@ -9,16 +9,13 @@ import { useLogout } from '@/hooks/mutations/useAuthMutations';
 import toast from 'react-hot-toast';
 import {
   User,
-  Shield,
   Download,
   Trash2,
   Lock,
   Mail,
   Sliders,
-  CheckCircle,
   AlertTriangle,
   ArrowLeft,
-  Key,
   Database,
   RefreshCw,
   LogOut,
@@ -94,7 +91,7 @@ export const AccountSettingsView: React.FC = () => {
     }
   };
 
-  // Handle Data Export (Art. 20)
+  // Handle Data Export
   const handleExportData = async () => {
     setExporting(true);
     try {
@@ -107,7 +104,7 @@ export const AccountSettingsView: React.FC = () => {
     }
   };
 
-  // Handle Account Deletion (Art. 17)
+  // Handle Account Deletion
   const handleDeleteAccount = async () => {
     if (deleteConfirmationText !== 'DELETE') {
       toast.error('Please type DELETE to confirm.');
@@ -140,18 +137,14 @@ export const AccountSettingsView: React.FC = () => {
             <span>Back to Dashboard</span>
           </Link>
           <h1 className="text-2xl sm:text-3xl font-extrabold text-white tracking-tight uppercase">
-            Account &amp; Privacy Settings
+            Account &amp; Security Settings
           </h1>
           <p className="text-zinc-400 text-xs sm:text-sm font-mono mt-1">
-            Manage your credentials, exercise your UK GDPR rights, and export your data archive.
+            Manage your profile, credentials, and account data archive.
           </p>
         </div>
 
         <div className="flex items-center gap-2.5">
-          <span className="text-[10px] font-mono uppercase bg-cyan-950/80 text-cyan-400 border border-cyan-800/60 px-3 py-1.5 rounded-xl flex items-center gap-1.5">
-            <Shield className="w-3 h-3" />
-            UK GDPR Compliant
-          </span>
           <button
             type="button"
             onClick={handleLogout}
@@ -257,21 +250,20 @@ export const AccountSettingsView: React.FC = () => {
             </form>
           </div>
 
-          {/* Right to Data Portability (UK GDPR Art. 20) */}
+          {/* Export Account Data */}
           <div className="bg-zinc-950 border border-zinc-800 rounded-2xl p-5 sm:p-6 shadow-xl">
             <div className="flex items-center gap-3 mb-4 pb-4 border-b border-zinc-800/80">
               <div className="p-2 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-400">
                 <Download className="w-5 h-5" />
               </div>
               <div>
-                <h2 className="text-base font-bold text-white">Data Portability (UK GDPR Art. 20)</h2>
+                <h2 className="text-base font-bold text-white">Export Account Data</h2>
                 <p className="text-xs text-zinc-400">Download a complete structured JSON archive of your account.</p>
               </div>
             </div>
 
             <p className="text-xs text-zinc-300 leading-relaxed mb-4">
-              Under UK GDPR Article 20, you have the right to receive your personal data in a structured, commonly used, and machine-readable format.
-              This export includes your profile details, registered Docker migration agents, schema metadata snapshots, migration plans, and job history.
+              Download a copy of your personal data in a structured JSON format. This export includes your profile details, registered migration agents, schema metadata snapshots, migration plans, and job history.
             </p>
 
             <div className="p-3 rounded-xl bg-zinc-900/60 border border-zinc-800 flex items-center justify-between gap-4">
@@ -310,7 +302,7 @@ export const AccountSettingsView: React.FC = () => {
               </div>
               <div>
                 <h3 className="text-sm font-bold text-white">Cookie Preferences</h3>
-                <p className="text-[11px] text-zinc-400">PECR / ePrivacy settings</p>
+                <p className="text-[11px] text-zinc-400">Manage site cookies</p>
               </div>
             </div>
 
@@ -360,20 +352,20 @@ export const AccountSettingsView: React.FC = () => {
             </button>
           </div>
 
-          {/* Danger Zone: Account Deletion (Art. 17) */}
+          {/* Danger Zone: Account Deletion */}
           <div className="bg-zinc-950 border border-red-500/30 rounded-2xl p-5 shadow-xl space-y-4">
             <div className="flex items-center gap-3 pb-3 border-b border-red-500/20">
               <div className="p-2 rounded-xl bg-red-500/10 border border-red-500/20 text-red-400">
                 <Trash2 className="w-4 h-4" />
               </div>
               <div>
-                <h3 className="text-sm font-bold text-red-400">Right to Erasure (Art. 17)</h3>
+                <h3 className="text-sm font-bold text-red-400">Delete Account</h3>
                 <p className="text-[11px] text-zinc-400">Permanently delete account</p>
               </div>
             </div>
 
             <p className="text-xs text-zinc-300 leading-relaxed">
-              Under UK GDPR Article 17 (&ldquo;Right to be Forgotten&rdquo;), you can permanently delete your account. This cascades and irreversibly erases all registered agents, plans, and jobs.
+              Permanently delete your account and all associated data. This action is irreversible and erases all registered agents, plans, and job history.
             </p>
 
             <button
@@ -399,7 +391,7 @@ export const AccountSettingsView: React.FC = () => {
             </div>
 
             <p className="text-xs text-zinc-300 leading-relaxed">
-              This action is <strong>irreversible</strong>. In accordance with UK GDPR Article 17, your profile, authentication credentials, registered agents, and migration plans will be permanently purged from our database immediately.
+              This action is <strong>irreversible</strong>. Your profile, authentication credentials, registered agents, and migration plans will be permanently removed immediately.
             </p>
 
             <div className="space-y-1.5">

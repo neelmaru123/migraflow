@@ -14,15 +14,50 @@ _redis_client: Optional[aioredis.Redis] = None
 
 
 def get_redis_client() -> aioredis.Redis:
-    """Return singleton async Redis client instance."""
+    """Return singleton async Redis client instance with bounded socket timeouts."""
     global _redis_client
     if _redis_client is None:
         _redis_client = aioredis.from_url(
             settings.REDIS_URL,
             decode_responses=True,
             encoding="utf-8",
+            socket_timeout=2.0,
+            socket_connect_timeout=2.0,
         )
     return _redis_client
+
+
+async def check_redis_connectivity(timeout_seconds: float = 1.5) -> bool:
+    """
+    Bounded-time Redis connectivity probe.
+    Does not close the connection pool and never leaks credentials or internal exceptions.
+    """
+    import asyncio
+    from app.core.credential_sanitizer import CredentialSanitizer
+
+    try:
+        client = get_redis_client()
+        pong = await asyncio.wait_for(client.ping(), timeout=timeout_seconds)
+        return bool(pong)
+    except Exception as exc:
+        sanitized = CredentialSanitizer.mask_credentials(str(exc))
+        logger.debug(f"Redis connectivity check note: {sanitized}")
+        return False
+
+
+async def close_redis_client() -> None:
+    """Closes the singleton Redis client connection pool on application shutdown."""
+    global _redis_client
+    if _redis_client is not None:
+        try:
+            if hasattr(_redis_client, "aclose"):
+                await _redis_client.aclose()
+            else:
+                await _redis_client.close()
+        except Exception as exc:
+            logger.warning(f"Error closing Redis client: {exc}")
+        finally:
+            _redis_client = None
 
 
 class PasswordResetCache:

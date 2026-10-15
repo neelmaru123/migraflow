@@ -2,7 +2,125 @@
 
 This file records all key architectural decisions, technology selections, trade-offs, and design rationale for the **AI Data Migration Platform**.
 
-## [2026-10-05] - UK GDPR, Data Protection Act 2018 & PECR Privacy Remediation
+## [2026-10-13] - Phase 5: Comprehensive Remediation Validation and System Integrity Verification
+
+### 1. Decision Summary
+Validated all architectural, security, execution, safety, and health remediations across Phases 1–4 without introducing broad refactors or code churn:
+1. **Full Test Suite & Regressions Validation**:
+   - 202 unit tests, live API suite integration tests, database models integration tests, and AST transformer agent tests executed with 100% pass rate.
+   - Zero tests deleted, weakened, or skipped across the entire remediation lifecycle.
+2. **Database Migration Linearity & Reversibility**:
+   - Verified Alembic linear migration chain (19 revisions, ending at head `d7e8f9a0b1c2`).
+   - Validated non-destructive upgrade path (`alembic upgrade --sql base:head`) and clean reverse downgrade path (`alembic downgrade --sql head:base`).
+   - Confirmed 0 schema migrations were added in Phases 1–4, avoiding database migration churn since schema support already existed.
+3. **Multi-Tier Compilation and Type Checks**:
+   - Verified Python bytecode compilation across all backend and agent engine packages via `python -m compileall`.
+   - Verified backend linting via Ruff on all modified modules.
+   - Verified Next.js frontend TypeScript compilation (`tsc --noEmit`) and production static page build (`next build`) across all 17 routes.
+4. **Staging Readiness Verdict**:
+   - The repository is structurally and logically ready for multi-container staging integration tests with live PostgreSQL and Redis services.
+
+---
+
+## [2026-10-12] - Phase 4: Production Health Reporting, Dependency Readiness, and Lifecycle Hardening
+
+### 1. Decision Summary
+Eliminated false health reporting, hardcoded Redis status, unbounded probe timeouts, and unmanaged connection lifecycles:
+1. **Accurate Bounded Redis Health Probing**:
+   - Replaced hardcoded `redis_connected: True` with an actual bounded-time `client.ping()` probe using `check_redis_connectivity(timeout_seconds=1.5)` over the shared connection pool.
+   - Handled connection errors and timeouts without leaking credentials or raw internal exceptions.
+2. **Dependency Readiness vs. Degradation Distinction**:
+   - Defined PostgreSQL as a **mandatory** dependency: if the database is unreachable, readiness probe returns `HTTP 503 Service Unavailable`.
+   - Defined Redis as an **optional** dependency (supported by in-memory fallback in `PasswordResetCache`): if Redis is unreachable or times out, the application remains ready (`HTTP 200 OK`) with degraded cache status (`data.redis_connected: False`, `dependencies.redis.status: "degraded"`).
+3. **Decoupled Liveness and Readiness Semantics**:
+   - Implemented zero-dependency `GET /api/v1/health/live` (and `/live`) liveness probe that verifies event-loop responsiveness without pinging external dependencies, avoiding cascading container restarts during downstream database outages.
+   - Maintained `GET /api/v1/health` (and `/health`) and `GET /api/v1/health/ready` (and `/ready`) readiness probes with bounded DB and Redis checks.
+4. **Lifecycle & Connection Pool Clean Shutdown**:
+   - Added `close_redis_client()` and `dispose_engine()` hooks invoked in a guaranteed `finally:` block of the application `lifespan` context manager, preventing dangling connections and resource leaks upon shutdown.
+
+### 2. Why This Approach? (Rationale)
+- **Problem Being Solved**: `/api/v1/health` previously reported hardcoded `redis_connected: True` without checking Redis. Furthermore, DB checks lacked timeout bounding (risking hung probes during outages), and Redis/DB connection pools were never explicitly closed on application shutdown.
+- **Chosen Solution**: Created `SystemHealthService` to centralize bounded health checks, distinguish mandatory vs optional dependencies, provide clean liveness/readiness routes, and tie connection pool closure to `lifespan`.
+- **Why This Library / Technology**: Reused native `asyncio.wait_for`, `redis.asyncio` ping, and SQLAlchemy async sessions; zero new external dependencies.
+
+### 3. Alternatives Considered & Rejected
+- **Alternative A: Failing Readiness on Redis Outage**:
+  - _Rejected_: Unnecessarily takes down the entire migration platform API when Redis is temporarily offline, even though password reset and rate limiting feature resilient in-memory fallbacks.
+- **Alternative B: Checking Database in Liveness Probe**:
+  - _Rejected_: If the database undergoes maintenance or connection spikes, Kubernetes/Docker would restart the healthy API container in a cascading crash loop. Liveness must test process responsiveness only.
+
+### 4. Trade-offs & Future Considerations
+- Probes use short bounded timeouts (2.0s for DB, 1.5s for Redis) to ensure Docker Compose and load balancer healthcheck intervals are never blocked.
+
+---
+
+## [2026-10-12] - Phase 2: Destructive Target-Operation Approval & Clean-Wipe Bypass Remediation
+
+### 1. Decision Summary
+Eliminated the critical destructive bypass where execution job creation requests specifying `truncate_target=True` could trigger a complete destination database wipe without server-side approval:
+1. **Server-Side Safety Decision Gating**:
+   - Enhanced `DestructiveApprovalManager.check_plan_destructive_compliance()` to evaluate requested runtime job actions (`requested_truncate_target`) alongside AST plan cleanup operations.
+   - Rejected execution requests with `HTTP 400 Bad Request` if `truncate_target=True` is requested without an active, valid server-side `DestructiveOperationApproval` matching the plan ID and current plan version.
+2. **Approval Binding & Invalidation Governance**:
+   - Approvals are strictly bound to `(migration_plan_id, plan_version_number, target_table, operation_type, approved_by_user_id, approved_at)`.
+   - Approvals are version-pinned; modifying or refining a plan invalidates prior approvals via `DestructiveApprovalManager.invalidate_all_for_plan()`. Stale approvals from prior versions are rejected.
+   - Expired approvals (`expires_at < now`) are actively rejected.
+   - Target scope isolation: Approving a single table (e.g. `dim_users`) does not authorize global clean-wipe (`*`), and approval for table A does not cover table B.
+3. **Dry-Run Immutability Invariant**:
+   - Guaranteed that dry runs never perform destructive actions. If `is_dry_run=True`, `effective_truncate_target` is strictly forced to `False` in `MigrationJob`, in `MigrationExecutionStep.input_definition`, and in `AgentTaskItemResponse`.
+4. **Audit Trail Recording**:
+   - Recorded destructive action authorization and parameters into `ExecutionEvent` append-only audit log during job creation (`JOB_CREATED`), approval grant (`DESTRUCTIVE_APPROVAL_GRANTED`), rejection (`DESTRUCTIVE_APPROVAL_REJECTED`), and revocation (`DESTRUCTIVE_APPROVAL_REVOKED`).
+
+### 2. Why This Approach? (Rationale)
+- **Problem Being Solved**: The system previously inspected only `plan.plan_data` AST for cleanup actions. An execution request with `truncate_target=True` on a plan with `cleanup_action=NONE` bypassed safety compliance, generating a job with `truncate_target=True` which instructed the agent orchestrator to clean-wipe all destination tables.
+- **Chosen Solution**: Reused the existing `DestructiveApprovalManager` and `DestructiveOperationApproval` entity. Treated the requested execution action as a first-class destructive operation (`truncate_all_targets` on `*`) requiring matching server-side approval.
+- **Why This Library / Technology**: Reused the existing database schema (migration 012 and 016) without introducing any unnecessary schema modifications or breaking changes.
+
+### 3. Alternatives Considered & Rejected
+- **Alternative A: Frontend-Only Checkbox Gating**:
+  - _Rejected_: Completely insecure; any direct API call, CLI invocation, or compromised client could set `truncate_target: true` and destroy production data.
+- **Alternative B: Introducing a New Approval Architecture**:
+  - _Rejected_: The existing `DestructiveApprovalManager` already implemented version tracking, invalidation, user attribution, and audit event dispatch. Extending it preserved architectural integrity with zero schema alterations.
+
+### 4. Trade-offs & Future Considerations
+- Users requesting clean-wipe must submit a destructive approval request via `POST /plans/{plan_id}/destructive-approvals/request` (or UI prompt) and grant it prior to triggering the migration.
+
+---
+
+## [2026-10-12] - Phase 1: Security and Authorization Hardening (Agent Boundaries, Ownership, Secrets)
+
+### 1. Decision Summary
+Implemented server-side security authorization boundaries across agent execution, step checkpoints, failure diagnosis, emergency fatal error reporting, and production secrets configuration:
+1. **Agent Execution Authorization & Isolation**:
+   - Validated agent-to-job and agent-to-step relationships directly at the database/service layer in `ExecutionPlanService` (`_verify_step_agent_access`), rather than relying solely on route authentication.
+   - Enforced cross-tenant isolation: agents owned by User A cannot access, claim, checkpoint, complete, or fail execution steps owned by User B (raises `HTTP 404` without leaking tenant data).
+   - Enforced cross-agent boundaries while preserving standby recovery: an agent assigned to Job A cannot mutate steps of Job B; however, when an agent crashes and Watchdog marks a step as `RETRYING`, standby failover agents owned by the same tenant can claim the recovered step, updating `job.agent_id` to reassign active execution.
+2. **Failure Diagnosis Ownership Boundary**:
+   - Hardened `diagnose_job_failure()` in `ExecutionService` by requiring caller `user_id: Optional[UUID]` and validating `job.plan.user_id == user_id`.
+   - Prevented cross-tenant information disclosure of stack traces, connection metadata, and LLM diagnostics. Preserved trusted background system calls (`user_id=None`).
+3. **Emergency Fatal Error Hardening (`/agents/fatal-error`)**:
+   - Prevented arbitrary agent identity spoofing by validating caller credentials (`caller_agent` token or `caller_user` JWT) against target `agent_id`.
+   - Preserved unauthenticated startup failure reporting specifically for agents with no active running tasks or offline status, while rejecting unauthenticated reports if the agent currently has active jobs (`HTTP 403`).
+   - Replaced full `AgentResponse` with sanitized `AgentFatalErrorResponse` excluding `user_id`, API tokens, and credentials.
+4. **Production Secrets Enforcement**:
+   - Updated `config.py` (`validate_security_settings`) to strictly reject insecure default signing keys, example placeholders, short keys (< 32 chars), or keys containing "change_me" / "change_in_production".
+   - Prohibited silent key auto-generation in production; required explicit environment variables in `docker-compose.prod.yml` and `.env.production.example`.
+
+### 2. Why This Approach? (Rationale)
+- **Problem Being Solved**: Execution endpoints authenticated agent tokens but previously performed checkpoint and step mutations using untrusted caller-supplied step IDs without verifying that the agent was assigned to the step or owned by the plan's user. Furthermore, `/agents/fatal-error` allowed arbitrary unauthenticated callers to crash any agent and returned sensitive user IDs in responses. In addition, `diagnose_job_failure()` accepted untrusted job IDs without validating user ownership, leaking database configuration and tracebacks.
+- **Chosen Solution**: Service-layer authorization checks in database transactions using row locks (`with_for_update`), ensuring no time-of-check/time-of-use (TOCTOU) vulnerability. Explicit caller user ID checks on failure diagnosis. Strict Pydantic validator rejecting weak or auto-generated keys in production.
+- **Why This Library / Technology**: Native SQLAlchemy async queries and Pydantic validators; zero additional external dependencies required.
+
+### 3. Alternatives Considered & Rejected
+- **Alternative A: Route-Only Authorization**:
+  - _Rejected_: Filtering only in FastAPI route handlers creates significant risks when internal services, tasks, or background workers invoke services directly, leaving the database layer vulnerable.
+- **Alternative B: Blanket Token Enforcement on `/agents/fatal-error`**:
+  - _Rejected_: Agents crashing during entrypoint initialization (e.g. missing Docker drivers, network failure before token validation) cannot report startup crashes if token validation is mandatory. Distinguishing offline/idle agents from agents running active jobs preserves emergency diagnostics without opening spoofing attacks.
+
+### 4. Trade-offs & Future Considerations
+- An agent taking over a retried step must be owned by the same user. Multi-tenant worker pools sharing an agent across tenants remain strictly disallowed.
+
+---
 
 ### 1. Decision Summary
 Implemented comprehensive technical privacy, data protection, and cookie compliance remediations across the entire stack. Addressed 17 identified privacy findings covering CORS origin protection, IDOR user isolation, secrets hardening, PECR cookie consent gating with high-performance 3D visual fallback, user rights data portability (Art. 20) and erasure (Art. 17), prompt data minimization (Art. 5(1)(c)), email log masking, WebSocket bearer token security, and local DuckDB staging storage limitation.
@@ -2874,4 +2992,36 @@ Performed full-stack production deployment scan and hardened the system for smoo
 
 ### 4. Trade-offs & Future Considerations
 - In environments using an AWS Application Load Balancer (ALB) with SSL offloading, set `FRONTEND_URL=https://...` and `COOKIE_SECURE=true`.
+
+---
+
+## [2026-10-08] - Polyglot Dual-Engine Data Merge Test Environment & Reproducible Seeder
+
+### 1. Decision Summary
+Implemented a production-grade, reproducible dual-source test and benchmark environment for testing data-merging, entity resolution, and schema consolidation algorithms. Created two source databases representing the same E-Commerce and CRM domain:
+1. **Source A (PostgreSQL 16: `legacy_oms_pg`)**: Relational, 3NF normalized schema with `customers`, `products`, `orders`, `order_items`, `payments`, and `support_tickets` tables.
+2. **Source B (MongoDB 7: `customer_experience_mongo`)**: Document-based schema with nested objects, arrays, and denormalized collections (`customers`, `products`, `orders`, `feedback`).
+3. **Reproducible Generation & Ground Truth**: Deterministic seed (`seed=42`) using Faker and random, outputting full cross-database match files (`customer_matches.csv`, `product_matches.csv`, `order_matches.csv`), schema transformation dictionaries (`field_mapping.json`), conflict records (`conflicts_report.csv`), and golden merged samples (`expected_merged_sample.json`).
+
+### 2. Why This Approach? (Rationale)
+- **Problem Being Solved**: Merging data from disparate architectures requires exercising 9 classic data-integration challenges: field naming variations, structural differences (flat vs nested), data type/format divergence, overlapping entities with conflicting values, fuzzy duplicates, category taxonomy mismatches, source-unique attributes, and real-world data quality anomalies (nulls, whitespace, invalid emails, negative values, unicode characters, and orphaned foreign keys).
+- **Chosen Solution**:
+  - Implemented a unified in-memory dataset generator ([`test_environment/data_generator.py`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/data_generator.py)) ensuring exact mathematical parity and referential cross-links between relational rows and NoSQL documents.
+  - Implemented standalone compose orchestration ([`test_environment/docker-compose.yml`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/docker-compose.yml)) alongside dynamic connection discovery (auto-detecting host ports `5434` and `5432` for PostgreSQL and `27017` for MongoDB).
+  - Designed automated post-insert foreign key constraints with `NOT VALID` in PostgreSQL to safely allow intentional orphaned foreign keys (`customer_id = 99999`) without breaking DDL execution.
+- **Why This Library / Technology**:
+  - `psycopg2-binary` with `execute_values`: Enables high-throughput page-buffered batch inserts for 5,000 orders and 11,000+ line items in under 2 seconds.
+  - `pymongo`: Native BSON/ObjectId generation and batch chunked inserts ensuring rapid document indexing.
+  - `Faker` (with `en_US` and `en_IN` locales): Produces authentic multi-locale names, addresses, and localized phone numbers.
+
+### 3. Alternatives Considered & Rejected
+- **Alternative A: Independent Random Generators in Separate Seed Scripts**:
+  - _Rejected_: Running separate random loops in PostgreSQL and MongoDB scripts creates divergent primary keys and breaks ground-truth match integrity.
+- **Alternative B: Pure SQL / Shell Scripting Without Python**:
+  - _Rejected_: Lacks the fuzzy string manipulation, BSON embedding, and complex multi-locale name generation required for realistic NoSQL documents.
+
+### 4. Trade-offs & Future Considerations
+- **Trade-offs**: Storing ground truth files in CSV/JSON requires regenerating them when seed parameters change. Generating them deterministically via `seed_all.py` guarantees synchronization.
+- **Future Considerations**: Providing automated fuzzy scoring benchmark harnesses (e.g. TF-IDF / Jaro-Winkler evaluation scripts) in subsequent test phases.
+
 

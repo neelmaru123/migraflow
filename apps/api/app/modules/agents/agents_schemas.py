@@ -73,8 +73,20 @@ class AgentHeartbeat(BaseModel):
 
 class AgentFatalErrorRequest(BaseModel):
     """Emergency fatal error reporting payload when an agent is stopping."""
+    agent_id: Optional[UUID] = Field(default=None, description="Target agent UUID")
     error_message: str = Field(..., description="Description of the fatal stopping error")
     error_category: str = Field(default="FATAL_ERROR", description="Category tag for the stopping error")
+
+
+class AgentFatalErrorResponse(BaseModel):
+    """Sanitized non-sensitive response payload for emergency fatal error reporting."""
+    id: UUID
+    status: str
+    last_error: Optional[str] = None
+    error_category: Optional[str] = None
+    last_error_at: Optional[datetime] = None
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 VALID_AGENT_ACTION = Literal["SHUTDOWN", "ENTER_IDLE_MODE", "RESUME_ACTIVE_MODE"]

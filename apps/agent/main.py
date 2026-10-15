@@ -409,10 +409,13 @@ def report_fatal_error_and_exit(
                 "error_message": error_message,
                 "error_category": error_category,
             }).encode("utf-8")
+            fatal_headers = {"Content-Type": "application/json", "X-Agent-ID": agent_id}
+            if agent_token:
+                fatal_headers["X-Agent-Token"] = agent_token
             fatal_req = urllib.request.Request(
                 fatal_url,
                 data=fatal_payload,
-                headers={"Content-Type": "application/json", "X-Agent-ID": agent_id},
+                headers=fatal_headers,
                 method="POST",
             )
             with urllib.request.urlopen(fatal_req, timeout=5.0) as f_resp:

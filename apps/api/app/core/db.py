@@ -41,3 +41,8 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
         finally:
             await session.close()
 
+
+async def dispose_engine() -> None:
+    """Disposes the SQLAlchemy engine connection pool on application shutdown."""
+    await engine.dispose()
+

@@ -9,7 +9,7 @@ from typing import List, Optional
 import uuid
 
 from fastapi import HTTPException, status
-from sqlalchemy import or_, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -22,12 +22,12 @@ from app.modules.agents.agents_schemas import (
     AgentCreate,
     AgentDetailResponse,
     AgentDockerCommandResponse,
+    AgentFatalErrorResponse,
     AgentHeartbeat,
     AgentResponse,
     AgentUpdate,
 )
 from app.modules.execution.execution_models import MigrationJob
-from sqlalchemy import and_
 from app.modules.sources.sources_models import DataSource
 from app.modules.sources.sources_schemas import DataSourceResponse
 
@@ -566,16 +566,55 @@ class AgentService:
         agent_id: uuid.UUID,
         error_message: str,
         error_category: str = "FATAL_ERROR",
-    ) -> AgentResponse:
+        caller_agent: Optional[Agent] = None,
+        caller_user_id: Optional[uuid.UUID] = None,
+    ) -> AgentFatalErrorResponse:
         """
         Records an emergency fatal error reported by an agent (e.g. startup crash, token failure)
         and broadcasts real-time alert to UI subscribers.
+        Validates caller identity to prevent arbitrary agent-ID spoofing.
         """
         stmt = select(Agent).where(Agent.id == agent_id).options(selectinload(Agent.data_sources))
         res = await session.execute(stmt)
         agent = res.scalar_one_or_none()
         if not agent:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
+
+        # 1. If caller authenticated with an agent token, verify it matches target agent
+        if caller_agent is not None and caller_agent.id != agent.id:
+            logger.warning(
+                f"Agent spoofing attempt: authenticated agent '{caller_agent.id}' "
+                f"attempted to report fatal error for agent '{agent.id}'."
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Authenticated agent credentials do not match the target agent ID.",
+            )
+
+        # 2. If caller authenticated as a user, verify ownership
+        if caller_user_id is not None and agent.user_id != caller_user_id:
+            logger.warning(
+                f"User unauthorized: user '{caller_user_id}' attempted to report error "
+                f"for agent '{agent.id}' owned by user '{agent.user_id}'."
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have permission to report errors for this agent.",
+            )
+
+        # 3. Unauthenticated caller guard:
+        # Prevent unauthenticated callers from disrupting an agent that is actively executing jobs
+        if caller_agent is None and caller_user_id is None:
+            stmt_active_jobs = select(MigrationJob).where(
+                MigrationJob.agent_id == agent.id,
+                MigrationJob.status.in_(["preparing", "running", "verifying"]),
+            )
+            res_active = await session.execute(stmt_active_jobs)
+            if res_active.scalar_one_or_none() is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Authentication required: cannot report unauthenticated fatal error while agent has active jobs.",
+                )
 
         now = datetime.now(timezone.utc)
         agent.status = "error"
@@ -597,22 +636,12 @@ class AgentService:
             },
         )
 
-        return AgentResponse(
+        return AgentFatalErrorResponse(
             id=agent.id,
-            user_id=agent.user_id,
-            name=agent.name,
-            agent_identifier=agent.agent_identifier,
             status=agent.status,
-            version=agent.version,
-            api_token=None,
-            last_seen_at=agent.last_seen_at,
             last_error=agent.last_error,
             error_category=agent.error_category,
             last_error_at=agent.last_error_at,
-            created_at=agent.created_at,
-            updated_at=agent.updated_at,
-            action=None,
-            action_reason=None,
         )
 
     @staticmethod
@@ -775,7 +804,6 @@ class AgentService:
                 # Cascade failure to attached execution plan and running steps
                 from app.modules.execution.execution_models import (
                     MigrationExecutionPlan,
-                    MigrationExecutionStep,
                 )
                 from app.core.state import ExecutionPlanLifecycle, ExecutionStepLifecycle
                 stmt_plan = (

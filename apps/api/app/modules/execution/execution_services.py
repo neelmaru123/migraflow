@@ -32,7 +32,6 @@ from app.modules.execution.execution_plan_services import ExecutionPlanService
 from app.modules.execution.execution_state_machine import ExecutionStateMachine
 from app.modules.execution.execution_schemas import (
     ExecutionProgressUpdate,
-    ExecutionStartRequest,
 )
 from app.modules.migration_plans.migration_plans_models import MigrationPlan
 from app.modules.sources.sources_models import DataSource
@@ -71,12 +70,13 @@ class ExecutionService:
         target_config = plan.target_config if isinstance(plan.target_config, dict) else {}
         target_identifier = target_config.get("identifier")
 
+        ds_conditions = [DataSource.role.in_(["target", "both"])]
+        if target_identifier:
+            ds_conditions.append(DataSource.identifier == target_identifier)
+
         stmt_ds = select(DataSource).where(
             DataSource.agent_id == plan.agent_id,
-            or_(
-                DataSource.role.in_(["target", "both"]),
-                DataSource.identifier == target_identifier if target_identifier else False,
-            ),
+            or_(*ds_conditions),
         )
         res_ds = await session.execute(stmt_ds)
         target_data_sources = list(res_ds.scalars().all())
@@ -238,25 +238,31 @@ class ExecutionService:
                 f"Preflight alert for plan '{plan_id}': Target tables already contain rows: {existing_data_warnings}"
             )
 
-        # Destructive operation safety guard (Phase 4): non-dry-run executions require valid approval for destructive operations
+        effective_truncate_target = False if is_dry_run else truncate_target
+
+        current_ver = plan.approved_version_number or 1
+        if not plan.approved_version_number:
+            from app.modules.migration_plans.migration_plans_models import MigrationPlanVersion
+            v_stmt = (
+                select(MigrationPlanVersion.version_number)
+                .where(MigrationPlanVersion.migration_plan_id == plan.id)
+                .order_by(MigrationPlanVersion.version_number.desc())
+                .limit(1)
+            )
+            v_res = await session.execute(v_stmt)
+            latest_v = v_res.scalar_one_or_none()
+            if latest_v:
+                current_ver = latest_v
+
+        # Destructive operation safety guard: non-dry-run executions require valid approval for any destructive operations
         if not is_dry_run:
             from app.modules.execution.safety_services import DestructiveApprovalManager
-            current_ver = plan.approved_version_number or 1
-            if not plan.approved_version_number:
-                from app.modules.migration_plans.migration_plans_models import MigrationPlanVersion
-                v_stmt = (
-                    select(MigrationPlanVersion.version_number)
-                    .where(MigrationPlanVersion.migration_plan_id == plan.id)
-                    .order_by(MigrationPlanVersion.version_number.desc())
-                    .limit(1)
-                )
-                v_res = await session.execute(v_stmt)
-                latest_v = v_res.scalar_one_or_none()
-                if latest_v:
-                    current_ver = latest_v
 
             is_compliant, unapproved_ops = await DestructiveApprovalManager.check_plan_destructive_compliance(
-                session=session, plan=plan, current_version_number=current_ver
+                session=session,
+                plan=plan,
+                current_version_number=current_ver,
+                requested_truncate_target=effective_truncate_target,
             )
             if not is_compliant:
                 unapproved_str = ", ".join(f"{op['operation_type']} on {op['target_table']}" for op in unapproved_ops)
@@ -265,7 +271,6 @@ class ExecutionService:
                     detail=f"Cannot execute migration: Destructive operation(s) require explicit approval for plan version {current_ver}: {unapproved_str}.",
                 )
 
-
         now = datetime.now(timezone.utc)
         job = MigrationJob(
             migration_plan_id=plan_id,
@@ -273,7 +278,7 @@ class ExecutionService:
             idempotency_key=clean_idempotency_key,
             status=ExecutionLifecycle.QUEUED.value,
             is_dry_run=is_dry_run,
-            truncate_target=truncate_target,
+            truncate_target=effective_truncate_target,
             total_rows=0,
             processed_rows=0,
             successful_rows=0,
@@ -305,8 +310,10 @@ class ExecutionService:
                 "action": "job_created",
                 "job_id": str(job.id),
                 "is_dry_run": is_dry_run,
-                "truncate_target": truncate_target,
+                "truncate_target": effective_truncate_target,
                 "idempotency_key": clean_idempotency_key,
+                "plan_version": current_ver,
+                "destructive_operations_authorized": effective_truncate_target,
             },
             schema_version=1,
         )
@@ -369,7 +376,8 @@ class ExecutionService:
             .values(status="preparing", updated_at=now)
         )
         res_update = await session.execute(stmt_update)
-        if res_update.rowcount == 0:
+        updated_rows = int(getattr(res_update, "rowcount", 0) or 0)
+        if updated_rows == 0:
             await session.rollback()
             return []
 
@@ -520,7 +528,6 @@ class ExecutionService:
         # Cascade cancellation to execution plan and pending/running/retrying steps
         from app.modules.execution.execution_models import (
             MigrationExecutionPlan,
-            MigrationExecutionStep,
         )
         from app.core.state import ExecutionPlanLifecycle, ExecutionStepLifecycle
         stmt_plan = (
@@ -781,7 +788,9 @@ class ExecutionService:
 
     @staticmethod
     async def diagnose_job_failure(
-        session: AsyncSession, job_id: uuid.UUID
+        session: AsyncSession,
+        job_id: uuid.UUID,
+        user_id: Optional[uuid.UUID] = None,
     ) -> MigrationJob:
         """Synthesizes raw job error traceback into plain-English diagnosis & remediation actions using LLM."""
         # Atomic lock & guard: only process if ai_diagnosis is NULL (Fix #2)
@@ -799,8 +808,16 @@ class ExecutionService:
         if not job:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Execution job '{job_id}' not found.",
+                detail=f"Execution job '{job_id}' not found or access denied.",
             )
+
+        # Enforce user ownership at trusted boundary
+        if user_id is not None:
+            if not job.plan or job.plan.user_id != user_id:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Execution job '{job_id}' not found or access denied.",
+                )
 
         # Early guard: AI diagnosis only available for failed jobs (Fix #6)
         if job.status != "failed":
@@ -825,6 +842,7 @@ class ExecutionService:
         user_env_issue = False
         fix_steps: List[str] = []
         copyable_cmd: Optional[str] = None
+        copyable_cmd_label: Optional[str] = None
 
         # 1. Attempt Intelligent LLM-Powered Diagnosis (Gemini / OpenAI)
         llm_success = False
@@ -841,7 +859,13 @@ class ExecutionService:
                     copyable_fix_command: Optional[str] = Field(None, description="Exact copyable SQL command (e.g. ALTER TABLE ... or TRUNCATE ...) to fix or inspect the database.")
                     copyable_fix_label: Optional[str] = Field(None, description="Label for the command, e.g., 'SQL Schema Fix (Run in Destination DB)'")
 
-                plan_title = job.plan.title if job.plan else "Migration Plan"
+                plan_title = "Migration Plan"
+                if job.plan:
+                    plan_title = getattr(job.plan, "title", None) or (
+                        job.plan.plan_data.get("title") or job.plan.plan_data.get("name")
+                        if isinstance(getattr(job.plan, "plan_data", None), dict)
+                        else None
+                    ) or "Migration Plan"
                 target_engine = "postgresql"
                 if job.agent and job.agent.data_sources:
                     for ds in job.agent.data_sources:
@@ -889,7 +913,16 @@ Rules:
 
                 if llm:
                     structured_llm = llm.with_structured_output(LLMDiagnosisResponse)
-                    diag_obj: LLMDiagnosisResponse = await structured_llm.ainvoke([HumanMessage(content=llm_prompt)])
+                    raw_diag: Any = await structured_llm.ainvoke([HumanMessage(content=llm_prompt)])
+                    diag_obj: Optional[LLMDiagnosisResponse] = (
+                        raw_diag
+                        if isinstance(raw_diag, LLMDiagnosisResponse)
+                        else (
+                            LLMDiagnosisResponse.model_validate(raw_diag)
+                            if isinstance(raw_diag, dict)
+                            else None
+                        )
+                    )
                     if diag_obj and diag_obj.summary:
                         diag_summary = diag_obj.summary
                         category = diag_obj.root_cause_category
@@ -921,149 +954,147 @@ Rules:
             port_re = re.compile(r':(5\d{3}|27017|3306|5432|3307)\b')
             is_network_err = any(p in err_lower for p in network_patterns) or bool(port_re.search(err_msg))
 
-        # Check NOT NULL constraint violations (extract column and relation)
-        not_null_match = re.search(r'null value in column "([^"]+)" of relation "([^"]+)"', err_msg, re.IGNORECASE)
-        if not not_null_match:
-            not_null_match = re.search(r'null value in column "([^"]+)"', err_msg, re.IGNORECASE)
-        if not not_null_match:
-            not_null_match = re.search(r"column ['\"]([^'\"]+)['\"] cannot be null", err_msg, re.IGNORECASE)
+            # Check NOT NULL constraint violations (extract column and relation)
+            not_null_match = re.search(r'null value in column "([^"]+)" of relation "([^"]+)"', err_msg, re.IGNORECASE)
+            if not not_null_match:
+                not_null_match = re.search(r'null value in column "([^"]+)"', err_msg, re.IGNORECASE)
+            if not not_null_match:
+                not_null_match = re.search(r"column ['\"]([^'\"]+)['\"] cannot be null", err_msg, re.IGNORECASE)
 
-        # Check unique constraint violations
-        unique_match = re.search(r'duplicate key value violates unique constraint "([^"]+)"', err_msg, re.IGNORECASE)
-        if not unique_match:
-            unique_match = re.search(r"duplicate entry '([^']+)' for key '([^']+)'", err_msg, re.IGNORECASE)
+            # Check unique constraint violations
+            unique_match = re.search(r'duplicate key value violates unique constraint "([^"]+)"', err_msg, re.IGNORECASE)
+            if not unique_match:
+                unique_match = re.search(r"duplicate entry '([^']+)' for key '([^']+)'", err_msg, re.IGNORECASE)
 
-        # Check foreign key constraint violations
-        fk_match = re.search(r'violates foreign key constraint "([^"]+)"', err_msg, re.IGNORECASE)
+            # Check foreign key constraint violations
+            fk_match = re.search(r'violates foreign key constraint "([^"]+)"', err_msg, re.IGNORECASE)
 
-        copyable_cmd_label: Optional[str] = None
-
-        if is_network_err:
-            category = "NETWORK_CONNECTION_FAILED"
-            user_env_issue = True
-            diag_summary = f"The agent could not connect to database on host/port specified during stage '{stage}'."
-            fix_steps = [
-                "Verify database host and port mapping (e.g. use host.docker.internal:5435 instead of localhost:5432).",
-                "Ensure database container is running and accepting incoming connections.",
-                "Verify --add-host=host.docker.internal:host-gateway flag is included in docker run."
-            ]
-        elif not_null_match or "notnullviolation" in err_lower or "null value in column" in err_lower or "cannot be null" in err_lower:
-            category = "NOT_NULL_CONSTRAINT_VIOLATION"
-            user_env_issue = False
-            col_name = not_null_match.group(1) if not_null_match else None
-            rel_name = not_null_match.group(2) if (not_null_match and len(not_null_match.groups()) > 1) else tbl
-            if col_name:
+            if is_network_err:
+                category = "NETWORK_CONNECTION_FAILED"
+                user_env_issue = True
+                diag_summary = f"The agent could not connect to database on host/port specified during stage '{stage}'."
+                fix_steps = [
+                    "Verify database host and port mapping (e.g. use host.docker.internal:5435 instead of localhost:5432).",
+                    "Ensure database container is running and accepting incoming connections.",
+                    "Verify --add-host=host.docker.internal:host-gateway flag is included in docker run."
+                ]
+            elif not_null_match or "notnullviolation" in err_lower or "null value in column" in err_lower or "cannot be null" in err_lower:
+                category = "NOT_NULL_CONSTRAINT_VIOLATION"
+                user_env_issue = False
+                col_name = not_null_match.group(1) if not_null_match else None
+                rel_name = not_null_match.group(2) if (not_null_match and len(not_null_match.groups()) > 1) else tbl
+                if col_name:
+                    diag_summary = (
+                        f"Destination database table '{rel_name}' rejected row insertions because column '{col_name}' "
+                        f"has a strict NOT NULL constraint with no default value in your database, but this column is not "
+                        f"mapped in your migration plan."
+                    )
+                    fix_steps = [
+                        f"Run the SQL fix command below directly on your destination database to allow NULL values or set a default value: ALTER TABLE \"{rel_name}\" ALTER COLUMN \"{col_name}\" DROP NOT NULL;",
+                        "Or enable 'Clean Wipe' in migration execution options if you want the pipeline to drop old legacy tables and recreate them cleanly according to the plan.",
+                        f"Or edit your migration plan in the UI to map a source column or constant value to '{col_name}'."
+                    ]
+                    copyable_cmd = f'ALTER TABLE "{rel_name}" ALTER COLUMN "{col_name}" DROP NOT NULL;'
+                    copyable_cmd_label = "SQL Schema Fix (Run in Destination DB)"
+                else:
+                    diag_summary = f"Target table '{rel_name}' rejected insertion due to a NOT NULL column constraint in your destination database."
+                    fix_steps = [
+                        "Enable 'Clean Wipe' in migration execution options to recreate all target tables cleanly according to the plan.",
+                        "Or edit the transformation blueprint in the UI to map all NOT NULL target columns."
+                    ]
+            elif unique_match or "duplicate key" in err_lower or "unique constraint" in err_lower:
+                category = "UNIQUE_CONSTRAINT_VIOLATION"
+                user_env_issue = False
                 diag_summary = (
-                    f"Destination database table '{rel_name}' rejected row insertions because column '{col_name}' "
-                    f"has a strict NOT NULL constraint with no default value in your database, but this column is not "
-                    f"mapped in your migration plan."
+                    f"Destination database table '{tbl}' rejected insertion because a record already exists with the same "
+                    f"primary key or unique index."
                 )
                 fix_steps = [
-                    f"Run the SQL fix command below directly on your destination database to allow NULL values or set a default value: ALTER TABLE \"{rel_name}\" ALTER COLUMN \"{col_name}\" DROP NOT NULL;",
-                    "Or enable 'Clean Wipe' in migration execution options if you want the pipeline to drop old legacy tables and recreate them cleanly according to the plan.",
-                    f"Or edit your migration plan in the UI to map a source column or constant value to '{col_name}'."
+                    "Enable 'Clean Wipe' in migration execution options to clear previous conflicting test data before migrating.",
+                    "Or adjust Conflict Resolution in your transformation plan to 'Skip on Conflict' (ON CONFLICT DO NOTHING) or 'Update on Conflict'."
                 ]
-                copyable_cmd = f'ALTER TABLE "{rel_name}" ALTER COLUMN "{col_name}" DROP NOT NULL;'
-                copyable_cmd_label = "SQL Schema Fix (Run in Destination DB)"
-            else:
-                diag_summary = f"Target table '{rel_name}' rejected insertion due to a NOT NULL column constraint in your destination database."
+                copyable_cmd = f'-- Run in destination database to clear previous conflicting records:\nTRUNCATE TABLE "{tbl}" CASCADE;'
+                copyable_cmd_label = "SQL Cleanup Command (Run in Destination DB)"
+            elif fk_match or "foreign key" in err_lower:
+                category = "FOREIGN_KEY_CONSTRAINT_VIOLATION"
+                user_env_issue = False
+                fk_name = fk_match.group(1) if fk_match else "foreign key"
+                diag_summary = (
+                    f"Destination database table '{tbl}' rejected insertion because a foreign key references a parent record "
+                    f"that does not exist in the referenced parent table (violates constraint '{fk_name}')."
+                )
                 fix_steps = [
-                    "Enable 'Clean Wipe' in migration execution options to recreate all target tables cleanly according to the plan.",
-                    "Or edit the transformation blueprint in the UI to map all NOT NULL target columns."
+                    "Ensure parent tables are migrated before child tables in the execution order.",
+                    "Check source database for orphan records that reference non-existent parent IDs."
                 ]
-        elif unique_match or "duplicate key" in err_lower or "unique constraint" in err_lower:
-            category = "UNIQUE_CONSTRAINT_VIOLATION"
-            user_env_issue = False
-            diag_summary = (
-                f"Destination database table '{tbl}' rejected insertion because a record already exists with the same "
-                f"primary key or unique index."
-            )
-            fix_steps = [
-                "Enable 'Clean Wipe' in migration execution options to clear previous conflicting test data before migrating.",
-                "Or adjust Conflict Resolution in your transformation plan to 'Skip on Conflict' (ON CONFLICT DO NOTHING) or 'Update on Conflict'."
-            ]
-            copyable_cmd = f'-- Run in destination database to clear previous conflicting records:\nTRUNCATE TABLE "{tbl}" CASCADE;'
-            copyable_cmd_label = "SQL Cleanup Command (Run in Destination DB)"
-        elif fk_match or "foreign key" in err_lower:
-            category = "FOREIGN_KEY_CONSTRAINT_VIOLATION"
-            user_env_issue = False
-            fk_name = fk_match.group(1) if fk_match else "foreign key"
-            diag_summary = (
-                f"Destination database table '{tbl}' rejected insertion because a foreign key references a parent record "
-                f"that does not exist in the referenced parent table (violates constraint '{fk_name}')."
-            )
-            fix_steps = [
-                "Ensure parent tables are migrated before child tables in the execution order.",
-                "Check source database for orphan records that reference non-existent parent IDs."
-            ]
-        elif "nosuchmoduleerror" in err_lower or "sqlalchemy.dialects:mongodb" in err_lower:
-            category = "NOSQL_DIALECT_MISMATCH"
-            user_env_issue = False
-            diag_summary = "Relational DDL statement execution was attempted on a MongoDB document database."
-            fix_steps = [
-                "Re-run the updated agent container image (data-migration-agent:latest) which skips relational DDL for MongoDB.",
-                "MongoDB target collections are created automatically upon document streaming."
-            ]
-        elif "access denied" in err_lower or "authentication failed" in err_lower or "password" in err_lower:
-            category = "DATABASE_AUTHENTICATION_FAILED"
-            user_env_issue = True
-            diag_summary = "Database rejected authentication credentials provided in agent environment variables."
-            fix_steps = [
-                "Verify database usernames and passwords in container environment variables.",
-                "Ensure password placeholders like <SRC_SRC_DB_1_PASSWORD> are replaced with valid credentials."
-            ]
-        elif "undefinedtable" in err_lower or ("relation" in err_lower and "does not exist" in err_lower):
-            category = "TARGET_TABLE_MISSING"
-            user_env_issue = False
-            diag_summary = f"Target table '{tbl}' does not exist in target database because pre-migration DDL table creation failed or was skipped."
-            fix_steps = [
-                "Enable 'Clean Wipe' before executing to automatically create all missing target tables.",
-                "Verify target DDL statements use valid SQL syntax for the target database engine (e.g. gen_random_uuid() on PostgreSQL).",
-                "Ensure pre-migration DDL statements execute without errors before starting data streaming."
-            ]
-        elif "undefinedfunction" in err_lower or "function uuid_v4() does not exist" in err_lower or "function does not exist" in err_lower:
-            category = "SQL_DIALECT_FUNCTION_ERROR"
-            user_env_issue = False
-            diag_summary = f"Pre-migration DDL referenced an unsupported SQL function (e.g. uuid_v4() on PostgreSQL)."
-            fix_steps = [
-                "Use native PostgreSQL gen_random_uuid() or uuid_generate_v4() instead of uuid_v4().",
-                "Update agent container to auto-heal dialect functions and re-run the execution job."
-            ]
-        elif "error rate exceeded" in err_lower:
-            category = "HIGH_ROW_ERROR_RATE"
-            user_env_issue = False
-            diag_summary = (
-                f"ETL pipeline aborted for table '{tbl}' because over 50% of records failed insertion into your destination database. "
-                f"This typically indicates an unmapped NOT NULL column, a data type mismatch, or a missing table in your destination."
-            )
-            fix_steps = [
-                f"Inspect table '{tbl}' in your destination database for columns with strict NOT NULL constraints or unique indexes.",
-                "Enable 'Clean Wipe' in execution options to recreate all destination tables cleanly according to the plan.",
-                "Review the agent container terminal output above for specific database error lines."
-            ]
-            copyable_cmd = (
-                f"-- Option 1: Drop legacy destination table so the migration creates it cleanly according to your plan:\n"
-                f"DROP TABLE IF EXISTS \"{tbl}\" CASCADE;\n\n"
-                f"-- Option 2: Inspect columns in destination DB to find unmapped NOT NULL constraints or mismatched types:\n"
-                f"SELECT column_name, data_type, is_nullable, column_default\n"
-                f"FROM information_schema.columns\n"
-                f"WHERE table_name = '{tbl}';"
-            )
-            copyable_cmd_label = "SQL Schema Fix & Inspection (Run in Destination DB)"
-        elif "cannot cast 'object' type" in err_lower or "computerror: cannot cast" in err_lower:
-            category = "SCHEMA_POLARS_TYPE_ERROR"
-            user_env_issue = False
-            diag_summary = f"Polars columnar transformation encountered unconverted Python Object/UUID columns in table '{tbl}'."
-            fix_steps = [
-                "Ensure source database driver columns (UUID/JSON) are sanitized to string before Polars cast operations.",
-                "Re-run migration using updated Docker Agent image (data-migration-agent:latest)."
-            ]
-        else:
-            diag_summary = f"ETL pipeline encountered an unexpected error during stage '{stage}': {err_msg[:200]}"
-            fix_steps = [
-                "Review target database constraints and column mapping specifications.",
-                "Verify source data quality and re-run execution job."
-            ]
+            elif "nosuchmoduleerror" in err_lower or "sqlalchemy.dialects:mongodb" in err_lower:
+                category = "NOSQL_DIALECT_MISMATCH"
+                user_env_issue = False
+                diag_summary = "Relational DDL statement execution was attempted on a MongoDB document database."
+                fix_steps = [
+                    "Re-run the updated agent container image (data-migration-agent:latest) which skips relational DDL for MongoDB.",
+                    "MongoDB target collections are created automatically upon document streaming."
+                ]
+            elif "access denied" in err_lower or "authentication failed" in err_lower or "password" in err_lower:
+                category = "DATABASE_AUTHENTICATION_FAILED"
+                user_env_issue = True
+                diag_summary = "Database rejected authentication credentials provided in agent environment variables."
+                fix_steps = [
+                    "Verify database usernames and passwords in container environment variables.",
+                    "Ensure password placeholders like <SRC_SRC_DB_1_PASSWORD> are replaced with valid credentials."
+                ]
+            elif "undefinedtable" in err_lower or ("relation" in err_lower and "does not exist" in err_lower):
+                category = "TARGET_TABLE_MISSING"
+                user_env_issue = False
+                diag_summary = f"Target table '{tbl}' does not exist in target database because pre-migration DDL table creation failed or was skipped."
+                fix_steps = [
+                    "Enable 'Clean Wipe' before executing to automatically create all missing target tables.",
+                    "Verify target DDL statements use valid SQL syntax for the target database engine (e.g. gen_random_uuid() on PostgreSQL).",
+                    "Ensure pre-migration DDL statements execute without errors before starting data streaming."
+                ]
+            elif "undefinedfunction" in err_lower or "function uuid_v4() does not exist" in err_lower or "function does not exist" in err_lower:
+                category = "SQL_DIALECT_FUNCTION_ERROR"
+                user_env_issue = False
+                diag_summary = "Pre-migration DDL referenced an unsupported SQL function (e.g. uuid_v4() on PostgreSQL)."
+                fix_steps = [
+                    "Use native PostgreSQL gen_random_uuid() or uuid_generate_v4() instead of uuid_v4().",
+                    "Update agent container to auto-heal dialect functions and re-run the execution job."
+                ]
+            elif "error rate exceeded" in err_lower:
+                category = "HIGH_ROW_ERROR_RATE"
+                user_env_issue = False
+                diag_summary = (
+                    f"ETL pipeline aborted for table '{tbl}' because over 50% of records failed insertion into your destination database. "
+                    f"This typically indicates an unmapped NOT NULL column, a data type mismatch, or a missing table in your destination."
+                )
+                fix_steps = [
+                    f"Inspect table '{tbl}' in your destination database for columns with strict NOT NULL constraints or unique indexes.",
+                    "Enable 'Clean Wipe' in execution options to recreate all destination tables cleanly according to the plan.",
+                    "Review the agent container terminal output above for specific database error lines."
+                ]
+                copyable_cmd = (
+                    f"-- Option 1: Drop legacy destination table so the migration creates it cleanly according to your plan:\n"
+                    f"DROP TABLE IF EXISTS \"{tbl}\" CASCADE;\n\n"
+                    f"-- Option 2: Inspect columns in destination DB to find unmapped NOT NULL constraints or mismatched types:\n"
+                    f"SELECT column_name, data_type, is_nullable, column_default\n"
+                    f"FROM information_schema.columns\n"
+                    f"WHERE table_name = '{tbl}';"
+                )
+                copyable_cmd_label = "SQL Schema Fix & Inspection (Run in Destination DB)"
+            elif "cannot cast 'object' type" in err_lower or "computerror: cannot cast" in err_lower:
+                category = "SCHEMA_POLARS_TYPE_ERROR"
+                user_env_issue = False
+                diag_summary = f"Polars columnar transformation encountered unconverted Python Object/UUID columns in table '{tbl}'."
+                fix_steps = [
+                    "Ensure source database driver columns (UUID/JSON) are sanitized to string before Polars cast operations.",
+                    "Re-run migration using updated Docker Agent image (data-migration-agent:latest)."
+                ]
+            else:
+                diag_summary = f"ETL pipeline encountered an unexpected error during stage '{stage}': {err_msg[:200]}"
+                fix_steps = [
+                    "Review target database constraints and column mapping specifications.",
+                    "Verify source data quality and re-run execution job."
+                ]
 
         # Build copyable container run command ONLY if it is an environment/connectivity/auth issue (Fix #3)
         if user_env_issue and copyable_cmd is None and job.agent:
@@ -1074,7 +1105,7 @@ Rules:
                 "  --restart unless-stopped \\",
                 "  --add-host=host.docker.internal:host-gateway \\",
                 '  -e BACKEND_URL="http://host.docker.internal:8000" \\',
-                f'  -e AGENT_TOKEN="AG_TOKEN_PLACEHOLDER" \\',
+                '  -e AGENT_TOKEN="AG_TOKEN_PLACEHOLDER" \\',
                 f'  -e AGENT_ID="{ag.id}" \\',
                 f'  -e AGENT_IDENTIFIER="{ag.agent_identifier}" \\',
             ]
@@ -1196,8 +1227,9 @@ Rules:
         cursor_offset: int,
         rows_processed: int,
         source_position: Optional[dict] = None,
+        agent_id: Optional[uuid.UUID] = None,
     ) -> ExecutionCheckpoint:
-        """Persists an authoritative checkpoint to PostgreSQL/SQLite."""
+        """Persists an authoritative checkpoint to PostgreSQL/SQLite after validating agent authorization."""
         checkpoint = await ExecutionPlanService.save_checkpoint(
             session=session,
             step_id=step_id,
@@ -1207,6 +1239,7 @@ Rules:
             cursor_offset=cursor_offset,
             rows_processed=rows_processed,
             source_position=source_position,
+            agent_id=agent_id,
         )
         await session.commit()
         await session.refresh(checkpoint)
@@ -1214,20 +1247,23 @@ Rules:
 
     @staticmethod
     async def get_step_checkpoints(
-        session: AsyncSession, step_id: uuid.UUID
+        session: AsyncSession,
+        step_id: uuid.UUID,
+        agent_id: Optional[uuid.UUID] = None,
     ) -> List[ExecutionCheckpoint]:
-        """Fetches all checkpoints for an execution step."""
-        return await ExecutionPlanService.get_checkpoints_for_step(session, step_id)
+        """Fetches all checkpoints for an execution step after validating agent authorization."""
+        return await ExecutionPlanService.get_checkpoints_for_step(session, step_id, agent_id=agent_id)
 
     @staticmethod
     async def complete_step(
         session: AsyncSession,
         step_id: uuid.UUID,
         output_summary: Optional[dict] = None,
+        agent_id: Optional[uuid.UUID] = None,
     ) -> MigrationExecutionStep:
-        """Marks a step completed and checks for whole plan completion."""
+        """Marks a step completed after validating agent authorization and checks for whole plan completion."""
         step = await ExecutionPlanService.complete_step(
-            session=session, step_id=step_id, output_summary=output_summary
+            session=session, step_id=step_id, output_summary=output_summary, agent_id=agent_id
         )
         await session.commit()
         await session.refresh(step)
@@ -1239,13 +1275,15 @@ Rules:
         step_id: uuid.UUID,
         error_type: Optional[str] = None,
         error_message: Optional[str] = None,
+        agent_id: Optional[uuid.UUID] = None,
     ) -> MigrationExecutionStep:
-        """Handles step failure and applies retry policy."""
+        """Handles step failure and applies retry policy after validating agent authorization."""
         step = await ExecutionPlanService.fail_step(
             session=session,
             step_id=step_id,
             error_type=error_type,
             error_message=error_message or "Execution step failed.",
+            agent_id=agent_id,
         )
         await session.commit()
         await session.refresh(step)
@@ -1255,9 +1293,10 @@ Rules:
     async def list_user_interventions(
         session: AsyncSession,
         job_id: uuid.UUID,
+        user_id: Optional[uuid.UUID] = None,
     ) -> List[Any]:
-        """Lists pending and resolved user interventions for a migration job."""
-        return await ExecutionPlanService.list_user_interventions(session, job_id)
+        """Lists pending and resolved user interventions for a migration job after verifying user ownership."""
+        return await ExecutionPlanService.list_user_interventions(session, job_id, user_id=user_id)
 
     @staticmethod
     async def resolve_user_intervention(
