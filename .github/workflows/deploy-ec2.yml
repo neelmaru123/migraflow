@@ -43,6 +43,26 @@ jobs:
             git checkout ${{ github.ref_name }}
             git reset --hard FETCH_HEAD
 
+            echo "=== Ensuring valid production secrets in .env ==="
+            if [ -f .env ]; then
+              CURRENT_SEC=$(grep "^SECRET_KEY=" .env | cut -d'=' -f2- | tr -d '"'\'' ' || true)
+              if [ -z "$CURRENT_SEC" ] || [ ${#CURRENT_SEC} -lt 32 ] || echo "$CURRENT_SEC" | grep -qiE "change_me|change-me|default|super-secret|099b4b4c"; then
+                NEW_SEC=$(openssl rand -hex 32)
+                sed -i '/^SECRET_KEY=/d' .env
+                echo "SECRET_KEY=\"$NEW_SEC\"" >> .env
+                echo "Configured valid high-entropy SECRET_KEY in .env"
+              fi
+
+              CURRENT_JWT=$(grep "^JWT_SECRET_KEY=" .env | cut -d'=' -f2- | tr -d '"'\'' ' || true)
+              CURRENT_SEC_NOW=$(grep "^SECRET_KEY=" .env | cut -d'=' -f2- | tr -d '"'\'' ' || true)
+              if [ -z "$CURRENT_JWT" ] || [ ${#CURRENT_JWT} -lt 32 ] || [ "$CURRENT_JWT" = "$CURRENT_SEC_NOW" ] || echo "$CURRENT_JWT" | grep -qiE "change_me|change-me|default|jwt-super-secret|07e7dbe7"; then
+                NEW_JWT=$(openssl rand -hex 32)
+                sed -i '/^JWT_SECRET_KEY=/d' .env
+                echo "JWT_SECRET_KEY=\"$NEW_JWT\"" >> .env
+                echo "Configured valid high-entropy JWT_SECRET_KEY in .env"
+              fi
+            fi
+
             echo "=== Pre-building updated Docker images (server stays active during build) ==="
             docker compose build
 

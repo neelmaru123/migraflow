@@ -4,8 +4,10 @@ on:
   push:
     paths:
       - 'apps/agent/**'
+      - '.github/workflows/publish-agent.yml'
     branches:
       - main
+      - production
   workflow_dispatch:
 
 jobs:
