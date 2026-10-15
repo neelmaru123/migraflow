@@ -1,5 +1,169 @@
 # Execution Flow — Migraflow Platform
 
+## Execution Flow — Phase 4: Production Health Reporting, Dependency Readiness, and Lifecycle Hardening
+
+### 1. Entry Points
+- **System Health & Readiness Probes**:
+  - `GET /api/v1/health` and `GET /health` in [`apps/api/app/main.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/main.py)
+  - `GET /api/v1/health/ready` and `GET /ready` in [`apps/api/app/main.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/main.py)
+- **Process Liveness Probe**:
+  - `GET /api/v1/health/live` and `GET /live` in [`apps/api/app/main.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/main.py)
+- **Application Lifespan & Shutdown**:
+  - `lifespan()` in [`apps/api/app/main.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/main.py)
+
+### 2. Step-by-Step Execution Sequence
+
+#### Flow A: Health & Readiness Probe Evaluation
+1. **Probe Request**: Load balancer, Docker Compose, or monitor issues `GET /api/v1/health` or `GET /ready`.
+2. **Service Evaluation**: Handler delegates to `SystemHealthService.evaluate_readiness(session_factory=AsyncSessionLocal)`.
+3. **Bounded Database Probe**:
+   - Executes `check_database(timeout_seconds=2.0)`.
+   - Opens async session and executes `SELECT 1` wrapped in `asyncio.wait_for`.
+   - If unreachable or timed out: masks credentials and sets `db_ok = False`.
+4. **Bounded Redis Probe**:
+   - Executes `check_redis(timeout_seconds=1.5)` via `check_redis_connectivity()`.
+   - Sends `client.ping()` over shared singleton pool wrapped in `asyncio.wait_for`.
+   - Never closes client and masks internal errors.
+5. **Decision Logic**:
+   - Database is **required**: if `db_ok == False`, returns `HTTP 503 Service Unavailable` with `success=False`, `status="degraded"`.
+   - Redis is **optional**: if `db_ok == True` and `redis_ok == False`, returns `HTTP 200 OK` with `success=True`, `status="ok"`, noting cache fallback.
+   - If both healthy: returns `HTTP 200 OK` with `success=True`, `status="ok"`, `database_connected=True`, `redis_connected=True`.
+
+#### Flow B: Zero-Dependency Liveness Probe
+1. **Probe Request**: Kubernetes or monitor issues `GET /api/v1/health/live` or `GET /live`.
+2. **Event Loop Verification**: Handler calls `SystemHealthService.evaluate_liveness()`.
+3. **Immediate Response**: Returns `HTTP 200 OK` with ISO timestamp, confirming process loop is unblocked without querying external databases.
+
+#### Flow C: Lifecycle Shutdown Cleanup
+1. **Termination Signal**: Process receives `SIGTERM` / `SIGINT`.
+2. **Lifespan Exit**: Context manager exits `yield` block.
+3. **Background Watchdog Cancel**: Cancels `watchdog_task` and awaits cancellation.
+4. **Connection Pool Draining**:
+   - Invokes `close_redis_client()` to drain and close the Redis connection pool.
+   - Invokes `dispose_engine()` to cleanly dispose the SQLAlchemy connection pool.
+
+### 3. Impact & Delta Analysis
+- **[NEW]**: [`apps/api/tests/unit/test_health_and_lifecycle_reporting.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/tests/unit/test_health_and_lifecycle_reporting.py) - 9 comprehensive unit tests covering all Phase 4 probe and lifecycle scenarios.
+- **[MODIFIED]**: [`apps/api/app/core/redis_client.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/core/redis_client.py) - Added socket timeouts, bounded `check_redis_connectivity()`, and `close_redis_client()`.
+- **[MODIFIED]**: [`apps/api/app/core/db.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/core/db.py) - Added `dispose_engine()` async helper for clean pool disposal.
+- **[MODIFIED]**: [`apps/api/app/modules/observability/health_service.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/observability/health_service.py) - Added `SystemHealthService` with bounded DB and Redis checks and liveness/readiness evaluation.
+- **[MODIFIED]**: [`apps/api/app/main.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/main.py) - Replaced hardcoded Redis status with real probe, added `/live` and `/ready` endpoints, and added clean connection shutdown in lifespan.
+
+---
+
+## Execution Flow — Phase 2: Destructive Target-Operation Safety Gating & Bypass Remediation
+
+### 1. Entry Points
+- **Job Execution Creation**:
+  - `POST /api/v1/executions` in [`apps/api/app/modules/execution/execution_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_routes.py)
+- **Destructive Approval Management**:
+  - `GET /api/v1/plans/{plan_id}/destructive-approvals` in [`apps/api/app/modules/migration_plans/migration_plans_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/migration_plans/migration_plans_routes.py)
+  - `POST /api/v1/plans/{plan_id}/destructive-approvals/request` in [`apps/api/app/modules/migration_plans/migration_plans_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/migration_plans/migration_plans_routes.py)
+  - `POST /api/v1/plans/{plan_id}/destructive-approvals/{approval_id}/grant` in [`apps/api/app/modules/migration_plans/migration_plans_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/migration_plans/migration_plans_routes.py)
+  - `POST /api/v1/plans/{plan_id}/destructive-approvals/{approval_id}/reject` in [`apps/api/app/modules/migration_plans/migration_plans_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/migration_plans/migration_plans_routes.py)
+- **Agent Task Polling**:
+  - `GET /api/v1/executions/agent/tasks` in [`apps/api/app/modules/execution/execution_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_routes.py)
+
+### 2. Step-by-Step Execution Sequence
+
+#### Flow A: Job Creation with Destructive Safety Gating
+1. **API Request**: User submits `POST /api/v1/executions` with `plan_id`, `is_dry_run`, `truncate_target`, and optional `idempotency_key`.
+2. **Authentication & Ownership**: Route resolves `current_user: User` and delegates to `ExecutionService.create_execution_job()`.
+3. **Plan Validation & Ownership**: Validates plan exists, belongs to caller, `plan.is_valid == True`, and `plan.status in ("completed", "approved")`.
+4. **Idempotency Guard**: If `idempotency_key` is provided and a job exists for the plan and user, returns existing `MigrationJob` immediately.
+5. **Dry-Run Sanitization**:
+   - Computes `effective_truncate_target = False if is_dry_run else truncate_target`.
+   - Dry runs strictly bypass destructive actions without requiring destructive approvals.
+6. **Server-Side Safety Evaluation**:
+   - If not a dry run: resolves active `current_ver = plan.approved_version_number or latest_version`.
+   - Invokes `DestructiveApprovalManager.check_plan_destructive_compliance(plan=plan, current_version_number=current_ver, requested_truncate_target=effective_truncate_target)`.
+   - Evaluates:
+     - All AST destructive cleanup actions (`TRUNCATE`, `DROP TABLE`).
+     - Requested execution action: if `effective_truncate_target=True`, injects requirement for `truncate_all_targets` on `*`.
+     - Validates against active `DestructiveOperationApproval` records matching plan ID, current version, `is_valid == True`, `is_approved == True`, and `expires_at > now`.
+     - Wildcard check: approval for `*` covers all tables; approving an individual table (e.g. `dim_users`) does NOT authorize clean-wiping all tables or table `dim_orders`.
+   - **Rejection**: If any operation is unapproved, raises `HTTP 400 Bad Request` with detailed list of unapproved operations.
+7. **Durable Job & DAG Creation**:
+   - Instantiates `MigrationJob(truncate_target=effective_truncate_target, is_dry_run=is_dry_run, ...)`.
+   - Calls `ExecutionPlanService.create_execution_plan_for_job()`, configuring step `pre_ddl` with sanitized `input_definition["truncate_target"]`.
+   - Emits `JOB_CREATED` event in `ExecutionEvent` audit log with authorized parameters.
+
+#### Flow B: Destructive Operation Approval Workflow
+1. **Sync / Discovery**: When user queries `GET /plans/{plan_id}/destructive-approvals`, `DestructiveApprovalManager.sync_plan_destructive_approvals()` automatically discovers destructive operations in the AST and creates pending `DestructiveOperationApproval` records for the current version.
+2. **Explicit Request**: For clean wipe operations, caller calls `POST /plans/{plan_id}/destructive-approvals/request` specifying `target_table="*"` and `operation_type="truncate_all_targets"`.
+3. **Granting Approval**: Plan owner calls `POST /plans/{plan_id}/destructive-approvals/{approval_id}/grant`.
+   - Verifies `approval.is_valid == True` (stale approvals from previous versions cannot be granted).
+   - Sets `is_approved = True`, `approved_by_user_id = current_user.id`, and `approved_at = now`.
+   - Emits append-only `DESTRUCTIVE_APPROVAL_GRANTED` audit event.
+4. **Invalidation upon Plan Change**: If the plan is refined or modified, `DestructiveApprovalManager.invalidate_all_for_plan()` marks all prior approvals `is_valid = False` with `DESTRUCTIVE_APPROVAL_REVOKED` audit events.
+
+#### Flow C: Agent Dispatch & Execution
+1. **Task Fetching**: Agent calls `GET /api/v1/executions/agent/tasks`.
+2. **Safe Instruction Delivery**: Server returns `AgentTaskItemResponse` with sanitized `truncate_target = False if job.is_dry_run else job.truncate_target`.
+3. **Agent Orchestration**: Agent orchestrator inspects `truncate_target`. If `True`, performs preflight backup check and `DDLExecutor.clean_wipe_target_database()`. If `False`, uses append mode (`ON CONFLICT DO NOTHING`). In dry run mode, DDL and wipe are skipped completely.
+
+### 3. Impact & Delta Analysis
+- **[NEW]**: [`apps/api/tests/unit/test_destructive_approval_bypass.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/tests/unit/test_destructive_approval_bypass.py) - 9 comprehensive unit tests verifying bypass closure, target boundaries, version binding, dry runs, idempotency, and expirations.
+- **[MODIFIED]**: [`apps/api/app/modules/execution/safety_services.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/safety_services.py) - Added `requested_truncate_target` validation, expiration check, target scoping, and `sync_plan_destructive_approvals()`.
+- **[MODIFIED]**: [`apps/api/app/modules/execution/execution_services.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_services.py) - Gated job creation with `check_plan_destructive_compliance`, bound `effective_truncate_target`, and recorded audit event.
+- **[MODIFIED]**: [`apps/api/app/modules/execution/execution_plan_services.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_plan_services.py) - Sanitized `truncate_target` in `pre_ddl` step `input_definition`.
+- **[MODIFIED]**: [`apps/api/app/modules/execution/execution_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_routes.py) - Sanitized `truncate_target` in `AgentTaskItemResponse`.
+- **[MODIFIED]**: [`apps/api/app/modules/execution/execution_schemas.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_schemas.py) - Added `DestructiveApprovalRequestPayload`.
+- **[MODIFIED]**: [`apps/api/app/modules/migration_plans/migration_plans_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/migration_plans/migration_plans_routes.py) - Added approval sync and `POST /{plan_id}/destructive-approvals/request` endpoint.
+
+---
+
+## Execution Flow — Phase 1: Security & Authorization Boundaries
+
+### 1. Entry Points
+- **Agent Step & Checkpoint Execution Operations**:
+  - `POST /api/v1/executions/plans/{plan_id}/steps/claim` in [`apps/api/app/modules/execution/execution_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_routes.py)
+  - `POST /api/v1/executions/steps/{step_id}/checkpoint` in [`apps/api/app/modules/execution/execution_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_routes.py)
+  - `GET /api/v1/executions/steps/{step_id}/checkpoints` in [`apps/api/app/modules/execution/execution_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_routes.py)
+  - `POST /api/v1/executions/steps/{step_id}/complete` in [`apps/api/app/modules/execution/execution_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_routes.py)
+  - `POST /api/v1/executions/steps/{step_id}/fail` in [`apps/api/app/modules/execution/execution_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_routes.py)
+- **Failure Diagnosis**:
+  - `POST /api/v1/executions/{id}/diagnose` in [`apps/api/app/modules/execution/execution_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_routes.py)
+- **Agent Fatal Error Reporting**:
+  - `POST /api/v1/agents/fatal-error` in [`apps/api/app/modules/agents/agents_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/agents/agents_routes.py)
+
+### 2. Step-by-Step Execution Sequence
+
+#### Flow A: Agent Step Checkpoint & Execution Mutation
+1. **Agent Request**: Edge Agent calls `POST /api/v1/executions/steps/{step_id}/checkpoint` with `X-Agent-Token` header.
+2. **Authentication**: `get_current_agent` verifies token hash and resolves authenticated `Agent`.
+3. **Route Dispatch**: Route extracts `agent.id` and forwards to `ExecutionService.save_step_checkpoint()`, then `ExecutionPlanService.save_checkpoint()`.
+4. **Service-Layer Authorization Boundary**:
+   - `ExecutionPlanService._verify_step_agent_access()` is invoked with row-level transaction locks.
+   - **Cross-Tenant Guard**: Queries `step.execution_plan.plan`. If `agent.user_id != plan.user_id`, immediately raises `HTTP 404 Not Found` without disclosing step or tenant information.
+   - **Cross-Agent Guard**: Verifies `job.agent_id == agent.id` or matches active `step.agent_run_id`. If foreign agent mutates an active step, raises `HTTP 404 Not Found`.
+5. **Durable Mutation**: Updates/saves `ExecutionCheckpoint` monotonically and records `ExecutionEvent`.
+
+#### Flow B: Failure Diagnosis Ownership Validation
+1. **User Request**: User calls `POST /api/v1/executions/{job_id}/diagnose`.
+2. **Authentication**: Route resolves `current_user: User`.
+3. **Service Validation**: `ExecutionService.diagnose_job_failure()` acquires lock and checks `job.plan.user_id == user_id`.
+   - If user does not own the plan: raises `HTTP 404 Not Found`.
+   - If called internally by system watchdog (`user_id=None`): proceeds securely.
+4. **Remediation Synthesis**: Synthesizes sanitized diagnosis and persists `ai_diagnosis` on `MigrationJob`.
+
+#### Flow C: Emergency Fatal Error Reporting
+1. **Agent Crash/Exit**: Agent container encounters fatal startup crash or shutdown and invokes `POST /api/v1/agents/fatal-error`.
+2. **Identity Verification**:
+   - Route resolves `caller_agent` if `X-Agent-Token` is provided, or `caller_user_id` if JWT Bearer is provided.
+   - If authenticated as Agent X but target `agent_id` is Agent Y: rejects with `HTTP 403 Forbidden` ("Authenticated agent credentials do not match").
+   - If unauthenticated: checks whether target agent has active/running jobs. If active jobs exist: rejects with `HTTP 403 Forbidden`. If offline/idle: permits emergency failure reporting.
+3. **Sanitized Response**: Updates agent status to `error` and returns `AgentFatalErrorResponse` containing only error diagnostics, strictly stripping `user_id` and authentication tokens.
+
+### 3. Impact & Delta Analysis
+- **[NEW]**: [`apps/api/tests/unit/test_security_authorization_gaps.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/tests/unit/test_security_authorization_gaps.py) - 5 comprehensive regression test cases covering all Phase 1 boundaries.
+- **[MODIFIED]**: [`apps/api/app/core/config.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/core/config.py) - Insecure secret key validator.
+- **[MODIFIED]**: [`apps/api/app/modules/agents/agents_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/agents/agents_routes.py), [`agents_schemas.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/agents/agents_schemas.py), [`agents_services.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/agents/agents_services.py) - Caller identity checks and sanitized responses.
+- **[MODIFIED]**: [`apps/api/app/modules/execution/execution_routes.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_routes.py), [`execution_services.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_services.py), [`execution_plan_services.py`](file:///d:/GitHub/Ai_data_migration_platform/apps/api/app/modules/execution/execution_plan_services.py) - Server-side agent authorization, tenant isolation, and job ownership enforcement.
+- **[MODIFIED]**: [`docker-compose.prod.yml`](file:///d:/GitHub/Ai_data_migration_platform/docker-compose.prod.yml), [`.env.example`](file:///d:/GitHub/Ai_data_migration_platform/.env.example), [`.env.production.example`](file:///d:/GitHub/Ai_data_migration_platform/.env.production.example) - Production secrets configuration hardening.
+
+---
+
 ## Execution Flow — UK GDPR & PECR Compliance Controls
 
 ### 1. Entry Points
@@ -2230,4 +2394,58 @@ sequenceDiagram
 - **[NEW]**: [`.env.production.example`](file:///d:/GitHub/Ai_data_migration_platform/.env.production.example) — Complete production environment template with secure 256-bit keys and documentation.
 - **[NEW]**: [`scripts/deploy.sh`](file:///d:/GitHub/Ai_data_migration_platform/scripts/deploy.sh) — End-to-end automated EC2 deployment and health verification script.
 - **[MODIFIED]**: [`docs/DECISIONS.md`](file:///d:/GitHub/Ai_data_migration_platform/docs/DECISIONS.md) & [`docs/EXECUTION_FLOW.md`](file:///d:/GitHub/Ai_data_migration_platform/docs/EXECUTION_FLOW.md) — Documented decision and execution sequence.
+
+---
+
+# Execution Flow — Polyglot Dual-Source Data Merge Test Environment & Seeder
+
+## 1. Entry Point
+- **CLI Invocations**:
+  - `docker compose up -d && python seed_all.py` (or `python test_environment/seed_all.py`)
+  - `python verify.py` (or `python test_environment/verify.py`)
+- **Files**:
+  - [`seed_all.py`](file:///d:/GitHub/Ai_data_migration_platform/seed_all.py) / [`test_environment/seed_all.py:L70`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/seed_all.py#L70)
+  - [`verify.py`](file:///d:/GitHub/Ai_data_migration_platform/verify.py) / [`test_environment/verify.py:L20`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/verify.py#L20)
+
+## 2. Step-by-Step Execution Sequence
+
+1. **Docker Container Discovery & Provisioning**:
+   - Docker Compose orchestrates `postgres:16-alpine` and `mongo:7.0`.
+   - Dynamic connection detection in [`seed_postgres.py`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/seed_postgres.py#L22) inspects port `5434` (existing running Migraflow container) or port `5432` (standalone compose).
+   - Dynamic connection detection in [`seed_mongo.py`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/seed_mongo.py#L20) authenticates to `localhost:27017`.
+2. **Unified Deterministic Data Generation**:
+   - `generate_dataset(seed=42)` in [`data_generator.py`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/data_generator.py#L100) initializes `random` and `Faker` (`en_US` and `en_IN`).
+   - Synthesizes 1,000 PostgreSQL customers, 1,000 MongoDB customers, 300 PostgreSQL products, 300 MongoDB products, 5,000 PostgreSQL orders, 4,000 MongoDB orders, 1,500 support tickets, 2,000 feedback documents, and 990 injected conflicts.
+3. **PostgreSQL Schema Execution & Ingestion**:
+   - `seed_postgres()` creates `legacy_oms_pg` if absent, parses and applies [`sql/schema.sql`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/sql/schema.sql).
+   - Executes batch `execute_values` insertions for `customers`, `products`, `orders`, `order_items`, `payments`, and `support_tickets`.
+   - Issues `ALTER TABLE orders ADD CONSTRAINT fk_orders_customer FOREIGN KEY (customer_id) REFERENCES customers(customer_id) NOT VALID;` to preserve intentional orphaned foreign key test cases (`customer_id = 99999`).
+4. **MongoDB Document Ingestion & Index Creation**:
+   - `seed_mongo()` switches to `customer_experience_mongo`.
+   - Drops prior collections and chunks inserts across `customers`, `products`, `orders`, and `feedback`.
+   - Creates indexes on `emailAddress`, `mobile`, `productCode`, `orderRef`, `customerEmail`.
+5. **Ground-Truth Artifact Generation**:
+   - `export_ground_truth()` writes:
+     - [`ground_truth/customer_matches.csv`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/ground_truth/customer_matches.csv) (600 match pairs: exact, fuzzy, phone_only)
+     - [`ground_truth/product_matches.csv`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/ground_truth/product_matches.csv) (180 match pairs: exact, sku_normalized)
+     - [`ground_truth/order_matches.csv`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/ground_truth/order_matches.csv) (2,000 match pairs: exact_ref)
+     - [`ground_truth/field_mapping.json`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/ground_truth/field_mapping.json) (exhaustive cross-engine field transformation schema)
+     - [`ground_truth/conflicts_report.csv`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/ground_truth/conflicts_report.csv) (990 conflict records)
+     - [`ground_truth/expected_merged_sample.json`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/ground_truth/expected_merged_sample.json) (20 golden merged records)
+6. **Cross-Engine Verification Pipeline**:
+   - `verify_all()` in [`verify.py`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/verify.py#L20) connects to both engines, verifies table/document counts, cross-audits overlaps against ground-truth CSVs, checks data quality anomalies (orphaned FKs, negative quantities, unicode strings), and formats side-by-side comparison tables.
+
+## 3. Impact & Delta Analysis (AI Modifications)
+- **[NEW]**: [`test_environment/docker-compose.yml`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/docker-compose.yml) — Standalone Docker Compose for PostgreSQL 16 & MongoDB 7.
+- **[NEW]**: [`test_environment/sql/schema.sql`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/sql/schema.sql) — Normalized relational schema with 6 tables, indexes, and constraints.
+- **[NEW]**: [`test_environment/data_generator.py`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/data_generator.py) — Reproducible multi-locale synthetic data generator.
+- **[NEW]**: [`test_environment/seed_postgres.py`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/seed_postgres.py) — PostgreSQL batch seeder with auto-port detection.
+- **[NEW]**: [`test_environment/seed_mongo.py`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/seed_mongo.py) — MongoDB document seeder with indexes.
+- **[NEW]**: [`test_environment/seed_all.py`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/seed_all.py) — Master seed orchestrator & ground-truth exporter.
+- **[NEW]**: [`test_environment/verify.py`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/verify.py) — Cross-engine verification and side-by-side audit runner.
+- **[NEW]**: [`test_environment/requirements.txt`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/requirements.txt) — Dependency specifications.
+- **[NEW]**: [`test_environment/README.md`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/README.md) — Comprehensive architecture, Mermaid ER diagram, and conflict reference.
+- **[NEW]**: [`test_environment/ground_truth/`](file:///d:/GitHub/Ai_data_migration_platform/test_environment/ground_truth) — 6 authoritative ground truth match, mapping, and conflict files.
+- **[NEW]**: [`seed_all.py`](file:///d:/GitHub/Ai_data_migration_platform/seed_all.py) & [`verify.py`](file:///d:/GitHub/Ai_data_migration_platform/verify.py) — Root workspace convenience wrappers.
+
 

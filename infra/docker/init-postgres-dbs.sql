@@ -35,3 +35,8 @@ WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'retail_store_pg')\gex
 SELECT 'CREATE DATABASE retail_merged_pg'
 WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'retail_merged_pg')\gexec
 
+-- 9. Legacy Order-Management System (Multi-Source Merge Benchmark Source A)
+SELECT 'CREATE DATABASE legacy_oms_pg'
+WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'legacy_oms_pg')\gexec
+
+

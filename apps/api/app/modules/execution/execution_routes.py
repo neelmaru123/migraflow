@@ -176,7 +176,7 @@ async def poll_agent_tasks(
             execution_plan_id=getattr(job, "execution_plan_id", None),
             status=job.status,
             is_dry_run=job.is_dry_run,
-            truncate_target=job.truncate_target,
+            truncate_target=False if job.is_dry_run else bool(job.truncate_target),
             created_at=job.created_at,
         )
         for job in jobs
@@ -252,6 +252,7 @@ async def save_checkpoint(
         cursor_offset=body.cursor_offset,
         rows_processed=body.rows_processed,
         source_position=body.source_position,
+        agent_id=agent.id,
     )
 
 
@@ -266,7 +267,9 @@ async def get_step_checkpoints(
     session: AsyncSession = Depends(get_db),
 ):
     """Fetches all authoritative checkpoints associated with a step."""
-    return await ExecutionService.get_step_checkpoints(session=session, step_id=step_id)
+    return await ExecutionService.get_step_checkpoints(
+        session=session, step_id=step_id, agent_id=agent.id
+    )
 
 
 @execution_router.post(
@@ -284,7 +287,7 @@ async def complete_step(
     Marks a step completed, advances DAG dependencies, and completes the execution plan if all steps finish.
     """
     return await ExecutionService.complete_step(
-        session=session, step_id=step_id, output_summary=body.output_summary
+        session=session, step_id=step_id, output_summary=body.output_summary, agent_id=agent.id
     )
 
 
@@ -307,6 +310,7 @@ async def fail_step(
         step_id=step_id,
         error_type=body.error_type,
         error_message=body.error_message,
+        agent_id=agent.id,
     )
 
 
@@ -337,7 +341,9 @@ async def diagnose_execution_failure(
     session: AsyncSession = Depends(get_db),
 ):
     """Triggers AI failure analysis and synthesizes plain English remediation steps."""
-    return await ExecutionService.diagnose_job_failure(session=session, job_id=id)
+    return await ExecutionService.diagnose_job_failure(
+        session=session, job_id=id, user_id=current_user.id
+    )
 
 
 @execution_router.post(
@@ -371,7 +377,9 @@ async def list_job_interventions(
     session: AsyncSession = Depends(get_db),
 ):
     """Lists human-in-the-loop (ASK_USER) intervention requests for an execution job."""
-    return await ExecutionService.list_user_interventions(session=session, job_id=id)
+    return await ExecutionService.list_user_interventions(
+        session=session, job_id=id, user_id=current_user.id
+    )
 
 
 @execution_router.post(
@@ -409,6 +417,7 @@ async def list_job_verifications(
     session: AsyncSession = Depends(get_db),
 ):
     """Lists durable verification check results for an execution job."""
+    await ExecutionService.get_job_by_id(session=session, user_id=current_user.id, job_id=id)
     from app.modules.execution.execution_plan_services import ExecutionPlanService
     return await ExecutionPlanService.list_verification_results(session=session, job_id=id)
 
@@ -425,6 +434,7 @@ async def run_job_verification(
     session: AsyncSession = Depends(get_db),
 ):
     """Manually executes or re-evaluates the verification suite for an execution job."""
+    await ExecutionService.get_job_by_id(session=session, user_id=current_user.id, job_id=id)
     from app.modules.execution.execution_plan_services import ExecutionPlanService
     from app.modules.execution.verification_services import VerificationPolicy
     policy = VerificationPolicy(

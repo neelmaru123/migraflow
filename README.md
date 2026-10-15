@@ -94,6 +94,7 @@ data-migration-platform/
 │   └── scripts/                              # Database initialization & deployment scripts
 │
 ├── docs/                                     # System Documentation
+│   ├── USER_MANUAL.md                        # Plain-English User Manual (Non-Technical Guide)
 │   ├── ai_planner.md
 │   ├── api.md
 │   ├── connectors.md

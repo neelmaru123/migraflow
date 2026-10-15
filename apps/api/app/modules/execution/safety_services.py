@@ -8,7 +8,7 @@ and handles approval invalidation upon plan version changes.
 from datetime import datetime, timezone
 import logging
 import re
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 import uuid
 
 from sqlalchemy import select, update
@@ -154,7 +154,7 @@ class DestructiveApprovalManager:
                 DestructiveOperationApproval.plan_version_number == plan_version_number,
                 DestructiveOperationApproval.target_table == target_table,
                 DestructiveOperationApproval.operation_type == operation_type,
-                DestructiveOperationApproval.is_valid == True,
+                DestructiveOperationApproval.is_valid.is_(True),
             )
         )
         res = await session.execute(stmt)
@@ -285,7 +285,7 @@ class DestructiveApprovalManager:
             update(DestructiveOperationApproval)
             .where(
                 DestructiveOperationApproval.migration_plan_id == plan_id,
-                DestructiveOperationApproval.is_valid == True,
+                DestructiveOperationApproval.is_valid.is_(True),
             )
             .values(is_valid=False, rejection_reason=f"Invalidated: {reason}")
         )
@@ -311,42 +311,127 @@ class DestructiveApprovalManager:
         return count
 
     @classmethod
+    async def sync_plan_destructive_approvals(
+        cls,
+        session: AsyncSession,
+        plan: MigrationPlan,
+        current_version_number: int,
+    ) -> List[DestructiveOperationApproval]:
+        """
+        Scans the plan for destructive operations and ensures a pending DestructiveOperationApproval
+        record exists for each detected operation for the current plan version.
+        """
+        plan_data = plan.plan_data or {}
+        destructive_ops = SafetyClassifier.classify_plan_operations(plan_data)
+        approvals = []
+        for op in destructive_ops:
+            appr = await cls.get_or_create_approval_request(
+                session=session,
+                plan_id=plan.id,
+                plan_version_number=current_version_number,
+                target_table=op["target_table"],
+                operation_type=op["operation_type"],
+                metadata_snapshot=op,
+            )
+            approvals.append(appr)
+        return approvals
+
+    @classmethod
     async def check_plan_destructive_compliance(
         cls,
         session: AsyncSession,
         plan: MigrationPlan,
         current_version_number: int,
+        requested_truncate_target: bool = False,
     ) -> Tuple[bool, List[Dict[str, Any]]]:
         """
-        Verifies that every destructive operation in the plan has a valid, active approval
-        matching the EXACT current_version_number.
+        Verifies that every destructive operation in the plan (and any requested job operations)
+        has a valid, active approval matching the EXACT current_version_number.
         Returns:
             (is_compliant: bool, pending_or_unapproved_operations: list)
         """
         plan_data = plan.plan_data or {}
         destructive_ops = SafetyClassifier.classify_plan_operations(plan_data)
 
+        # Treat the actual requested job operation as part of the server-side safety decision
+        if requested_truncate_target:
+            has_global_trunc = any(
+                op.get("target_table") == "*" and op.get("operation_type") in ("truncate_all_targets", "truncate_target")
+                for op in destructive_ops
+            )
+            if not has_global_trunc:
+                destructive_ops.append({
+                    "target_table": "*",
+                    "operation_type": "truncate_all_targets",
+                    "risk_level": OperationRiskLevel.DESTRUCTIVE.value,
+                    "statement": "TRUNCATE TARGET TABLES (clean wipe requested for execution)",
+                })
+
         if not destructive_ops:
             return True, []
 
+        now = datetime.now(timezone.utc)
         stmt = (
             select(DestructiveOperationApproval)
             .where(
                 DestructiveOperationApproval.migration_plan_id == plan.id,
                 DestructiveOperationApproval.plan_version_number == current_version_number,
-                DestructiveOperationApproval.is_valid == True,
-                DestructiveOperationApproval.is_approved == True,
+                DestructiveOperationApproval.is_valid.is_(True),
+                DestructiveOperationApproval.is_approved.is_(True),
             )
         )
         res = await session.execute(stmt)
         approved_records = list(res.scalars().all())
-        approved_map = {(a.target_table, a.operation_type) for a in approved_records}
+
+        # Filter out expired approvals
+        valid_approvals = []
+        for a in approved_records:
+            if a.expires_at is not None:
+                exp = a.expires_at if a.expires_at.tzinfo else a.expires_at.replace(tzinfo=timezone.utc)
+                if exp < now:
+                    logger.warning(f"Destructive approval '{a.id}' has expired at {exp}.")
+                    continue
+            valid_approvals.append(a)
+
+        approved_pairs = {(a.target_table, a.operation_type) for a in valid_approvals}
+        global_truncate_approved = any(
+            a.target_table == "*" and a.operation_type in ("truncate_all_targets", "truncate_target")
+            for a in valid_approvals
+        )
+
+        mappings = plan_data.get("table_mappings", [])
+        mapped_target_tables = {
+            m.get("target_table_name") or m.get("target_table")
+            for m in mappings
+            if (m.get("target_table_name") or m.get("target_table"))
+        }
 
         unapproved = []
         for op in destructive_ops:
-            key = (op["target_table"], op["operation_type"])
-            if key not in approved_map:
+            tgt = op.get("target_table")
+            op_type = op.get("operation_type")
+
+            # 1. Global clean wipe (*) check
+            if tgt == "*":
+                if global_truncate_approved:
+                    continue
+                # If ALL mapped tables individually have approved truncate_table records
+                if mapped_target_tables and all(
+                    (tbl, "truncate_table") in approved_pairs for tbl in mapped_target_tables
+                ):
+                    continue
                 unapproved.append(op)
+                continue
+
+            # 2. Specific table check
+            if (tgt, op_type) in approved_pairs:
+                continue
+
+            # Global wipe covers specific table truncations
+            if global_truncate_approved and op_type in ("truncate_table", "truncate_target"):
+                continue
+
+            unapproved.append(op)
 
         return (len(unapproved) == 0), unapproved
 
@@ -364,7 +449,7 @@ class DestructiveApprovalManager:
             .order_by(DestructiveOperationApproval.created_at.desc())
         )
         if not include_invalid:
-            stmt = stmt.where(DestructiveOperationApproval.is_valid == True)
+            stmt = stmt.where(DestructiveOperationApproval.is_valid.is_(True))
         res = await session.execute(stmt)
         return list(res.scalars().all())
 

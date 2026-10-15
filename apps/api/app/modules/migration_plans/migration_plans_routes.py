@@ -5,12 +5,14 @@ Migration Plans Domain — FastAPI REST API Routes
 import uuid
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.db import get_db
 from app.modules.agents.agents_dependencies import hash_agent_token
 from app.modules.agents.agents_models import Agent
+from app.modules.migration_plans.migration_plans_models import MigrationPlanVersion
 from app.modules.migration_plans.migration_plans_schemas import (
     PlanDetailResponse,
     PlanGenerationJobResponse,
@@ -26,6 +28,7 @@ from app.modules.migration_plans.migration_plans_schemas import (
 )
 from app.modules.execution.execution_schemas import (
     DestructiveApprovalRejectRequest,
+    DestructiveApprovalRequestPayload,
     DestructiveApprovalResponse,
 )
 from app.modules.execution.safety_services import DestructiveApprovalManager
@@ -467,10 +470,76 @@ async def list_destructive_approvals(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You do not have permission to view approvals for this migration plan.",
         )
+    current_ver = plan.approved_version_number or 1
+    if not plan.approved_version_number:
+        v_stmt = (
+            select(MigrationPlanVersion.version_number)
+            .where(MigrationPlanVersion.migration_plan_id == plan.id)
+            .order_by(MigrationPlanVersion.version_number.desc())
+            .limit(1)
+        )
+        v_res = await session.execute(v_stmt)
+        latest_v = v_res.scalar_one_or_none()
+        if latest_v:
+            current_ver = latest_v
+
+    await DestructiveApprovalManager.sync_plan_destructive_approvals(session, plan, current_ver)
+
     approvals = await DestructiveApprovalManager.list_approvals_for_plan(
         session, plan_id, include_invalid=include_invalid
     )
     return approvals
+
+
+@router.post(
+    "/{plan_id}/destructive-approvals/request",
+    response_model=DestructiveApprovalResponse,
+)
+async def request_destructive_approval(
+    plan_id: uuid.UUID,
+    payload: DestructiveApprovalRequestPayload,
+    current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_db),
+):
+    """
+    Register a pending destructive operation approval request (e.g. clean wipe or table drop).
+    """
+    plan = await MigrationPlanService.get_plan_by_id(session, plan_id)
+    if not plan:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Migration plan '{plan_id}' not found.",
+        )
+    if plan.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to request approvals for this migration plan.",
+        )
+    current_ver = plan.approved_version_number or 1
+    if not plan.approved_version_number:
+        v_stmt = (
+            select(MigrationPlanVersion.version_number)
+            .where(MigrationPlanVersion.migration_plan_id == plan.id)
+            .order_by(MigrationPlanVersion.version_number.desc())
+            .limit(1)
+        )
+        v_res = await session.execute(v_stmt)
+        latest_v = v_res.scalar_one_or_none()
+        if latest_v:
+            current_ver = latest_v
+
+    approval = await DestructiveApprovalManager.get_or_create_approval_request(
+        session=session,
+        plan_id=plan.id,
+        plan_version_number=current_ver,
+        target_table=payload.target_table,
+        operation_type=payload.operation_type,
+        metadata_snapshot={
+            "risk_level": payload.risk_level,
+            "statement": payload.statement or f"{payload.operation_type} on {payload.target_table}",
+        },
+    )
+    return approval
 
 
 @router.post(

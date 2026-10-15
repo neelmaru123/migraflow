@@ -278,3 +278,11 @@ class DestructiveApprovalRejectRequest(BaseModel):
     """Request payload to reject a destructive operation approval."""
     reason: str = Field(..., min_length=3, description="Reason for rejection")
 
+
+class DestructiveApprovalRequestPayload(BaseModel):
+    """Request payload to register a pending destructive approval request."""
+    target_table: str = Field(default="*", description="Target table name or '*' for all tables")
+    operation_type: str = Field(default="truncate_all_targets", description="Operation type: truncate_all_targets, truncate_table, drop_table, etc.")
+    risk_level: str = Field(default="high", description="Risk level (critical, high, medium)")
+    statement: Optional[str] = Field(default=None, description="Optional description or DDL statement")
+
